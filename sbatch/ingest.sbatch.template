@@ -12,6 +12,10 @@ ml python/3.12.1 uv hdf5/1.14.4 openblas/0.3.20
 export UV_PYTHON=$(which python3)
 source ~/geothermal-pomdp/bin/activate
 
+# wandb offline mode — see train_acquire.sbatch.template for rationale.
+export WANDB_MODE=offline
+export WANDB_DIR={{RUN_ROOT}}/wandb
+
 python {{REPO_ROOT}}/scripts/phase_ingest.py \
     --run-root {{RUN_ROOT}} \
     --iteration {{ITER}} \

@@ -31,6 +31,21 @@ class IngestError(RuntimeError):
 
 
 @dataclass
+class CandidateMetric:
+    """Per-candidate calibration row, persisted for post-run analysis."""
+    snapshot_id: str
+    case_id: str
+    output_file_name: str
+    geology_index: int
+    geology_config_id: int | str | None
+    kind: str  # "frontier" | "adversarial"
+    predicted_revenue: float
+    real_revenue: float
+    abs_pct_error: float
+    signed_pct_error: float
+
+
+@dataclass
 class IngestMetrics:
     n_submitted: int
     n_completed: int
@@ -42,6 +57,9 @@ class IngestMetrics:
     best_real_revenue_in_batch: float | None
     best_real_revenue_so_far: float | None
     n_train_samples: int
+    # New: per-candidate rows + per-geology rollups for richer post-run plots.
+    candidates: list[CandidateMetric] | None = None
+    per_geology: dict[str, dict[str, float | int | None]] | None = None
 
 
 def _link_ix_outputs_to_archive(ix_output_dir: Path, archive_dir: Path) -> list[Path]:
@@ -185,7 +203,7 @@ def ingest_iteration(
     n_train_samples = _count_cases(next_compiled_h5)
 
     # Step 4: match outputs back to manifest snapshots and compute metrics.
-    pred_real_pairs: list[tuple[float, float, str]] = []  # (predicted, real, kind)
+    candidates: list[CandidateMetric] = []
     n_completed = 0
     for task in tasks:
         out_name = task.get("output_file_name", "")
@@ -200,7 +218,9 @@ def ingest_iteration(
         if real is None:
             continue
         predicted = float(task.get("predicted_discounted_total_revenue", float("nan")))
-        # task doesn't carry "kind" — read from snapshot json if available.
+
+        # Pull `kind` from the snapshot JSON the orchestrator wrote during
+        # acquisition (the task JSON itself doesn't carry it).
         kind = "frontier"
         snap_json = task.get("snapshot_json_path", "")
         if snap_json:
@@ -210,36 +230,64 @@ def ingest_iteration(
                 kind = payload.get("kind", kind)
             except Exception:
                 pass
-        pred_real_pairs.append((predicted, real, kind))
+
+        if real == 0 or not np.isfinite(predicted) or not np.isfinite(real):
+            abs_pct = float("nan")
+            signed_pct = float("nan")
+        else:
+            abs_pct = abs(predicted - real) / abs(real)
+            signed_pct = (predicted - real) / abs(real)
+
+        candidates.append(CandidateMetric(
+            snapshot_id=str(task.get("snapshot_id", "")),
+            case_id=case_id,
+            output_file_name=out_name,
+            geology_index=int(task.get("geology_index", -1)),
+            geology_config_id=task.get("scenario") or task.get("geology_config_id"),
+            kind=kind,
+            predicted_revenue=predicted,
+            real_revenue=float(real),
+            abs_pct_error=float(abs_pct),
+            signed_pct_error=float(signed_pct),
+        ))
 
     completion_rate = (n_completed / n_submitted) if n_submitted > 0 else 0.0
 
-    def _safe_mape(rows: list[tuple[float, float, str]]) -> float | None:
-        if not rows:
-            return None
-        diffs = []
-        for p, r, _ in rows:
-            if r == 0 or not np.isfinite(p) or not np.isfinite(r):
-                continue
-            diffs.append(abs(p - r) / abs(r))
-        return float(np.mean(diffs)) if diffs else None
+    def _mean_finite(vals: list[float]) -> float | None:
+        finite = [v for v in vals if np.isfinite(v)]
+        return float(np.mean(finite)) if finite else None
 
-    def _safe_signed_bias(rows: list[tuple[float, float, str]]) -> float | None:
-        if not rows:
-            return None
-        diffs = []
-        for p, r, _ in rows:
-            if r == 0 or not np.isfinite(p) or not np.isfinite(r):
-                continue
-            diffs.append((p - r) / abs(r))
-        return float(np.mean(diffs)) if diffs else None
+    batch_mape = _mean_finite([c.abs_pct_error for c in candidates])
+    batch_signed_pct_bias = _mean_finite([c.signed_pct_error for c in candidates])
+    frontier_mape = _mean_finite([c.abs_pct_error for c in candidates if c.kind == "frontier"])
+    adversarial_mape = _mean_finite([c.abs_pct_error for c in candidates if c.kind == "adversarial"])
 
-    batch_mape = _safe_mape(pred_real_pairs)
-    batch_signed_pct_bias = _safe_signed_bias(pred_real_pairs)
-    frontier_mape = _safe_mape([row for row in pred_real_pairs if row[2] == "frontier"])
-    adversarial_mape = _safe_mape([row for row in pred_real_pairs if row[2] == "adversarial"])
+    # Per-geology rollup — useful for spotting geologies the surrogate
+    # systematically struggles on, and for the convergence plot script.
+    per_geology: dict[str, dict[str, float | int | None]] = {}
+    for c in candidates:
+        bucket = per_geology.setdefault(str(c.geology_index), {
+            "count": 0,
+            "mape": [],
+            "signed_bias": [],
+            "max_real_revenue": None,
+        })
+        bucket["count"] += 1  # type: ignore[operator]
+        if np.isfinite(c.abs_pct_error):
+            bucket["mape"].append(c.abs_pct_error)  # type: ignore[union-attr]
+        if np.isfinite(c.signed_pct_error):
+            bucket["signed_bias"].append(c.signed_pct_error)  # type: ignore[union-attr]
+        if np.isfinite(c.real_revenue):
+            cur = bucket["max_real_revenue"]
+            bucket["max_real_revenue"] = (
+                c.real_revenue if cur is None else max(float(cur), c.real_revenue)  # type: ignore[arg-type]
+            )
+    # Collapse list-valued aggregates to scalars.
+    for g, bucket in per_geology.items():
+        bucket["mape"] = _mean_finite(bucket["mape"])  # type: ignore[arg-type]
+        bucket["signed_bias"] = _mean_finite(bucket["signed_bias"])  # type: ignore[arg-type]
 
-    real_values = [r for _, r, _ in pred_real_pairs if np.isfinite(r)]
+    real_values = [c.real_revenue for c in candidates if np.isfinite(c.real_revenue)]
     best_in_batch = float(max(real_values)) if real_values else None
     best_so_far: float | None
     if best_in_batch is None:
@@ -260,4 +308,6 @@ def ingest_iteration(
         best_real_revenue_in_batch=best_in_batch,
         best_real_revenue_so_far=best_so_far,
         n_train_samples=n_train_samples,
+        candidates=candidates,
+        per_geology=per_geology,
     )

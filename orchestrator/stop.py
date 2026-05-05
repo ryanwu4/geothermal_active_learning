@@ -73,8 +73,17 @@ def _consecutive_zero_completions(state: RunState, limit: int) -> int:
 
 
 def evaluate_stopping(state: RunState, cfg: StoppingConfig) -> StopDecision:
-    if state.iteration >= cfg.max_iterations:
-        return StopDecision(should_stop=True, reason=f"max_iterations ({cfg.max_iterations}) reached")
+    # `state.iteration` is 0-indexed and is the *just-completed* iteration when
+    # this check runs (in phase_ingest, before the increment that schedules the
+    # next iter). `max_iterations` is the total count the user asked for, so
+    # we stop once we've completed that many — meaning iteration index
+    # `max_iterations - 1`.
+    if state.iteration + 1 >= cfg.max_iterations:
+        return StopDecision(
+            should_stop=True,
+            reason=f"max_iterations ({cfg.max_iterations}) reached "
+                   f"(just completed iter {state.iteration})",
+        )
     zero_streak = _consecutive_zero_completions(state, cfg.consecutive_zero_completion_limit)
     if zero_streak >= cfg.consecutive_zero_completion_limit:
         return StopDecision(

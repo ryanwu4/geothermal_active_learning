@@ -70,3 +70,25 @@ def test_new_wandb_run_id_is_hex_only() -> None:
     rid = new_wandb_run_id()
     assert all(c in "0123456789abcdef" for c in rid)
     assert len(rid) == 12
+
+
+def test_max_iterations_is_total_count_not_index() -> None:
+    """max_iterations=N means we run iterations 0..N-1 (total N), not 0..N."""
+    from orchestrator.stop import StoppingConfig, evaluate_stopping
+
+    cfg = StoppingConfig(max_iterations=1)
+    state = RunState(run_id="r", config_path="c", wandb_run_id="w", iteration=0)
+    state.upsert_iter(IterationRecord(iteration=0, submitted=4, completed=4))
+    # After completing iteration 0 with max_iterations=1, we should stop.
+    assert evaluate_stopping(state, cfg).should_stop
+
+    cfg = StoppingConfig(max_iterations=3)
+    state = RunState(run_id="r", config_path="c", wandb_run_id="w", iteration=1)
+    state.upsert_iter(IterationRecord(iteration=0, submitted=4, completed=4))
+    state.upsert_iter(IterationRecord(iteration=1, submitted=4, completed=4))
+    # After iteration 1 with max_iterations=3, we should still continue.
+    assert not evaluate_stopping(state, cfg).should_stop
+
+    state.iteration = 2
+    state.upsert_iter(IterationRecord(iteration=2, submitted=4, completed=4))
+    assert evaluate_stopping(state, cfg).should_stop

@@ -18,6 +18,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from dataclasses import asdict
+
 from orchestrator.ingest import ingest_iteration
 from orchestrator.log import init_run
 from orchestrator.paths import resolve_run_paths
@@ -150,7 +152,21 @@ def main() -> int:
     rec.best_real_revenue = metrics.best_real_revenue_so_far
     rec.n_train_samples = metrics.n_train_samples
     rec.wallclock_ingest_min = ingest_elapsed_min
+    rec.per_geology = metrics.per_geology
     state.upsert_iter(rec)
+
+    # Write per-candidate calibration rows alongside the iteration's artifacts.
+    # state.json stays compact; the convergence plot script reads these files
+    # to build scatter / per-geology heatmap / distribution plots.
+    per_cand_path = paths.iter_dir(state.iteration) / "per_candidate_metrics.json"
+    per_cand_payload = {
+        "iteration": state.iteration,
+        "n_submitted": metrics.n_submitted,
+        "n_completed": metrics.n_completed,
+        "candidates": [asdict(c) for c in (metrics.candidates or [])],
+    }
+    with open(per_cand_path, "w") as f:
+        json.dump(per_cand_payload, f, indent=2)
     # Make the new compiled H5 the active training set for the next iteration.
     state.current_compiled_h5 = str(next_compiled_h5)
     state.save(paths.state_file)

@@ -37,6 +37,11 @@ class IterationRecord:
     ix_array_job_id: str | None = None
     ingest_job_id: str | None = None
     notes: str = ""
+    # Per-geology aggregate calibration for this iteration's batch. Keyed by
+    # `str(geology_index)` so the JSON round-trips cleanly. Each value carries
+    # at least: count, mape, signed_bias, max_real_revenue. Optional — older
+    # iterations may have None.
+    per_geology: dict[str, dict[str, object]] | None = None
 
 
 @dataclass

@@ -17,4 +17,10 @@ module load julia
 export UV_PYTHON=$(which python3)
 source ~/geothermal-pomdp/bin/activate
 
+# wandb in offline mode: writes runs to local disk during the SLURM job (which
+# may not have outbound internet on Sherlock's GPU partition). Sync to the
+# wandb cloud after the AL run completes via scripts/wandb_sync.sh.
+export WANDB_MODE=offline
+export WANDB_DIR={{RUN_ROOT}}/wandb
+
 python {{REPO_ROOT}}/scripts/phase_train_acquire.py --run-root {{RUN_ROOT}}
