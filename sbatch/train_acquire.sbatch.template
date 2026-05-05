@@ -1,0 +1,20 @@
+#!/usr/bin/bash
+#SBATCH --job-name={{JOB_NAME}}
+#SBATCH --output={{LOG_OUT}}
+#SBATCH --error={{LOG_ERR}}
+#SBATCH --mem=48GB
+#SBATCH -c 4
+#SBATCH -t 4:00:00
+#SBATCH -p gpu
+#SBATCH --gpus 1
+#SBATCH -C GPU_SKU:L40S
+
+set -euo pipefail
+
+ml python/3.12.1 uv hdf5/1.14.4 openblas/0.3.20
+module use /home/groups/sh_s-dss/share/sdss/modules/modulefiles/
+module load julia
+export UV_PYTHON=$(which python3)
+source ~/geothermal-pomdp/bin/activate
+
+python {{REPO_ROOT}}/scripts/phase_train_acquire.py --run-root {{RUN_ROOT}}

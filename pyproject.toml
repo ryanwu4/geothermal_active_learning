@@ -1,0 +1,29 @@
+[project]
+name = "geothermal_active_learning"
+version = "0.1.0"
+description = "Active learning orchestrator for the geothermal GNN surrogate + INTERSECT simulator"
+requires-python = ">=3.10"
+
+# Runtime deps reuse the geothermal-pomdp env on Sherlock; declared here for clarity.
+# Install via the existing env: `source ~/geothermal-pomdp/bin/activate`
+dependencies = [
+    "h5py",
+    "numpy",
+    "scipy",
+    "scikit-learn",
+    "torch",
+    "torch-geometric",
+    "lightning",
+    "matplotlib",
+    "tqdm",
+    "wandb",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["orchestrator*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

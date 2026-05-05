@@ -1,0 +1,17 @@
+{
+  "comment": "Two geologies for end-to-end smoke testing. Subset of geologies_full.json (scenarios 74 and 76). Keeping geology_index numerically distinct from full so combined runs would not accidentally collide on the snapshot_id token.",
+  "geologies": [
+    {
+      "geology_index": 0,
+      "scenario": 74,
+      "filename": "v2.5_0005.h5",
+      "geology_h5_file": "/scratch/users/rwu4/al_runs/geology_h5s/v2.5_0005.h5"
+    },
+    {
+      "geology_index": 1,
+      "scenario": 76,
+      "filename": "v2.5_0001.h5",
+      "geology_h5_file": "/scratch/users/rwu4/al_runs/geology_h5s/v2.5_0001.h5"
+    }
+  ]
+}

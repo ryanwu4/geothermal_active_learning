@@ -1,0 +1,81 @@
+{
+  "_comment": "Reduced-scale shake-down config for the AL pipeline. Runs 1 iteration with 2 geologies, 2 starts each, 4 IX tasks, no retraining. Use this to verify the full chain (Phase A -> IX array -> Phase C) works end-to-end before launching al_default.json. Outputs land under <scratch_root>/<run_id>/ with run_id_prefix 'smoke' so they're easy to clean up.",
+  "run_id_prefix": "smoke",
+  "target": "graph_discounted_net_revenue",
+
+  "wandb": {
+    "project": "geothermal_active_learning",
+    "entity": "ryanwu4",
+    "tags": ["sherlock", "smoke"]
+  },
+
+  "paths": {
+    "scratch_root": "/scratch/users/rwu4/al_runs",
+    "surrogate_repo": "/home/users/rwu4/Geothermal_Graph_Surrogate",
+    "julia_repo": "/home/users/rwu4/GeologicalSimulationWrapper.jl",
+    "julia_config": "configs/sherlock_ryan.json",
+    "bootstrap_compiled_h5": "/scratch/users/rwu4/al_runs/compiled_CNN_patched.h5",
+    "bootstrap_checkpoint_dir": "/home/users/rwu4/Geothermal_Graph_Surrogate/trained/withheld_0p_discountedrevenue/checkpoints",
+    "geologies_config": "configs/geologies_smoke.json",
+    "norm_config_path": "/scratch/users/rwu4/al_runs/norm_config.json"
+  },
+
+  "training": {
+    "_comment": "Smoke runs only iter 0, which always uses the bootstrap ckpt and skips training entirely. These knobs are here so the schema validates; they're not exercised.",
+    "from_scratch_every_k": 999,
+    "max_epochs_full": 5,
+    "max_epochs_finetune": 5,
+    "early_stop_patience": 3,
+    "lr": 3e-4,
+    "batch_size": 16,
+    "edge_encoder": "cnn",
+    "seed": 42
+  },
+
+  "acquisition": {
+    "n_starts_per_geology": 2,
+    "k_safe": 10,
+    "k_adv": 30,
+    "adv_fraction": 0.5,
+    "edge_buffer": 10,
+    "lr": 0.5,
+    "log_every_n_steps": 5,
+    "seed": 42
+  },
+
+  "selection": {
+    "batch_size": 4,
+    "frontier_fraction": 0.75
+  },
+
+  "intersect": {
+    "max_concurrent": 4,
+    "time_per_run": "00:40:00",
+    "cpus_per_task": 2,
+    "mem_per_task": "8GB",
+    "np": 2
+  },
+
+  "stopping": {
+    "max_iterations": 1,
+    "plateau_window": 5,
+    "plateau_threshold_relative": 0.005,
+    "target_mape": null,
+    "consecutive_zero_completion_limit": 1
+  },
+
+  "wells": [
+    {"depth": 50, "type": "injector"},
+    {"depth": 50, "type": "producer"},
+    {"depth": 50, "type": "injector"},
+    {"depth": 50, "type": "producer"},
+    {"depth": 50, "type": "injector"},
+    {"depth": 50, "type": "producer"},
+    {"depth": 50, "type": "injector"},
+    {"depth": 50, "type": "producer"},
+    {"depth": 50, "type": "injector"},
+    {"depth": 50, "type": "producer"},
+    {"depth": 50, "type": "injector"},
+    {"depth": 50, "type": "producer"}
+  ]
+}
