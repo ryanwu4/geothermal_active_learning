@@ -7,7 +7,7 @@
 #SBATCH -t 4:00:00
 #SBATCH -p gpu
 #SBATCH --gpus 1
-#SBATCH -C GPU_SKU:L40S
+#SBATCH -C "GPU_MEM:32GB|GPU_MEM:48GB|GPU_MEM:80GB"
 
 set -euo pipefail
 

@@ -307,6 +307,7 @@ def run_acquisition(
         coords.requires_grad = True
         optimizer = optim.Adam([coords], lr=cfg.learning_rate)
         M = cfg.n_starts_per_geology
+        last_valid_coords = coords.detach().clone()
 
         def _predict_unscaled(c: torch.Tensor) -> torch.Tensor:
             batch_data["well"].pos_xyz = c.view(-1, 3)
@@ -329,6 +330,10 @@ def run_acquisition(
             # Boundary projection (matches run_ensemble_active_learning.py logic).
             with torch.no_grad():
                 grads = coords.grad
+                # Surrogate's grid_sample can emit non-finite grads near edges;
+                # zero them out before step() so Adam doesn't poison coords.
+                if not torch.isfinite(grads).all():
+                    torch.nan_to_num_(grads, nan=0.0, posinf=0.0, neginf=0.0)
                 for d, max_val in enumerate([nx - 1, ny - 1, z_max - 1]):
                     mask_lo = (coords[:, :, d] <= 1e-4) & (grads[:, :, d] > 0)
                     mask_hi = (coords[:, :, d] >= max_val - 1e-4) & (grads[:, :, d] < 0)
@@ -340,21 +345,37 @@ def run_acquisition(
                             st["exp_avg"][..., d][mask] = 0.0
             optimizer.step()
             with torch.no_grad():
+                # If a coord went non-finite (e.g. Adam moment was already poisoned),
+                # roll back to the last all-finite snapshot rather than serialize NaN.
+                if not torch.isfinite(coords).all():
+                    bad = ~torch.isfinite(coords)
+                    coords[bad] = last_valid_coords[bad]
+                    # Also clear any non-finite Adam moments for those entries.
+                    st = optimizer.state.get(coords, {})
+                    for key in ("exp_avg", "exp_avg_sq"):
+                        if key in st and not torch.isfinite(st[key]).all():
+                            torch.nan_to_num_(st[key], nan=0.0, posinf=0.0, neginf=0.0)
                 coords[:, :, 0].clamp_(0, nx - 1)
                 coords[:, :, 1].clamp_(0, ny - 1)
                 coords[:, :, 2].clamp_(0, z_max - 1)
+                last_valid_coords.copy_(coords)
 
             if step == cfg.k_safe:
                 with torch.no_grad():
                     preds_now = _predict_unscaled(coords).detach().cpu().numpy()
                 for m in range(M):
+                    cxyz = coords[m].detach().cpu().numpy()
+                    pred_val = float(preds_now[m])
+                    if not (np.isfinite(cxyz).all() and np.isfinite(pred_val)):
+                        print(f"[acquire] skip non-finite frontier snapshot geo={geo.geology_index} m={m}", flush=True)
+                        continue
                     snap = _emit_snapshot(
                         run_id=geo.geology_index * 10000 + m,
                         iteration_step=step,
                         kind="frontier",
-                        coords_xyz=coords[m].detach().cpu().numpy(),
+                        coords_xyz=cxyz,
                         is_injector_list=is_injector_list,
-                        predicted_revenue=float(preds_now[m]),
+                        predicted_revenue=pred_val,
                         geo=geo,
                         geo_path=geo_path,
                         geo_name=geo_name,
@@ -364,19 +385,24 @@ def run_acquisition(
                         to_julia_wells_text=to_julia_wells_text,
                     )
                     snapshots.append(snap)
-                    candidates.append(_snapshot_to_candidate(snap, coords[m].detach().cpu().numpy(), is_injector_list))
+                    candidates.append(_snapshot_to_candidate(snap, cxyz, is_injector_list))
 
             if step == cfg.k_adv and adv_idx:
                 with torch.no_grad():
                     preds_now = _predict_unscaled(coords).detach().cpu().numpy()
                 for m in sorted(adv_idx):
+                    cxyz = coords[m].detach().cpu().numpy()
+                    pred_val = float(preds_now[m])
+                    if not (np.isfinite(cxyz).all() and np.isfinite(pred_val)):
+                        print(f"[acquire] skip non-finite adversarial snapshot geo={geo.geology_index} m={m}", flush=True)
+                        continue
                     snap = _emit_snapshot(
                         run_id=geo.geology_index * 10000 + m,
                         iteration_step=step,
                         kind="adversarial",
-                        coords_xyz=coords[m].detach().cpu().numpy(),
+                        coords_xyz=cxyz,
                         is_injector_list=is_injector_list,
-                        predicted_revenue=float(preds_now[m]),
+                        predicted_revenue=pred_val,
                         geo=geo,
                         geo_path=geo_path,
                         geo_name=geo_name,
@@ -386,7 +412,7 @@ def run_acquisition(
                         to_julia_wells_text=to_julia_wells_text,
                     )
                     snapshots.append(snap)
-                    candidates.append(_snapshot_to_candidate(snap, coords[m].detach().cpu().numpy(), is_injector_list))
+                    candidates.append(_snapshot_to_candidate(snap, cxyz, is_injector_list))
 
     # Write aggregate manifest matching cli_surrogate_array_prepare.jl schema.
     manifest = {
