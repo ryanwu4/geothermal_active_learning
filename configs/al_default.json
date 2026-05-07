@@ -31,7 +31,7 @@
   },
 
   "acquisition": {
-    "n_starts_per_geology": 10,
+    "n_starts_per_geology": 15,
     "k_safe": 45,
     "k_adv": 300,
     "adv_fraction": 0.2,
@@ -42,7 +42,7 @@
   },
 
   "selection": {
-    "batch_size": 50,
+    "batch_size": 200,
     "frontier_fraction": 0.85
   },
 
@@ -56,7 +56,7 @@
 
   "stopping": {
     "max_iterations": 20,
-    "plateau_window": 5,
+    "plateau_window": 20,
     "plateau_threshold_relative": 0.005,
     "target_mape": null
   },
