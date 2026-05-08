@@ -2,7 +2,7 @@
 #SBATCH --job-name={{JOB_NAME}}
 #SBATCH --output={{LOG_OUT}}
 #SBATCH --error={{LOG_ERR}}
-#SBATCH --mem=48GB
+#SBATCH --mem=96GB
 #SBATCH -c 4
 #SBATCH -t 4:00:00
 #SBATCH -p gpu
