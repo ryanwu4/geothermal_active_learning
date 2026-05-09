@@ -41,3 +41,62 @@ cat /scratch/users/rwu4/al_runs/<run_id>/state.json | jq .
 ```
 
 See `configs/al_default.json` for all configurable parameters.
+
+## Hybrid mode (local GPU, remote IX + ingest)
+
+Waiting for a Sherlock GPU node dominates iteration latency in test runs. The
+hybrid mode in `configs/al_hybrid.json` runs **train + acquire + select on the
+local GPU host (bend)** while keeping IX simulations and ingest on Sherlock.
+
+### One-time setup
+
+Add a `Host sherlock` entry to `~/.ssh/config` so that *any* `ssh sherlock`,
+`scp … sherlock:…`, or `rsync … sherlock:…` invocation transparently
+multiplexes onto a single authenticated master socket:
+
+```
+Host sherlock
+    HostName login.sherlock.stanford.edu
+    User rwu4
+    ControlMaster auto
+    ControlPath ~/.ssh/cm-%r@%h:%p
+    ControlPersist 24h
+```
+
+Then in a dedicated tmux pane on bend, kick the master once and authenticate
+(Duo). With `ControlPersist 24h` the socket stays alive for 24h after you
+exit the shell:
+
+```bash
+ssh sherlock          # accept Duo, run anything, exit
+ssh -O check sherlock # → "Master running"
+```
+
+Edit `configs/al_hybrid.json` so the `compute.*` paths match the bend host
+(`local_workspace`, `local_surrogate_repo`, `local_geologies_config`). The
+local geologies config must reference local copies of the v2.5 H5 files. The
+`ssh_control_path` in the config is only used for a friendly pre-flight check
+that the socket exists — it should match the path your `~/.ssh/config`
+`ControlPath` resolves to (e.g. `~/.ssh/cm-rwu4@login.sherlock.stanford.edu:22`).
+
+### Run
+
+```bash
+# Fresh run (bootstraps a remote run dir on Sherlock first):
+python scripts/run_al_local.py --config configs/al_hybrid.json
+
+# Resume an existing run:
+python scripts/run_al_local.py --config configs/al_hybrid.json --run-id <id>
+```
+
+The driver runs as a long-lived process — keep it in a tmux pane. Each
+iteration it pulls only what it needs (compiled H5 for training, ~11–15 GB)
+and overwrites a single local copy at `local_workspace/current_compiled.h5`.
+Checkpoints live locally only.
+
+### When ssh fails
+
+If the ControlMaster socket dies (Duo expires, etc.) the driver writes
+`local_workspace/NEEDS_AUTH.md` with the exact command to re-establish the
+socket and the resume command, then exits cleanly with code 2. State on
+Sherlock is untouched; restart the driver with `--run-id <id>`.

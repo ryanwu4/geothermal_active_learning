@@ -230,6 +230,20 @@ def main() -> int:
     state.iteration += 1
     state.save(paths.state_file)
 
+    # In hybrid mode the local driver on bend takes over here — it polls this
+    # ingest job's terminal state and runs the next train_acquire on its own
+    # GPU. Skip submitting on Sherlock so we don't burn a GPU node we won't use.
+    compute_loc = (config.get("compute") or {}).get("train_acquire_location", "sherlock")
+    if compute_loc == "local":
+        print(
+            f"[ingest] hybrid mode (compute.train_acquire_location=local): "
+            f"not submitting next train_acquire on Sherlock. Local driver "
+            f"will pick up iter={state.iteration}."
+        )
+        if wandb_handle.is_active:
+            wandb_handle.finish()
+        return 0
+
     next_template = REPO_ROOT / "sbatch" / "train_acquire.sbatch.template"
     next_sbatch = paths.sbatch_dir / f"train_acquire_iter_{state.iteration:04d}.sbatch"
     write_rendered(

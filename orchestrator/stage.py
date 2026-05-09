@@ -4,6 +4,10 @@ The Julia script consumes a manifest JSON, materializes per-task ``.jl`` files
 under a ``stage_run_dir``, and writes a ``submit_surrogate_array.sbatch``
 script. We invoke it without ``--remote-userhost`` so it skips the local→scp
 helper and gives us a sbatch we can submit immediately.
+
+Hybrid mode (local driver on bend, IX on Sherlock) injects a ``runner`` that
+executes the Julia subprocess on Sherlock over ssh — in that case every path
+passed in must already be a Sherlock-side absolute path.
 """
 from __future__ import annotations
 
@@ -11,6 +15,7 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 
 _SBATCH_PATH_RE = re.compile(r"Sbatch file\s*:\s*(\S+)")
@@ -28,6 +33,16 @@ class StageResult:
     tasks_count: int
 
 
+# Runner signature: takes an argv list, returns a CompletedProcess-like object
+# with .returncode/.stdout/.stderr. Default runs locally; hybrid passes a
+# remote runner that ssh's into Sherlock.
+Runner = Callable[[list[str]], "subprocess.CompletedProcess[str]"]
+
+
+def _local_runner(argv: list[str]) -> "subprocess.CompletedProcess[str]":
+    return subprocess.run(argv, capture_output=True, text=True, check=False)
+
+
 def stage_iteration(
     *,
     julia_repo: Path,
@@ -42,10 +57,17 @@ def stage_iteration(
     np_procs: int = 2,
     max_concurrent: int = 50,
     job_name: str = "AL_IX_ARRAY",
+    runner: Runner | None = None,
+    skip_script_existence_check: bool = False,
 ) -> StageResult:
-    """Run the staging script and parse its stdout for the rendered sbatch path."""
+    """Run the staging script and parse its stdout for the rendered sbatch path.
+
+    ``runner`` defaults to a local ``subprocess.run``; pass a remote runner for
+    hybrid mode and set ``skip_script_existence_check=True`` (the script lives
+    on the remote host and we can't stat it locally).
+    """
     script = Path(julia_repo) / "scripts" / "cli_surrogate_array_prepare.jl"
-    if not script.exists():
+    if not skip_script_existence_check and not script.exists():
         raise StageError(f"Staging script not found: {script}")
 
     cmd = [
@@ -65,7 +87,7 @@ def stage_iteration(
         "--repo-dir-for-sbatch", str(julia_repo),
     ]
 
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    proc = (runner or _local_runner)(cmd)
     if proc.returncode != 0:
         raise StageError(
             f"Julia stage script failed (code {proc.returncode}):\n"

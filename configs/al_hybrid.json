@@ -5,7 +5,7 @@
   "wandb": {
     "project": "geothermal_active_learning",
     "entity": "ryanwu4",
-    "tags": ["sherlock", "discounted_revenue"]
+    "tags": ["hybrid", "bend_gpu", "sherlock_ix", "discounted_revenue"]
   },
 
   "paths": {
@@ -20,7 +20,16 @@
   },
 
   "compute": {
-    "train_acquire_location": "sherlock"
+    "train_acquire_location": "local",
+    "ssh_host": "sherlock",
+    "ssh_control_path": "~/.ssh/cm-rwu4@login.sherlock.stanford.edu:22",
+    "remote_repo_root": "/home/users/rwu4/geothermal_active_learning",
+    "local_workspace": "/home/rwu4/geothermal_active_learning/local_workspace",
+    "local_surrogate_repo": "/home/rwu4/Geothermal_Graph_Surrogate",
+    "local_geologies_config": "/home/rwu4/geothermal_active_learning/configs/geologies_full.json",
+    "poll_interval_sec": 600,
+    "notify_email": "ryanwu2002@gmail.com",
+    "notify_msmtp_account": "gmail"
   },
 
   "training": {
