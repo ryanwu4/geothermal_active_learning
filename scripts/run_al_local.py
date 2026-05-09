@@ -252,15 +252,46 @@ def _bootstrap_remote_run(
 
     print(f"[local-driver] bootstrapping remote run {run_id} (config={remote_config_path})")
     proc = remote.run(
-        ["python", "scripts/start_al_run.py",
-         "--config", remote_config_path,
-         "--run-id", run_id,
-         "--dry-run"],
+        ["bash", "-lc", _wrap_with_sherlock_env(
+            f"python scripts/start_al_run.py "
+            f"--config {shlex.quote(remote_config_path)} "
+            f"--run-id {shlex.quote(run_id)} "
+            f"--dry-run"
+        )],
         cwd=remote_repo_root,
         check=True,
     )
     print(proc.stdout.strip())
     return run_id
+
+
+# Sherlock's login-node default ``python`` is Python 2 and ``julia`` isn't on
+# PATH at all. Every interpreter invocation we ssh-run has to load the same
+# modules + venv that the sbatch templates do — mirrors
+# sbatch/train_acquire.sbatch.template:14-18. Wrapped in ``bash -lc`` so ``ml``
+# is in scope.
+_SHERLOCK_ENV_PREAMBLE = (
+    "ml python/3.12.1 uv hdf5/1.14.4 openblas/0.3.20 && "
+    "module use /home/groups/sh_s-dss/share/sdss/modules/modulefiles/ && "
+    "module load julia && "
+    "export UV_PYTHON=$(which python3) && "
+    "source ~/geothermal-pomdp/bin/activate"
+)
+
+
+def _wrap_with_sherlock_env(cmd: str) -> str:
+    return f"{_SHERLOCK_ENV_PREAMBLE} && {cmd}"
+
+
+def _make_sherlock_runner(remote: RemoteSession, *, cwd: str | None = None):
+    """Build a stage_iteration runner that wraps argv in the Sherlock env."""
+    def _runner(argv: list[str]):
+        cmd = " ".join(shlex.quote(a) for a in argv)
+        return remote.run(
+            ["bash", "-lc", _wrap_with_sherlock_env(cmd)],
+            cwd=cwd, check=False,
+        )
+    return _runner
 
 
 # ----------------------------------------------------------------------
@@ -713,7 +744,7 @@ def main() -> int:
                 np_procs=int(ix_cfg.get("np", 2)),
                 max_concurrent=int(ix_cfg.get("max_concurrent", 70)),
                 job_name=f"AL_IX_{run_id}_{iteration:04d}",
-                runner=lambda argv: remote.run(argv, check=False),
+                runner=_make_sherlock_runner(remote),
                 skip_script_existence_check=True,
             )
             last_step = f"staged IX (sbatch={stage.sbatch_path})"
