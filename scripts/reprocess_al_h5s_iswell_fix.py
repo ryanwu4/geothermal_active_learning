@@ -31,7 +31,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -40,6 +42,15 @@ from typing import Iterable
 
 import h5py
 import numpy as np
+
+
+# Bumped if the patching logic ever changes in a way that should force a
+# re-patch of previously-patched files. The script writes this as an HDF5
+# root-group attr (`reprocess_iswell_fix_version`) once a patch completes.
+PATCH_VERSION = 1
+PATCH_VERSION_ATTR = "reprocess_iswell_fix_version"
+PATCH_JL_ATTR = "reprocess_iswell_fix_jl_basename"
+TMP_SUFFIX = ".patching.tmp"
 
 
 # --------------------------------------------------------------------------- #
@@ -156,37 +167,115 @@ def rebuild_iswell_injrate(
     return is_well, inj_rate
 
 
-def patch_one_h5(h5_path: Path, jl_path: Path, default_float: float = -999.0) -> dict:
-    """Patch Input/IsWell + Input/InjRate in `h5_path` from `jl_path`. Returns a
-    summary dict for logging.
+def _already_patched(h5_path: Path) -> bool:
+    """Return True iff the file at h5_path carries the idempotency marker for
+    the current PATCH_VERSION. Tolerates a missing file (returns False).
     """
+    if not h5_path.exists():
+        return False
+    try:
+        with h5py.File(h5_path, "r") as f:
+            v = f.attrs.get(PATCH_VERSION_ATTR)
+            return v is not None and int(v) >= PATCH_VERSION
+    except (OSError, KeyError):
+        # Truncated/corrupt file from an interrupted run — treat as not patched.
+        return False
+
+
+def patch_one_h5(
+    src_h5: Path,
+    jl_path: Path,
+    target_h5: Path,
+    *,
+    default_float: float = -999.0,
+    force: bool = False,
+) -> dict:
+    """Patch Input/IsWell + Input/InjRate using a write-temp-then-rename pattern.
+
+    If `target_h5 == src_h5` we patch in place; otherwise we write a fresh copy
+    at `target_h5`. In both cases the actual mutation happens on a sibling
+    `target_h5.patching.tmp` file, and we `os.replace` it onto `target_h5` only
+    after every write has completed and the H5 file handle has been closed.
+    POSIX rename is atomic, so the operation is all-or-nothing from the
+    perspective of any subsequent run.
+
+    Idempotency: a completed patch leaves an HDF5 root attr
+    `reprocess_iswell_fix_version=PATCH_VERSION` on `target_h5`. A re-run with
+    `force=False` (default) sees this and short-circuits with status="skipped_already_patched".
+    """
+    if not force and _already_patched(target_h5):
+        return {"status": "skipped_already_patched", "h5": str(target_h5), "jl": str(jl_path), "n_wells": 0, "unchanged": False}
+
     wells = parse_staged_jl(jl_path)
-    with h5py.File(h5_path, "r+") as f:
-        is_active = f["Input/IsActive"][:]
-        old_iswell = f["Input/IsWell"][:]
-        if is_active.shape != old_iswell.shape:
-            raise ValueError(
-                f"Shape mismatch in {h5_path}: IsActive {is_active.shape} vs IsWell {old_iswell.shape}"
-            )
-        new_iswell, new_injrate = rebuild_iswell_injrate(is_active, wells, default_float)
+    tmp_h5 = target_h5.with_suffix(target_h5.suffix + TMP_SUFFIX)
 
-        # Sanity: the bugged default writes the same template into every H5; if
-        # the .jl produces an IsWell identical to the OLD one (byte-equal), that
-        # means either (a) this H5 was already correct, or (b) the .jl
-        # coincidentally matches the default template. Either way, log it.
-        unchanged = bool(np.array_equal(new_iswell, old_iswell))
+    # Clean up any orphan tmp from a previous interrupted run before we start.
+    if tmp_h5.exists():
+        tmp_h5.unlink()
 
-        del f["Input/IsWell"]
-        del f["Input/InjRate"]
-        f.create_dataset("Input/IsWell", data=new_iswell, dtype=np.int64, compression="gzip", compression_opts=4)
-        f.create_dataset("Input/InjRate", data=new_injrate, dtype=np.float32, compression="gzip", compression_opts=4)
+    # Stage a fresh copy of the source bytes into tmp. We always copy (rather
+    # than open src in r+) so that a failure mid-patch leaves the original
+    # untouched, and so the in-place and copy-dir paths share the same code.
+    shutil.copy2(src_h5, tmp_h5)
+
+    try:
+        with h5py.File(tmp_h5, "r+") as f:
+            is_active = f["Input/IsActive"][:]
+            old_iswell = f["Input/IsWell"][:]
+            if is_active.shape != old_iswell.shape:
+                raise ValueError(
+                    f"Shape mismatch in {src_h5}: IsActive {is_active.shape} vs IsWell {old_iswell.shape}"
+                )
+            new_iswell, new_injrate = rebuild_iswell_injrate(is_active, wells, default_float)
+            unchanged = bool(np.array_equal(new_iswell, old_iswell))
+
+            del f["Input/IsWell"]
+            del f["Input/InjRate"]
+            f.create_dataset("Input/IsWell", data=new_iswell, dtype=np.int64, compression="gzip", compression_opts=4)
+            f.create_dataset("Input/InjRate", data=new_injrate, dtype=np.float32, compression="gzip", compression_opts=4)
+
+            f.attrs[PATCH_VERSION_ATTR] = PATCH_VERSION
+            f.attrs[PATCH_JL_ATTR] = jl_path.name
+    except BaseException:
+        # On any failure (including KeyboardInterrupt), drop the tmp so we
+        # don't leave a half-written file that the next run would mistake for
+        # a stale-but-existent target.
+        try:
+            tmp_h5.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+    # Atomic swap. Anything before this and target_h5 is untouched; anything
+    # after and target_h5 has the complete patched file.
+    os.replace(str(tmp_h5), str(target_h5))
 
     return {
-        "h5": str(h5_path),
+        "status": "patched",
+        "h5": str(target_h5),
         "jl": str(jl_path),
         "n_wells": len(wells),
         "unchanged": unchanged,
     }
+
+
+def cleanup_orphan_tmps(*dirs: Path) -> int:
+    """Remove any *.h5.patching.tmp files left over from a previous run. These
+    are always safe to delete: their existence means a prior process didn't
+    reach the os.replace step, so the corresponding target either was never
+    written or already held the pre-tmp content.
+    """
+    n = 0
+    for d in dirs:
+        if d is None or not d.exists():
+            continue
+        for p in d.glob(f"*.h5{TMP_SUFFIX}"):
+            try:
+                p.unlink()
+                n += 1
+            except FileNotFoundError:
+                pass
+    return n
 
 
 # --------------------------------------------------------------------------- #
@@ -261,7 +350,14 @@ def main() -> int:
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--dry-run", action="store_true",
                     help="Print what would be patched without modifying files.")
+    ap.add_argument("--force", action="store_true",
+                    help="Re-patch files that already carry the idempotency marker. Default is to skip them.")
     args = ap.parse_args()
+
+    # Sweep any *.patching.tmp leftover from a prior interrupted run.
+    n_cleaned = cleanup_orphan_tmps(args.raw_h5_dir, args.patched_output_dir)
+    if n_cleaned:
+        print(f"[reprocess] cleaned {n_cleaned} orphan .patching.tmp file(s) from a prior interrupted run")
 
     out_to_jl = build_output_to_staged_jl_map(args.stage_root)
     if not out_to_jl:
@@ -277,6 +373,7 @@ def main() -> int:
         args.patched_output_dir.mkdir(parents=True, exist_ok=True)
 
     n_patched = 0
+    n_skipped_already = 0
     n_missing_in_h5_dir = 0
     n_missing_jl_on_disk = 0
     n_unchanged = 0
@@ -294,27 +391,32 @@ def main() -> int:
             print(f"[reprocess] WARN staged .jl missing for {out_name}: {jl_path}", file=sys.stderr)
             n_missing_jl_on_disk += 1
             continue
-        target = src_h5
-        if args.patched_output_dir:
-            target = args.patched_output_dir / out_name
-            if not target.exists():
-                target.write_bytes(src_h5.read_bytes())
+        target = args.patched_output_dir / out_name if args.patched_output_dir else src_h5
         if args.dry_run:
-            print(f"[reprocess] DRY would patch {target}  ← {jl_path}")
+            label = "RE-PATCH (--force)" if (args.force and _already_patched(target)) else (
+                "SKIP already-patched" if _already_patched(target) else "PATCH"
+            )
+            print(f"[reprocess] DRY {label} {target}  ← {jl_path}")
             continue
         try:
-            res = patch_one_h5(target, jl_path)
+            res = patch_one_h5(src_h5, jl_path, target, force=args.force)
         except Exception as e:
             print(f"[reprocess] ERROR patching {target}: {e}", file=sys.stderr)
             n_errors += 1
             continue
-        n_patched += 1
-        if res["unchanged"]:
-            n_unchanged += 1
-        if n_patched % 200 == 0:
-            print(f"[reprocess] progress: patched={n_patched} unchanged={n_unchanged} missing_h5={n_missing_in_h5_dir} missing_jl={n_missing_jl_on_disk} errors={n_errors}")
+        if res["status"] == "skipped_already_patched":
+            n_skipped_already += 1
+        else:
+            n_patched += 1
+            if res["unchanged"]:
+                n_unchanged += 1
+        done_so_far = n_patched + n_skipped_already
+        if done_so_far and done_so_far % 200 == 0:
+            print(f"[reprocess] progress: patched={n_patched} skipped_already={n_skipped_already} "
+                  f"unchanged={n_unchanged} missing_h5={n_missing_in_h5_dir} missing_jl={n_missing_jl_on_disk} errors={n_errors}")
     print(
         f"[reprocess] done patching: expected={len(out_to_jl)} patched={n_patched} "
+        f"skipped_already_patched={n_skipped_already} "
         f"unchanged={n_unchanged} missing_h5={n_missing_in_h5_dir} "
         f"missing_jl={n_missing_jl_on_disk} errors={n_errors}"
     )
