@@ -294,6 +294,104 @@ def _make_sherlock_runner(remote: RemoteSession, *, cwd: str | None = None):
     return _runner
 
 
+def _rewrite_manifest_paths(local_manifest: Path, remappings: list[tuple[str, str]]) -> dict:
+    """Load the manifest, apply each ``(local_prefix, remote_prefix)`` remap to
+    every string value, and return the rewritten payload.
+
+    Used so the Julia stage script (running on Sherlock) can resolve snapshot
+    JSON / well_config / geology h5 files written or referenced by acquire on
+    bend. ``remappings`` is order-sensitive: longer/more-specific prefixes
+    should come first so they take precedence over generic ones.
+    """
+    payload = json.loads(local_manifest.read_text())
+
+    def _rewrite_str(s: str) -> str:
+        for local_prefix, remote_prefix in remappings:
+            if s.startswith(local_prefix):
+                return remote_prefix + s[len(local_prefix):]
+        return s
+
+    def _walk(o):
+        if isinstance(o, dict):
+            return {k: _walk(v) for k, v in o.items()}
+        if isinstance(o, list):
+            return [_walk(v) for v in o]
+        if isinstance(o, str):
+            return _rewrite_str(o)
+        return o
+
+    return _walk(payload)
+
+
+def _render_local_plots(state: RunState, ws: Path) -> None:
+    """Render the state-derived diagnostic plots into ``<ws>/plots/``.
+
+    Uses the same plotting functions as ``scripts/plot_convergence.py`` but
+    only the subset that derives from ``state.history`` — we don't have the
+    Sherlock-side per-iteration ``per_candidate_metrics.json`` files locally,
+    so the scatter / distribution plots are skipped here.
+    """
+    try:
+        # Defer import: matplotlib pulls in a lot, no need at module load.
+        from dataclasses import asdict
+        import matplotlib
+        matplotlib.use("Agg")  # headless on bend
+        from scripts import plot_convergence as pc  # type: ignore
+    except Exception as e:
+        print(f"[local-driver] plotting deferred — could not import plot_convergence: {e}",
+              file=sys.stderr)
+        return
+
+    out_dir = ws / "plots"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    history = [asdict(r) for r in state.history]
+    if not history:
+        return
+    pc._set_style()
+    try:
+        pc.plot_best_revenue(history, out_dir)
+        pc.plot_calibration_metrics(history, out_dir)
+        pc.plot_per_geology_mape_heatmap(history, out_dir)
+        pc.plot_training_growth(history, out_dir)
+        pc.plot_wallclock_breakdown(history, out_dir)
+    except Exception as e:
+        # Plotting is diagnostic — never let a plot bug kill the AL loop.
+        print(f"[local-driver] plot rendering failed: {e}", file=sys.stderr)
+
+
+def _build_geology_remappings(cfg: dict) -> list[tuple[str, str]]:
+    """Build (local_geology_path → remote_geology_path) remappings by matching
+    filenames between the bend-side and Sherlock-side geology configs.
+
+    Both configs live in the repo at the same relative path on both sides, so
+    we read them locally — no ssh round-trip needed.
+    """
+    local_cfg = Path(cfg["compute"]["local_geologies_config"]).expanduser().resolve()
+    remote_cfg_rel = cfg["paths"]["geologies_config"]
+    # `paths.geologies_config` is a relative path resolved from the repo root
+    # on whichever side is reading it. We have the same repo locally on bend.
+    if Path(remote_cfg_rel).is_absolute():
+        remote_cfg = Path(remote_cfg_rel)
+    else:
+        remote_cfg = (REPO_ROOT / remote_cfg_rel).resolve()
+    if not remote_cfg.exists():
+        raise RuntimeError(
+            f"Cannot read Sherlock-side geology config locally: {remote_cfg} "
+            f"does not exist on bend. Add it to the repo or fix paths.geologies_config."
+        )
+
+    local_entries = _load_geology_list(local_cfg)
+    remote_entries = _load_geology_list(remote_cfg)
+    local_by_fn = {e["filename"]: e["geology_h5_file"] for e in local_entries}
+    remote_by_fn = {e["filename"]: e["geology_h5_file"] for e in remote_entries}
+    pairs = []
+    for fn, lp in local_by_fn.items():
+        rp = remote_by_fn.get(fn)
+        if rp and lp != rp:
+            pairs.append((lp, rp))
+    return pairs
+
+
 # ----------------------------------------------------------------------
 # State synchronization
 # ----------------------------------------------------------------------
@@ -632,8 +730,12 @@ def main() -> int:
     # GPU partition may not have egress; those runs sync up via
     # scripts/wandb_sync.sh after the fact. Both contexts use the same
     # state.wandb_run_id so the dashboards merge cleanly.)
+    #
+    # Note on WANDB_DIR semantics: wandb auto-creates a ``wandb/`` subdir
+    # under whatever path ``WANDB_DIR`` points at. Setting it to the
+    # workspace root makes runs land at ``<ws>/wandb/run-<ts>-<id>/``.
     os.environ["WANDB_MODE"] = compute.get("wandb_mode", "online")
-    os.environ["WANDB_DIR"] = str(ws / "wandb")
+    os.environ["WANDB_DIR"] = str(ws)
     (ws / "wandb").mkdir(parents=True, exist_ok=True)
     wandb_handle = None  # initialized once we know run_id + state.wandb_run_id
 
@@ -649,9 +751,28 @@ def main() -> int:
     try:
         remote.check_alive()
         last_step = "ssh_alive"
+        scratch_root = cfg["paths"]["scratch_root"]
         if run_id is None:
             run_id = _bootstrap_remote_run(remote, cfg, args.config, explicit_run_id=None)
             last_step = f"bootstrapped run_id={run_id}"
+        else:
+            # ``--run-id`` was supplied. If the corresponding state.json is
+            # missing on Sherlock (e.g. a prior bootstrap died before writing
+            # it), run bootstrap with this explicit id instead of failing on
+            # the upcoming pull.
+            probe = remote.run(
+                ["test", "-f", f"{scratch_root}/{run_id}/state.json"], check=False,
+            )
+            if probe.returncode != 0:
+                print(
+                    f"[local-driver] --run-id {run_id} given but no "
+                    f"{scratch_root}/{run_id}/state.json on Sherlock — "
+                    f"running bootstrap with this id."
+                )
+                run_id = _bootstrap_remote_run(
+                    remote, cfg, args.config, explicit_run_id=run_id,
+                )
+                last_step = f"bootstrapped run_id={run_id} (resumed-id)"
         print(f"[local-driver] driving run_id={run_id}")
         remote_run_root = f"{cfg['paths']['scratch_root']}/{run_id}"
         remote_repo_root = compute["remote_repo_root"]
@@ -680,7 +801,14 @@ def main() -> int:
             last_step = f"pulled state iter={iteration}"
             print(f"[local-driver] iter {iteration} starting")
 
+            # Refresh the diagnostic plots up-front so the user sees a current
+            # picture of the previous iterations even while the new one is
+            # still training/staging.
+            _render_local_plots(state, ws)
+
             if wandb_handle is None:
+                print(f"[wandb] initializing run_id={state.wandb_run_id} "
+                      f"project={cfg['wandb']['project']} entity={cfg['wandb'].get('entity')}")
                 wandb_handle = init_run(
                     run_id=state.wandb_run_id,
                     project=cfg["wandb"]["project"],
@@ -690,6 +818,11 @@ def main() -> int:
                     name=state.run_id,
                     resume="allow",
                 )
+                if wandb_handle.is_active:
+                    print(f"[wandb] run dir: {wandb_handle._run.dir}")
+                else:
+                    print("[wandb] init returned no-op handle — see [wandb] errors above.",
+                          file=sys.stderr)
 
             _ensure_norm_config(remote, state, ws)
             local_extra = _read_local_extra(ws)
@@ -715,17 +848,55 @@ def main() -> int:
             local_extra["current_scaler"] = str(scaler)
             _write_local_extra(ws, local_extra)
 
-            manifest_path, n_selected, acq_min = _acquire_and_select_locally(
-                cfg=cfg, state=state, ws=ws, iter_idx=iteration,
-                ckpt=ckpt, scaler=scaler,
+            manifest_path = ws / "manifests" / f"manifest_iter_{iteration:04d}.json"
+            local_acquire_dir = ws / "acquire" / f"iter_{iteration:04d}"
+            # Short-circuit: if a previous run produced the manifest and its
+            # snapshot/well_config artifacts, reuse them instead of re-running
+            # acquisition (which would overwrite identical files).
+            reused = (
+                manifest_path.exists()
+                and (local_acquire_dir / "snapshots_json").is_dir()
+                and (local_acquire_dir / "well_configs").is_dir()
             )
-            last_step = f"acquired+selected iter {iteration}"
+            if reused:
+                existing = json.loads(manifest_path.read_text())
+                n_selected = len(existing.get("snapshots", []))
+                acq_min = 0.0
+                print(f"[local-driver] reusing existing manifest at {manifest_path} "
+                      f"({n_selected} snapshots) — skipping acquire+select")
+            else:
+                manifest_path, n_selected, acq_min = _acquire_and_select_locally(
+                    cfg=cfg, state=state, ws=ws, iter_idx=iteration,
+                    ckpt=ckpt, scaler=scaler,
+                )
+            last_step = f"acquired+selected iter {iteration}" + (" (reused)" if reused else "")
 
-            # Push manifest to Sherlock.
+            # The manifest references absolute paths to per-snapshot JSONs and
+            # well_config .jl files that acquire wrote on bend, plus geology
+            # H5 files at bend-local paths. Julia stage runs on Sherlock so we
+            # (a) rsync the whole acquire/iter_NNNN/ tree over, and (b) rewrite
+            # bend paths in the manifest to their Sherlock counterparts before
+            # pushing it. Geology paths are mapped by matching filenames in the
+            # local vs remote geology configs.
+            remote_acquire_dir = f"{remote_run_root}/iter_{iteration:04d}/acquire"
+            remote.run(["mkdir", "-p", remote_acquire_dir])
+            # Trailing slash on src so rsync mirrors contents (snapshots_json/,
+            # well_configs/) directly into remote_acquire_dir.
+            remote.push(str(local_acquire_dir) + "/", remote_acquire_dir)
+
+            remappings = [
+                # acquire dir prefix first — most specific
+                (str(local_acquire_dir), remote_acquire_dir),
+                # geology h5 files — independent location
+                *_build_geology_remappings(cfg),
+            ]
+            rewritten = _rewrite_manifest_paths(manifest_path, remappings)
+            rewritten_local = ws / "manifests" / f"manifest_iter_{iteration:04d}.remote.json"
+            rewritten_local.write_text(json.dumps(rewritten, indent=2))
             remote_manifest = f"{remote_run_root}/manifests/manifest_iter_{iteration:04d}.json"
             remote.run(["mkdir", "-p", f"{remote_run_root}/manifests"])
-            remote.push(manifest_path, remote_manifest)
-            last_step = "pushed manifest"
+            remote.push(rewritten_local, remote_manifest)
+            last_step = "pushed acquire dir + manifest"
 
             # Stage IX on Sherlock via remote runner.
             stage_root_remote = f"{remote_run_root}/iter_{iteration:04d}/ix_stage"
@@ -804,6 +975,16 @@ def main() -> int:
 
             final = _poll_until_terminal(remote, ingest_job, every=poll_every, label="ingest")
             last_step = f"ingest job {ingest_job} → {final}"
+            # Pull the freshly-ingested state and refresh plots so the
+            # just-completed iteration's metrics show up immediately.
+            try:
+                fresh_state = _pull_state(remote, remote_run_root, ws)
+                _render_local_plots(fresh_state, ws)
+            except SshUnavailable:
+                raise
+            except Exception as e:
+                print(f"[local-driver] post-ingest plot refresh failed: {e}",
+                      file=sys.stderr)
             if final != "COMPLETED":
                 print(
                     f"[local-driver] ingest finished non-COMPLETED ({final}). "

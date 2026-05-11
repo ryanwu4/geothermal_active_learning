@@ -184,10 +184,14 @@ def _scaler_to_torch(scaler, device: torch.device) -> tuple[torch.Tensor, torch.
 
 
 def _read_geology_metadata_safe(read_geology_metadata, src, geology_name: str) -> dict:
-    try:
-        return read_geology_metadata(src, geology_name=geology_name)
-    except Exception:
-        return {"geology_name": geology_name}
+    meta = read_geology_metadata(src, geology_name=geology_name)
+    if meta.get("geology_config_id") in (None, ""):
+        raise RuntimeError(
+            f"Geology {geology_name!r} is missing geology_config_id (Metadata/RepNum or ScenarioName). "
+            "Refusing to emit a manifest snapshot without it — Julia staging would silently default "
+            "geology_config_id to 1 and collide all such snapshots under scenario 1."
+        )
+    return meta
 
 
 def run_acquisition(

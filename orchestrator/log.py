@@ -7,6 +7,8 @@ it via ``WANDB_MODE=disabled``.
 """
 from __future__ import annotations
 
+import sys
+import traceback
 from typing import Any
 
 try:
@@ -60,6 +62,7 @@ def init_run(
     AL run_id. They're separate so wandb can shuffle internally.
     """
     if wandb is None:
+        print("[wandb] not importable — logging disabled.", file=sys.stderr)
         return WandbHandle(None)
     try:
         run = wandb.init(
@@ -72,5 +75,10 @@ def init_run(
             name=name,
         )
         return WandbHandle(run)
-    except Exception:
+    except Exception as e:
+        # Don't kill the AL loop — but do surface the error. Without this the
+        # caller can't tell whether init failed (auth, network, etc.) vs
+        # silently produced a no-op handle.
+        print(f"[wandb] init failed: {e}", file=sys.stderr)
+        traceback.print_exc()
         return WandbHandle(None)

@@ -60,6 +60,12 @@ class IngestMetrics:
     # New: per-candidate rows + per-geology rollups for richer post-run plots.
     candidates: list[CandidateMetric] | None = None
     per_geology: dict[str, dict[str, float | int | None]] | None = None
+    # Outcome counters from the status-JSON pass (added 2026-05-11). Sum of these
+    # plus n_completed equals n_submitted. Tracking them separately keeps
+    # silent-failure modes distinguishable from a stuck SLURM queue.
+    n_failed_per_status: int = 0
+    n_succeeded_but_missing_h5: int = 0
+    n_missing_silently: int = 0
 
 
 def _link_ix_outputs_to_archive(ix_output_dir: Path, archive_dir: Path) -> list[Path]:
@@ -203,6 +209,16 @@ def ingest_iteration(
     n_train_samples = _count_cases(next_compiled_h5)
 
     # Step 4: match outputs back to manifest snapshots and compute metrics.
+    # Status JSONs live at <stage_run_dir>/status/task_NNNNNN.json; the worker
+    # writes one per task. We use them to distinguish:
+    #   - completed_with_h5:        success=true + h5 file present (normal)
+    #   - failed_per_status:        success=false (worker raised; surface it)
+    #   - succeeded_but_missing_h5: success=true but h5 absent (loud alarm)
+    #   - missing_silently:         no status JSON and no h5 (worker never ran)
+    status_dir = array_tasks_json.parent.parent / "status"
+    n_failed_per_status = 0
+    n_succeeded_but_missing_h5 = 0
+    n_missing_silently = 0
     candidates: list[CandidateMetric] = []
     n_completed = 0
     for task in tasks:
@@ -211,7 +227,27 @@ def ingest_iteration(
         if not out_name:
             continue
         produced = ix_output_dir / out_name
+        task_id = task.get("task_id")
+        status_path = status_dir / f"task_{int(task_id):06d}.json" if task_id is not None else None
+        status_payload: dict | None = None
+        if status_path is not None and status_path.exists():
+            try:
+                with open(status_path, "r") as f:
+                    status_payload = json.load(f)
+            except Exception as e:
+                print(f"[ingest] WARN: failed to parse status JSON {status_path}: {e}")
         if not produced.exists():
+            if status_payload is None:
+                n_missing_silently += 1
+                print(f"[ingest] MISSING_SILENTLY case_id={case_id} (no status JSON, no h5; worker never ran or output never staged)")
+            elif status_payload.get("success") is False:
+                n_failed_per_status += 1
+                phase = status_payload.get("phase", "?")
+                err = (status_payload.get("error") or "")[:300]
+                print(f"[ingest] FAILED_PER_STATUS case_id={case_id} phase={phase} error={err}")
+            else:
+                n_succeeded_but_missing_h5 += 1
+                print(f"[ingest] SUCCEEDED_BUT_MISSING_H5 case_id={case_id} status_path={status_path} — worker claimed success but output is absent; this is the IsWell-class symptom and should be investigated")
             continue
         n_completed += 1
         real = _read_real_revenue(delta_h5, case_id)
@@ -310,4 +346,7 @@ def ingest_iteration(
         n_train_samples=n_train_samples,
         candidates=candidates,
         per_geology=per_geology,
+        n_failed_per_status=n_failed_per_status,
+        n_succeeded_but_missing_h5=n_succeeded_but_missing_h5,
+        n_missing_silently=n_missing_silently,
     )

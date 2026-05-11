@@ -1,0 +1,336 @@
+"""One-off: rewrite Input/IsWell + Input/InjRate in each AL per-scenario H5
+that was corrupted by the cli_post_format_scenario.jl place_default_wells
+fallback (the "IsWell bug", 2026-05-08 to 2026-05-11).
+
+The simulator outputs themselves (revenues, well_tp_profiles, WEPT timeseries,
+PermX/Y/Z, Porosity, etc.) are correct in each per-scenario H5 — only the
+input-side `Input/IsWell` and `Input/InjRate` grids were stamped with a
+constant default-template. This script rewrites those two datasets from the
+staged .jl spec that the simulator actually consumed during pre-sim.
+
+After patching, the script optionally re-runs `preprocess_h5.py` over the
+patched directory and merges the result with the bootstrap compiled H5 to
+produce a clean `current_compiled.h5`.
+
+This script is intentionally isolated and not wired into the orchestrator.
+Run once, then delete or archive.
+
+Convention (verified against the bug-default empirical mapping):
+- The staged .jl records each well as `(I_jl, J_jl, K_jl, "TYPE", rate)`
+  with Julia 1-based indices, written by Geothermal_Graph_Surrogate's
+  `to_julia_wells_text` per `(j_idx=round(x)+1, i_idx=round(y)+1,
+  k_idx=round(z)+1)`.
+- Python's view of `Input/IsWell` has shape (NZ, A, B) where the bug-default
+  analysis proved Python axis-1 ↔ Julia j and Python axis-2 ↔ Julia i. So
+  a .jl entry `(I, J, K, ...)` marks `is_well[0:K, J-1, I-1] = 1`.
+- The `Input/IsActive` mask is respected: cells flagged inactive get -999
+  in both arrays (mirrors what `data_collect_initialize_reservoir` does on
+  the Julia side).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+
+import h5py
+import numpy as np
+
+
+# --------------------------------------------------------------------------- #
+# .jl parsing
+# --------------------------------------------------------------------------- #
+
+_WELL_LINE_RE = re.compile(
+    r"\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*\"(INJECTOR|PRODUCER)\"\s*,\s*(-?\d+(?:\.\d+)?)\s*\)"
+)
+
+
+@dataclass(frozen=True)
+class WellSpec:
+    i_jl: int   # Julia 1-based i (axis-2 in Python is i-1)
+    j_jl: int   # Julia 1-based j (axis-1 in Python is j-1)
+    k_jl: int   # Julia 1-based deepest perforation (Python perforations 0..K-1)
+    is_injector: bool
+    rate: float
+
+
+def parse_staged_jl(path: Path) -> list[WellSpec]:
+    """Parse a .jl staged by acquire.to_julia_wells_text. Returns wells in file order."""
+    text = path.read_text()
+    # Scope to the wells = [ ... ] block to avoid matching tuples in comments.
+    m = re.search(r"wells\s*=\s*\[(.*?)\]", text, re.DOTALL)
+    if not m:
+        raise ValueError(f"No `wells = [...]` block in {path}")
+    block = m.group(1)
+    wells: list[WellSpec] = []
+    for line in block.splitlines():
+        match = _WELL_LINE_RE.search(line)
+        if not match:
+            continue
+        i_jl, j_jl, k_jl, well_type, rate_str = match.groups()
+        wells.append(WellSpec(
+            i_jl=int(i_jl),
+            j_jl=int(j_jl),
+            k_jl=int(k_jl),
+            is_injector=(well_type == "INJECTOR"),
+            rate=float(rate_str),
+        ))
+    if not wells:
+        raise ValueError(f"Empty wells list in {path}")
+    return wells
+
+
+# --------------------------------------------------------------------------- #
+# Task-id ↔ staged-jl mapping
+# --------------------------------------------------------------------------- #
+
+def build_output_to_staged_jl_map(stage_roots: Iterable[Path]) -> dict[str, str]:
+    """Walk array_tasks.json files under each stage_root and return a dict
+    mapping output_file_name → staged_jl_path. This is the canonical source of
+    truth — it's exactly what the worker consumed when running IX.
+    """
+    mapping: dict[str, str] = {}
+    for root in stage_roots:
+        for tj in sorted(Path(root).rglob("array_tasks.json")):
+            try:
+                with open(tj) as f:
+                    payload = json.load(f)
+            except Exception as e:
+                print(f"[reprocess] WARN: failed to parse {tj}: {e}", file=sys.stderr)
+                continue
+            for task in payload.get("tasks", []):
+                out_name = task.get("output_file_name")
+                jl_path = task.get("staged_jl_path") or task.get("staged_jl_relpath")
+                if out_name and jl_path:
+                    if not Path(jl_path).is_absolute():
+                        jl_path = str(Path(tj).parent / jl_path)
+                    mapping[out_name] = jl_path
+    return mapping
+
+
+# --------------------------------------------------------------------------- #
+# H5 patching
+# --------------------------------------------------------------------------- #
+
+def rebuild_iswell_injrate(
+    is_active: np.ndarray,  # shape (NZ, A, B), 0/1 mask (or -999 etc.)
+    wells: list[WellSpec],
+    default_float: float = -999.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Construct fresh IsWell + InjRate arrays from a .jl wells spec.
+
+    The (i_jl, j_jl) → Python-(axis-1, axis-2) mapping is the swap proven by
+    the bug-default analysis: Python_x = j_jl - 1 (axis 1), Python_y = i_jl - 1
+    (axis 2). For each well, mark every k from 0..k_jl-1 inclusive.
+    """
+    nz, dim_a, dim_b = is_active.shape
+    is_well = np.zeros((nz, dim_a, dim_b), dtype=np.int64)
+    inj_rate = np.zeros((nz, dim_a, dim_b), dtype=np.float32)
+
+    inactive_mask = is_active != 1  # True where cell is inactive
+
+    for w in wells:
+        ax1 = w.j_jl - 1
+        ax2 = w.i_jl - 1
+        if not (0 <= ax1 < dim_a and 0 <= ax2 < dim_b):
+            raise ValueError(
+                f"Well (i_jl={w.i_jl}, j_jl={w.j_jl}) out of grid bounds (A={dim_a}, B={dim_b})"
+            )
+        kf = w.k_jl
+        if kf < 1 or kf > nz:
+            raise ValueError(
+                f"Well perforation depth k_jl={kf} outside [1, {nz}] for grid"
+            )
+        # Mirror data_collect_initialize_reservoir's inactive-cell handling.
+        column_inactive = inactive_mask[:kf, ax1, ax2]
+        is_well[:kf, ax1, ax2] = np.where(column_inactive, -999, 1)
+        sign = 1.0 if w.is_injector else -1.0
+        rate_value = sign * abs(w.rate)
+        inj_rate[:kf, ax1, ax2] = np.where(column_inactive, default_float, rate_value)
+    return is_well, inj_rate
+
+
+def patch_one_h5(h5_path: Path, jl_path: Path, default_float: float = -999.0) -> dict:
+    """Patch Input/IsWell + Input/InjRate in `h5_path` from `jl_path`. Returns a
+    summary dict for logging.
+    """
+    wells = parse_staged_jl(jl_path)
+    with h5py.File(h5_path, "r+") as f:
+        is_active = f["Input/IsActive"][:]
+        old_iswell = f["Input/IsWell"][:]
+        if is_active.shape != old_iswell.shape:
+            raise ValueError(
+                f"Shape mismatch in {h5_path}: IsActive {is_active.shape} vs IsWell {old_iswell.shape}"
+            )
+        new_iswell, new_injrate = rebuild_iswell_injrate(is_active, wells, default_float)
+
+        # Sanity: the bugged default writes the same template into every H5; if
+        # the .jl produces an IsWell identical to the OLD one (byte-equal), that
+        # means either (a) this H5 was already correct, or (b) the .jl
+        # coincidentally matches the default template. Either way, log it.
+        unchanged = bool(np.array_equal(new_iswell, old_iswell))
+
+        del f["Input/IsWell"]
+        del f["Input/InjRate"]
+        f.create_dataset("Input/IsWell", data=new_iswell, dtype=np.int64, compression="gzip", compression_opts=4)
+        f.create_dataset("Input/InjRate", data=new_injrate, dtype=np.float32, compression="gzip", compression_opts=4)
+
+    return {
+        "h5": str(h5_path),
+        "jl": str(jl_path),
+        "n_wells": len(wells),
+        "unchanged": unchanged,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Re-preprocess + merge
+# --------------------------------------------------------------------------- #
+
+def run_preprocess(
+    surrogate_repo: Path,
+    input_dir: Path,
+    output_h5: Path,
+    norm_config: Path,
+    economics_config: Path | None,
+    workers: int = 4,
+) -> None:
+    cmd = [
+        sys.executable,
+        str(surrogate_repo / "preprocess_h5.py"),
+        "--input-dir", str(input_dir),
+        "--output-h5", str(output_h5),
+        "--norm-config", str(norm_config),
+        "--workers", str(workers),
+    ]
+    if economics_config is not None:
+        cmd.extend(["--economics-config", str(economics_config)])
+    print(f"[reprocess] running: {' '.join(cmd)}")
+    proc = subprocess.run(cmd, cwd=str(surrogate_repo), check=False)
+    if proc.returncode != 0:
+        raise RuntimeError(f"preprocess_h5.py failed with code {proc.returncode}")
+
+
+def merge_compiled(prior: Path, delta: Path, out: Path) -> None:
+    """Mirror orchestrator.ingest._merge_compiled_h5s: copy prior groups, then
+    overlay delta groups (delta wins on collision).
+    """
+    with h5py.File(prior, "r") as p, h5py.File(delta, "r") as d, h5py.File(out, "w") as o:
+        for k, v in p.attrs.items():
+            o.attrs[k] = v
+        delta_keys = set(d.keys())
+        for key in p.keys():
+            if key in delta_keys:
+                continue
+            p.copy(key, o)
+        for key in d.keys():
+            d.copy(key, o)
+
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--raw-h5-dir", type=Path, required=True,
+                    help="Directory containing the per-scenario IX-output H5s to patch.")
+    ap.add_argument("--stage-root", type=Path, action="append", required=True,
+                    help="Stage root containing iter_*/array_tasks.json files. May be passed multiple times.")
+    ap.add_argument("--patched-output-dir", type=Path, default=None,
+                    help="If set, write patched H5s here instead of in-place. (Symlinks the originals first; "
+                         "the patched copies live in this dir.) Default: in-place.")
+    ap.add_argument("--rebuild-compiled", action="store_true",
+                    help="After patching, run preprocess_h5.py over the patched dir and merge with --bootstrap-compiled-h5.")
+    ap.add_argument("--surrogate-repo", type=Path, default=None,
+                    help="Path to Geothermal_Graph_Surrogate (needed only with --rebuild-compiled).")
+    ap.add_argument("--bootstrap-compiled-h5", type=Path, default=None,
+                    help="Bootstrap compiled H5 to merge AL delta into.")
+    ap.add_argument("--norm-config", type=Path, default=None,
+                    help="Norm config used by preprocess_h5.py.")
+    ap.add_argument("--economics-config", type=Path, default=None,
+                    help="Optional economics config for preprocess_h5.py.")
+    ap.add_argument("--output-compiled-h5", type=Path, default=None,
+                    help="Where to write the final rebuilt compiled H5.")
+    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--dry-run", action="store_true",
+                    help="Print what would be patched without modifying files.")
+    args = ap.parse_args()
+
+    out_to_jl = build_output_to_staged_jl_map(args.stage_root)
+    if not out_to_jl:
+        print(f"[reprocess] FATAL: no array_tasks.json entries found under {args.stage_root}", file=sys.stderr)
+        return 2
+    print(f"[reprocess] loaded {len(out_to_jl)} output_file_name → staged_jl_path mappings")
+
+    h5_files = sorted(args.raw_h5_dir.glob("*.h5"))
+    print(f"[reprocess] found {len(h5_files)} h5 files under {args.raw_h5_dir}")
+
+    if args.patched_output_dir:
+        args.patched_output_dir.mkdir(parents=True, exist_ok=True)
+
+    n_patched = 0
+    n_skipped_no_jl = 0
+    n_unchanged = 0
+    n_errors = 0
+    for h5 in h5_files:
+        out_name = h5.name
+        jl = out_to_jl.get(out_name)
+        if jl is None:
+            print(f"[reprocess] SKIP no staged .jl mapping for {out_name}")
+            n_skipped_no_jl += 1
+            continue
+        target = h5
+        if args.patched_output_dir:
+            target = args.patched_output_dir / out_name
+            if not target.exists():
+                # Copy bytes so we don't touch the original.
+                target.write_bytes(h5.read_bytes())
+        if args.dry_run:
+            print(f"[reprocess] DRY would patch {target}  ← {jl}")
+            continue
+        try:
+            res = patch_one_h5(target, Path(jl))
+        except Exception as e:
+            print(f"[reprocess] ERROR patching {target}: {e}", file=sys.stderr)
+            n_errors += 1
+            continue
+        n_patched += 1
+        if res["unchanged"]:
+            n_unchanged += 1
+        if n_patched % 100 == 0:
+            print(f"[reprocess] progress: patched={n_patched} unchanged={n_unchanged} skipped={n_skipped_no_jl} errors={n_errors}")
+    print(f"[reprocess] done patching: total={len(h5_files)} patched={n_patched} unchanged={n_unchanged} skipped_no_jl={n_skipped_no_jl} errors={n_errors}")
+
+    if args.dry_run:
+        return 0
+
+    if args.rebuild_compiled:
+        if not (args.surrogate_repo and args.bootstrap_compiled_h5 and args.norm_config and args.output_compiled_h5):
+            print("[reprocess] FATAL: --rebuild-compiled requires --surrogate-repo, --bootstrap-compiled-h5, --norm-config, --output-compiled-h5", file=sys.stderr)
+            return 2
+        patched_dir = args.patched_output_dir or args.raw_h5_dir
+        delta_h5 = args.output_compiled_h5.with_suffix(".al_delta.h5")
+        print(f"[reprocess] running preprocess_h5.py over patched dir → {delta_h5}")
+        run_preprocess(
+            surrogate_repo=args.surrogate_repo,
+            input_dir=patched_dir,
+            output_h5=delta_h5,
+            norm_config=args.norm_config,
+            economics_config=args.economics_config,
+            workers=args.workers,
+        )
+        print(f"[reprocess] merging {args.bootstrap_compiled_h5} + {delta_h5} → {args.output_compiled_h5}")
+        merge_compiled(args.bootstrap_compiled_h5, delta_h5, args.output_compiled_h5)
+        print(f"[reprocess] wrote {args.output_compiled_h5}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
