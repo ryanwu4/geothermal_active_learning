@@ -87,7 +87,7 @@ python "${AL_REPO}/scripts/reprocess_al_h5s_iswell_fix.py" \
     --norm-config "${NORM_CONFIG}" \
     --output-compiled-h5 "${OUTPUT_COMPILED_H5}" \
     --workers "${PREPROCESS_WORKERS}" \
-    "${extra_args[@]}"
+    ${extra_args[@]+"${extra_args[@]}"}
 
 # Stage 3: sanity-check the rebuilt compiled H5. We expect roughly one
 # distinct well-xy template per AL row (every snapshot has a unique geometry).
