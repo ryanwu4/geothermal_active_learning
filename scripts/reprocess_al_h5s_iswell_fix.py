@@ -269,34 +269,41 @@ def main() -> int:
         return 2
     print(f"[reprocess] loaded {len(out_to_jl)} output_file_name → staged_jl_path mappings")
 
-    h5_files = sorted(args.raw_h5_dir.glob("*.h5"))
-    print(f"[reprocess] found {len(h5_files)} h5 files under {args.raw_h5_dir}")
-
+    # Drive the loop from the mapping, not the directory. The raw-h5-dir may
+    # be a shared bucket (e.g. /scratch/users/rwu4/intersect_data/h5s_out)
+    # containing H5s from many runs; we should only touch files this run's
+    # stage roots actually claim.
     if args.patched_output_dir:
         args.patched_output_dir.mkdir(parents=True, exist_ok=True)
 
     n_patched = 0
-    n_skipped_no_jl = 0
+    n_missing_in_h5_dir = 0
+    n_missing_jl_on_disk = 0
     n_unchanged = 0
     n_errors = 0
-    for h5 in h5_files:
-        out_name = h5.name
-        jl = out_to_jl.get(out_name)
-        if jl is None:
-            print(f"[reprocess] SKIP no staged .jl mapping for {out_name}")
-            n_skipped_no_jl += 1
+    missing_h5_names: list[str] = []
+    for out_name in sorted(out_to_jl):
+        jl_path = Path(out_to_jl[out_name])
+        src_h5 = args.raw_h5_dir / out_name
+        if not src_h5.exists():
+            n_missing_in_h5_dir += 1
+            if len(missing_h5_names) < 20:
+                missing_h5_names.append(out_name)
             continue
-        target = h5
+        if not jl_path.exists():
+            print(f"[reprocess] WARN staged .jl missing for {out_name}: {jl_path}", file=sys.stderr)
+            n_missing_jl_on_disk += 1
+            continue
+        target = src_h5
         if args.patched_output_dir:
             target = args.patched_output_dir / out_name
             if not target.exists():
-                # Copy bytes so we don't touch the original.
-                target.write_bytes(h5.read_bytes())
+                target.write_bytes(src_h5.read_bytes())
         if args.dry_run:
-            print(f"[reprocess] DRY would patch {target}  ← {jl}")
+            print(f"[reprocess] DRY would patch {target}  ← {jl_path}")
             continue
         try:
-            res = patch_one_h5(target, Path(jl))
+            res = patch_one_h5(target, jl_path)
         except Exception as e:
             print(f"[reprocess] ERROR patching {target}: {e}", file=sys.stderr)
             n_errors += 1
@@ -304,9 +311,15 @@ def main() -> int:
         n_patched += 1
         if res["unchanged"]:
             n_unchanged += 1
-        if n_patched % 100 == 0:
-            print(f"[reprocess] progress: patched={n_patched} unchanged={n_unchanged} skipped={n_skipped_no_jl} errors={n_errors}")
-    print(f"[reprocess] done patching: total={len(h5_files)} patched={n_patched} unchanged={n_unchanged} skipped_no_jl={n_skipped_no_jl} errors={n_errors}")
+        if n_patched % 200 == 0:
+            print(f"[reprocess] progress: patched={n_patched} unchanged={n_unchanged} missing_h5={n_missing_in_h5_dir} missing_jl={n_missing_jl_on_disk} errors={n_errors}")
+    print(
+        f"[reprocess] done patching: expected={len(out_to_jl)} patched={n_patched} "
+        f"unchanged={n_unchanged} missing_h5={n_missing_in_h5_dir} "
+        f"missing_jl={n_missing_jl_on_disk} errors={n_errors}"
+    )
+    if n_missing_in_h5_dir:
+        print(f"[reprocess] first missing h5s: {missing_h5_names[:10]}")
 
     if args.dry_run:
         return 0
@@ -315,7 +328,14 @@ def main() -> int:
         if not (args.surrogate_repo and args.bootstrap_compiled_h5 and args.norm_config and args.output_compiled_h5):
             print("[reprocess] FATAL: --rebuild-compiled requires --surrogate-repo, --bootstrap-compiled-h5, --norm-config, --output-compiled-h5", file=sys.stderr)
             return 2
-        patched_dir = args.patched_output_dir or args.raw_h5_dir
+        if not args.patched_output_dir:
+            print(
+                "[reprocess] FATAL: --rebuild-compiled requires --patched-output-dir so preprocess only sees this run's AL outputs. "
+                "Running preprocess over the shared raw-h5-dir would compile every unrelated H5 too.",
+                file=sys.stderr,
+            )
+            return 2
+        patched_dir = args.patched_output_dir
         delta_h5 = args.output_compiled_h5.with_suffix(".al_delta.h5")
         print(f"[reprocess] running preprocess_h5.py over patched dir → {delta_h5}")
         run_preprocess(
