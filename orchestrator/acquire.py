@@ -152,6 +152,8 @@ def _build_static_batch_for_starts(
     extract_vertical_profiles,
     build_single_hetero_data,
     temp0_full: np.ndarray,
+    node_encoder: str = "profile",
+    enrich_global_attr: bool = False,
 ):
     """Build a list of normalized HeteroData objects, one per start."""
     static_graphs = []
@@ -190,6 +192,8 @@ def _build_static_batch_for_starts(
                 target_val=0.0,
                 vertical_profile=vertical_profiles,
                 case_id=f"start{m_idx}",
+                node_encoder=node_encoder,
+                enrich_global_attr=enrich_global_attr,
             )
             static_graphs.append(scaler.transform_graph(raw_graph))
     return static_graphs
@@ -236,6 +240,10 @@ class _WorkerContext:
     PERM_PROPS: Any
     find_z_cutoff: Any
     get_valid_mask: Any
+    # Data-pipeline knobs read from the loaded checkpoint's hparams so the graphs
+    # we build here match the scaler the model was trained with.
+    node_encoder: str = "profile"
+    enrich_global_attr: bool = False
 
 
 def _build_worker_context(
@@ -281,6 +289,14 @@ def _build_worker_context(
     model.eval()
     target_mean, target_scale = _scaler_to_torch(scaler, device)
 
+    # Recover the data-pipeline config from the checkpoint's saved_hyperparameters.
+    # node_encoder is stored directly. enrich_global_attr is inferred from global_dim:
+    # legacy (n_wells only) = 1; enriched (n_wells + 7 reservoir means/anisotropy) = 8.
+    hp = model.hparams
+    node_encoder = getattr(hp, "node_encoder", "profile")
+    global_dim = int(getattr(hp, "global_dim", 1))
+    enrich_global_attr = global_dim != 1
+
     is_injector_list = [w.type == "injector" for w in cfg.wells]
     num_wells = len(cfg.wells)
     base_seed = cfg.seed + iteration
@@ -305,6 +321,8 @@ def _build_worker_context(
         PERM_PROPS=PERM_PROPS,
         find_z_cutoff=find_z_cutoff,
         get_valid_mask=get_valid_mask,
+        node_encoder=node_encoder,
+        enrich_global_attr=enrich_global_attr,
     )
 
 
@@ -379,6 +397,8 @@ def _run_one_geology(
         cfg.revenue_target, ctx.scaler,
         ctx.extract_well_data, ctx.build_wells_table, ctx.extract_vertical_profiles,
         ctx.build_single_hetero_data, temp0_full,
+        node_encoder=ctx.node_encoder,
+        enrich_global_attr=ctx.enrich_global_attr,
     )
     batch_data = Batch.from_data_list(static_graphs).to(device)
 
