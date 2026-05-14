@@ -205,6 +205,7 @@ def main() -> int:
         plateau_window=int(config["stopping"].get("plateau_window", 5)),
         plateau_threshold_relative=float(config["stopping"].get("plateau_threshold_relative", 0.005)),
         target_mape=config["stopping"].get("target_mape"),
+        target_mape_window=int(config["stopping"].get("target_mape_window", 3)),
         consecutive_zero_completion_limit=int(
             config["stopping"].get("consecutive_zero_completion_limit", 2)
         ),

@@ -43,6 +43,10 @@ class CandidateMetric:
     real_revenue: float
     abs_pct_error: float
     signed_pct_error: float
+    abs_error: float = float("nan")
+    # Floored APE: abs(pred-real) / max(abs(real), denom_floor). The denom floor
+    # prevents geo-8-style "MAPE blows up because true revenue is small" artifacts.
+    abs_pct_error_floored: float = float("nan")
 
 
 @dataclass
@@ -57,6 +61,12 @@ class IngestMetrics:
     best_real_revenue_in_batch: float | None
     best_real_revenue_so_far: float | None
     n_train_samples: int
+    # Absolute-error and floored-MAPE counterparts (added to expose whether a
+    # MAPE blow-up reflects real model regression or just a small denominator).
+    batch_mae: float | None = None
+    batch_mape_floored: float | None = None
+    frontier_mae: float | None = None
+    adversarial_mae: float | None = None
     # New: per-candidate rows + per-geology rollups for richer post-run plots.
     candidates: list[CandidateMetric] | None = None
     per_geology: dict[str, dict[str, float | int | None]] | None = None
@@ -270,9 +280,11 @@ def ingest_iteration(
         if real == 0 or not np.isfinite(predicted) or not np.isfinite(real):
             abs_pct = float("nan")
             signed_pct = float("nan")
+            abs_err = float("nan")
         else:
             abs_pct = abs(predicted - real) / abs(real)
             signed_pct = (predicted - real) / abs(real)
+            abs_err = abs(predicted - real)
 
         candidates.append(CandidateMetric(
             snapshot_id=str(task.get("snapshot_id", "")),
@@ -285,6 +297,7 @@ def ingest_iteration(
             real_revenue=float(real),
             abs_pct_error=float(abs_pct),
             signed_pct_error=float(signed_pct),
+            abs_error=float(abs_err),
         ))
 
     completion_rate = (n_completed / n_submitted) if n_submitted > 0 else 0.0
@@ -298,6 +311,22 @@ def ingest_iteration(
     frontier_mape = _mean_finite([c.abs_pct_error for c in candidates if c.kind == "frontier"])
     adversarial_mape = _mean_finite([c.abs_pct_error for c in candidates if c.kind == "adversarial"])
 
+    # Floored MAPE: divide by max(|real|, 0.1 * cohort_median_real). Lets MAPE remain
+    # interpretable on the geo-8-like cohort with small true values.
+    finite_reals = [abs(c.real_revenue) for c in candidates if np.isfinite(c.real_revenue) and c.real_revenue != 0]
+    cohort_median_real = float(np.median(finite_reals)) if finite_reals else 0.0
+    floor_denom = 0.1 * cohort_median_real
+    for c in candidates:
+        if not np.isfinite(c.real_revenue) or not np.isfinite(c.predicted_revenue):
+            c.abs_pct_error_floored = float("nan")
+            continue
+        denom = max(abs(c.real_revenue), floor_denom) if floor_denom > 0 else abs(c.real_revenue)
+        c.abs_pct_error_floored = float(abs(c.predicted_revenue - c.real_revenue) / denom) if denom > 0 else float("nan")
+    batch_mape_floored = _mean_finite([c.abs_pct_error_floored for c in candidates])
+    batch_mae = _mean_finite([c.abs_error for c in candidates])
+    frontier_mae = _mean_finite([c.abs_error for c in candidates if c.kind == "frontier"])
+    adversarial_mae = _mean_finite([c.abs_error for c in candidates if c.kind == "adversarial"])
+
     # Per-geology rollup — useful for spotting geologies the surrogate
     # systematically struggles on, and for the convergence plot script.
     per_geology: dict[str, dict[str, float | int | None]] = {}
@@ -305,12 +334,18 @@ def ingest_iteration(
         bucket = per_geology.setdefault(str(c.geology_index), {
             "count": 0,
             "mape": [],
+            "mape_floored": [],
+            "mae": [],
             "signed_bias": [],
             "max_real_revenue": None,
         })
         bucket["count"] += 1  # type: ignore[operator]
         if np.isfinite(c.abs_pct_error):
             bucket["mape"].append(c.abs_pct_error)  # type: ignore[union-attr]
+        if np.isfinite(c.abs_pct_error_floored):
+            bucket["mape_floored"].append(c.abs_pct_error_floored)  # type: ignore[union-attr]
+        if np.isfinite(c.abs_error):
+            bucket["mae"].append(c.abs_error)  # type: ignore[union-attr]
         if np.isfinite(c.signed_pct_error):
             bucket["signed_bias"].append(c.signed_pct_error)  # type: ignore[union-attr]
         if np.isfinite(c.real_revenue):
@@ -321,6 +356,8 @@ def ingest_iteration(
     # Collapse list-valued aggregates to scalars.
     for g, bucket in per_geology.items():
         bucket["mape"] = _mean_finite(bucket["mape"])  # type: ignore[arg-type]
+        bucket["mape_floored"] = _mean_finite(bucket["mape_floored"])  # type: ignore[arg-type]
+        bucket["mae"] = _mean_finite(bucket["mae"])  # type: ignore[arg-type]
         bucket["signed_bias"] = _mean_finite(bucket["signed_bias"])  # type: ignore[arg-type]
 
     real_values = [c.real_revenue for c in candidates if np.isfinite(c.real_revenue)]
@@ -344,6 +381,10 @@ def ingest_iteration(
         best_real_revenue_in_batch=best_in_batch,
         best_real_revenue_so_far=best_so_far,
         n_train_samples=n_train_samples,
+        batch_mae=batch_mae,
+        batch_mape_floored=batch_mape_floored,
+        frontier_mae=frontier_mae,
+        adversarial_mae=adversarial_mae,
         candidates=candidates,
         per_geology=per_geology,
         n_failed_per_status=n_failed_per_status,

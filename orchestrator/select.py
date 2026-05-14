@@ -99,8 +99,15 @@ def _farthest_point_select(features: np.ndarray, k: int, seed_idx: int = 0) -> l
 def _select_frontier_per_geology(
     candidates: Sequence[Candidate], target: int
 ) -> list[Candidate]:
-    """Distribute ``target`` slots across geologies proportional to candidate counts,
+    """Distribute ``target`` slots across geologies *equally* (not proportionally),
     then greedily diversify within each geology.
+
+    Equal allocation matches the `n_starts_per_geology` guarantee at acquisition
+    time: every geology is meant to get the same number of seed configurations,
+    so the selection step shouldn't undo that by penalising geologies whose
+    Adam runs produced fewer finite candidates. The previous proportional
+    allocation drove the iter-5 geo-8 acquisition bias when geo-8 Adam runs
+    went non-finite more often than the cohort.
     """
     if target <= 0 or not candidates:
         return []
@@ -109,35 +116,30 @@ def _select_frontier_per_geology(
     for c in candidates:
         by_geo.setdefault(c.geology_index, []).append(c)
 
-    # Initial proportional allocation, rounded down.
     geo_keys = sorted(by_geo.keys())
-    counts = np.array([len(by_geo[g]) for g in geo_keys], dtype=np.float64)
-    weights = counts / counts.sum()
-    raw = weights * target
-    base = np.floor(raw).astype(int)
+    n_geos = len(geo_keys)
+    # Equal allocation: floor(target / n_geos) per geology, remainder distributed
+    # deterministically by geology id (round-robin).
+    base = np.array([target // n_geos] * n_geos, dtype=int)
     remainder = target - int(base.sum())
-    # Distribute leftover slots by largest fractional remainder.
-    fractional = raw - base
-    order = np.argsort(-fractional)
     for i in range(remainder):
-        base[order[i % len(order)]] += 1
-    # Clamp so we don't ask for more than each geology has.
-    for i, g in enumerate(geo_keys):
-        base[i] = min(int(base[i]), len(by_geo[g]))
-
-    # If clamping reduced the total below target, redistribute leftover to
-    # geologies that still have headroom, again by fractional remainder.
+        base[i % n_geos] += 1
+    # Clamp so we don't ask for more than each geology has, then redistribute
+    # any leftover to geologies that still have headroom.
+    headroom = np.array([len(by_geo[g]) for g in geo_keys], dtype=int)
+    for i in range(n_geos):
+        base[i] = min(int(base[i]), int(headroom[i]))
     short = target - int(base.sum())
-    if short > 0:
-        for i in order:
-            if short <= 0:
-                break
-            geo = geo_keys[i]
-            headroom = len(by_geo[geo]) - int(base[i])
-            if headroom > 0:
-                take = min(short, headroom)
-                base[i] += take
-                short -= take
+    while short > 0:
+        # Find geologies with remaining headroom; prefer those with the most.
+        slack = headroom - base
+        slack[slack <= 0] = -1  # ignore exhausted geologies
+        if int(slack.max()) <= 0:
+            break
+        i = int(np.argmax(slack))
+        take = min(short, int(slack[i]))
+        base[i] += take
+        short -= take
 
     selected: list[Candidate] = []
     for i, g in enumerate(geo_keys):

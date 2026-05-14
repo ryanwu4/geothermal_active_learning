@@ -12,6 +12,9 @@ class StoppingConfig:
     plateau_window: int = 5
     plateau_threshold_relative: float = 0.005
     target_mape: float | None = None
+    # Dedicated window for the target-MAPE check. Decoupled from `plateau_window`
+    # so revenue-plateau and MAPE-target stops can use different sustain lengths.
+    target_mape_window: int = 3
     # Bail out if IX completion rate has been zero for this many consecutive
     # iterations. Protects against silently burning compute when Intersect
     # systematically fails (bad submission, missing files, etc.).
@@ -100,9 +103,9 @@ def evaluate_stopping(state: RunState, cfg: StoppingConfig) -> StopDecision:
             reason=f"revenue plateau over last {cfg.plateau_window} iters "
                    f"(< {cfg.plateau_threshold_relative} relative improvement)",
         )
-    if cfg.target_mape is not None and _mape_plateau(state, cfg.plateau_window, cfg.target_mape):
+    if cfg.target_mape is not None and _mape_plateau(state, cfg.target_mape_window, cfg.target_mape):
         return StopDecision(
             should_stop=True,
-            reason=f"MAPE below target ({cfg.target_mape}) for {cfg.plateau_window} iters",
+            reason=f"MAPE below target ({cfg.target_mape}) for {cfg.target_mape_window} iters",
         )
     return StopDecision(should_stop=False, reason=None)

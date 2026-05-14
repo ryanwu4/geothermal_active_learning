@@ -15,7 +15,7 @@
     "julia_repo": "/home/users/rwu4/GeologicalSimulationWrapper.jl",
     "julia_config": "configs/sherlock_ryan.json",
     "bootstrap_compiled_h5": "/scratch/users/rwu4/al_runs/compiled_CNN_patched.h5",
-    "bootstrap_checkpoint_dir": "/home/users/rwu4/Geothermal_Graph_Surrogate/trained/withheld_0p_discountedrevenue/checkpoints",
+    "bootstrap_checkpoint_dir": "/home/users/rwu4/Geothermal_Graph_Surrogate/trained/nodecnn_discountedrevenue/checkpoints",
     "geologies_config": "configs/geologies_smoke.json",
     "norm_config_path": "/scratch/users/rwu4/al_runs/norm_config.json"
   },

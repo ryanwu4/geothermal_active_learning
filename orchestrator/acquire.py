@@ -66,6 +66,24 @@ class AcquisitionConfig:
     revenue_target: str
     seed: int = 42
     device: str = "cuda:0"
+    # Optional list of CUDA devices for cross-geology parallelism. When None or
+    # of length 1, runs in-process on a single device (back-compat). When > 1,
+    # spawns one worker subprocess per device and dispatches geologies across
+    # them via a shared queue. See ``run_acquisition`` for details.
+    devices: list[str] | None = None
+
+
+# Canonical ordering for snapshots in the aggregate manifest so parallel runs
+# produce byte-identical output to serial runs.
+_KIND_ORDER = {"frontier": 0, "adversarial": 1}
+
+
+def _snapshot_sort_key(snap: dict) -> tuple[int, int, int]:
+    return (
+        int(snap.get("well_config_paths_by_geology", [{}])[0].get("geology_index", 0)),
+        _KIND_ORDER.get(snap.get("kind", ""), 99),
+        int(snap.get("run_id", 0)),
+    )
 
 
 def _ensure_surrogate_imports(repo_root: Path) -> None:
@@ -194,19 +212,37 @@ def _read_geology_metadata_safe(read_geology_metadata, src, geology_name: str) -
     return meta
 
 
-def run_acquisition(
-    cfg: AcquisitionConfig,
-    *,
-    out_dir: Path,
-    iteration: int,
-    run_id_prefix: str = "al",
-) -> dict[str, Any]:
-    """Run multi-geology acquisition and emit a manifest at ``out_dir``.
+@dataclass
+class _WorkerContext:
+    """Per-process state for acquisition. Built once per worker."""
 
-    Returns the parsed manifest dict; also writes:
-      - ``out_dir/well_configs/<snapshot_id>.jl`` per snapshot
-      - ``out_dir/snapshots_json/<snapshot_id>.json`` per snapshot
-      - ``out_dir/manifest.json`` aggregate
+    device: torch.device
+    model: Any
+    scaler: Any
+    target_mean: torch.Tensor
+    target_scale: torch.Tensor
+    norm_config: dict
+    is_injector_list: list[bool]
+    num_wells: int
+    base_seed: int
+    # Resolved late-import callables (cached so we don't re-resolve per geology).
+    build_wells_table: Any
+    extract_vertical_profiles: Any
+    extract_well_data: Any
+    read_geology_metadata: Any
+    to_julia_wells_text: Any
+    build_single_hetero_data: Any
+    PROPERTIES: Any
+    PERM_PROPS: Any
+    find_z_cutoff: Any
+    get_valid_mask: Any
+
+
+def _build_worker_context(
+    cfg: AcquisitionConfig, iteration: int, device_str: str
+) -> _WorkerContext:
+    """Resolve surrogate imports and load model+scaler+normalization onto a
+    given CUDA device. Safe to call from a freshly-spawned subprocess.
     """
     _ensure_surrogate_imports(cfg.surrogate_repo)
 
@@ -229,18 +265,12 @@ def run_acquisition(
         get_valid_mask,
     )
 
-    out_dir = Path(out_dir)
-    well_configs_dir = out_dir / "well_configs"
-    snapshots_json_dir = out_dir / "snapshots_json"
-    well_configs_dir.mkdir(parents=True, exist_ok=True)
-    snapshots_json_dir.mkdir(parents=True, exist_ok=True)
-
     with open(cfg.norm_config_path, "r") as f:
         norm_config = json.load(f)
     with open(cfg.scaler_path, "rb") as f:
         scaler = pickle.load(f)
 
-    device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
+    device = torch.device(device_str if torch.cuda.is_available() else "cpu")
     # PyTorch 2.6+ defaults weights_only=True; allow PosixPath.
     import pathlib
     if hasattr(torch.serialization, "add_safe_globals"):
@@ -253,170 +283,402 @@ def run_acquisition(
 
     is_injector_list = [w.type == "injector" for w in cfg.wells]
     num_wells = len(cfg.wells)
-
-    # Use a deterministic seed offset per iteration so AL runs are reproducible.
     base_seed = cfg.seed + iteration
-    rng = np.random.default_rng(base_seed)
-    sampler = qmc.LatinHypercube(d=2 * num_wells, seed=base_seed)
+
+    return _WorkerContext(
+        device=device,
+        model=model,
+        scaler=scaler,
+        target_mean=target_mean,
+        target_scale=target_scale,
+        norm_config=norm_config,
+        is_injector_list=is_injector_list,
+        num_wells=num_wells,
+        base_seed=base_seed,
+        build_wells_table=build_wells_table,
+        extract_vertical_profiles=extract_vertical_profiles,
+        extract_well_data=extract_well_data,
+        read_geology_metadata=read_geology_metadata,
+        to_julia_wells_text=to_julia_wells_text,
+        build_single_hetero_data=build_single_hetero_data,
+        PROPERTIES=PROPERTIES,
+        PERM_PROPS=PERM_PROPS,
+        find_z_cutoff=find_z_cutoff,
+        get_valid_mask=get_valid_mask,
+    )
+
+
+def _per_geology_seed(base_seed: int, geology_index: int) -> int:
+    """Deterministic per-geology seed. Decoupling each geology from the global
+    sampler state lets us partition geologies across worker processes without
+    changing numerical results.
+    """
+    # Mask to 64 bits so numpy/scipy seed APIs accept it on all platforms.
+    return ((base_seed * 1_000_003) ^ (geology_index * 1009)) & ((1 << 63) - 1)
+
+
+def _run_one_geology(
+    *,
+    cfg: AcquisitionConfig,
+    geo: GeologySpec,
+    iteration: int,
+    ctx: _WorkerContext,
+    well_configs_dir: Path,
+    snapshots_json_dir: Path,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Run gradient-descent acquisition for a single geology on ``ctx.device``.
+
+    Returns (snapshot_records, candidate_payloads). Candidate payloads are
+    plain dicts so they survive the IPC boundary; the parent converts them
+    back to ``Candidate`` instances via ``_payload_to_candidate``.
+    """
+    device = ctx.device
+    model = ctx.model
+    target_mean = ctx.target_mean
+    target_scale = ctx.target_scale
+    is_injector_list = ctx.is_injector_list
+    num_wells = ctx.num_wells
+
+    geo_path = Path(geo.geology_h5_file)
+    geo_name = geo.geology_name or geo_path.stem
+    with h5py.File(geo_path, "r") as src:
+        geo_meta = _read_geology_metadata_safe(ctx.read_geology_metadata, src, geo_name)
+
+    loaded = _load_geology(
+        geo_path, ctx.norm_config,
+        ctx.PROPERTIES, ctx.PERM_PROPS, ctx.get_valid_mask, ctx.find_z_cutoff,
+    )
+    nx, ny, z_max = loaded["nx"], loaded["ny"], loaded["z_max"]
+    physics_dict, full_shape = loaded["physics_dict"], loaded["full_shape"]
+    z_cutoff = loaded["z_cutoff"]
+    temp0_full = loaded["temp0_full"]
+
+    # Per-geology RNG so geology results don't depend on iteration order across workers.
+    seed_geo = _per_geology_seed(ctx.base_seed, geo.geology_index)
+    rng = np.random.default_rng(seed_geo)
+    sampler = qmc.LatinHypercube(d=2 * num_wells, seed=seed_geo)
+
+    x_lo, x_hi = float(cfg.edge_buffer), float(nx - 1 - cfg.edge_buffer)
+    y_lo, y_hi = float(cfg.edge_buffer), float(ny - 1 - cfg.edge_buffer)
+    lhs = sampler.random(n=cfg.n_starts_per_geology)
+    cfgs: list[list[dict]] = []
+    for n in range(cfg.n_starts_per_geology):
+        c = []
+        for w in range(num_wells):
+            rx = x_lo + lhs[n, 2 * w] * (x_hi - x_lo)
+            ry = y_lo + lhs[n, 2 * w + 1] * (y_hi - y_lo)
+            depth = min(int(cfg.wells[w].depth), int(z_max))
+            c.append({
+                "x": float(rx), "y": float(ry),
+                "depth": int(depth), "type": cfg.wells[w].type,
+            })
+        cfgs.append(c)
+
+    static_graphs = _build_static_batch_for_starts(
+        cfgs, geo_path, physics_dict, full_shape, z_cutoff, nx, ny,
+        cfg.revenue_target, ctx.scaler,
+        ctx.extract_well_data, ctx.build_wells_table, ctx.extract_vertical_profiles,
+        ctx.build_single_hetero_data, temp0_full,
+    )
+    batch_data = Batch.from_data_list(static_graphs).to(device)
+
+    starts = [
+        [[w["x"], w["y"], float(w["depth"])] for w in c] for c in cfgs
+    ]
+    coords = torch.tensor(starts, dtype=torch.float32, device=device)
+    coords.requires_grad = True
+    optimizer = optim.Adam([coords], lr=cfg.learning_rate)
+    M = cfg.n_starts_per_geology
+    last_valid_coords = coords.detach().clone()
+
+    def _predict_unscaled(c: torch.Tensor) -> torch.Tensor:
+        batch_data["well"].pos_xyz = c.view(-1, 3)
+        pred_scaled = model(batch_data).view(M)
+        return pred_scaled * target_scale + target_mean
+
+    n_adv = max(0, int(round(M * cfg.adv_fraction)))
+    adv_idx = set(int(i) for i in rng.choice(M, size=n_adv, replace=False)) if n_adv > 0 else set()
+
+    snapshots: list[dict[str, Any]] = []
+    cand_payloads: list[dict[str, Any]] = []
+
+    K_total = max(cfg.k_safe, cfg.k_adv)
+    for step in range(1, K_total + 1):
+        optimizer.zero_grad()
+        preds = _predict_unscaled(coords)
+        loss = -preds.sum()
+        loss.backward()
+
+        with torch.no_grad():
+            grads = coords.grad
+            if not torch.isfinite(grads).all():
+                torch.nan_to_num_(grads, nan=0.0, posinf=0.0, neginf=0.0)
+            for d, max_val in enumerate([nx - 1, ny - 1, z_max - 1]):
+                mask_lo = (coords[:, :, d] <= 1e-4) & (grads[:, :, d] > 0)
+                mask_hi = (coords[:, :, d] >= max_val - 1e-4) & (grads[:, :, d] < 0)
+                mask = mask_lo | mask_hi
+                if mask.any():
+                    grads[..., d][mask] = 0.0
+                    st = optimizer.state.get(coords, {})
+                    if "exp_avg" in st:
+                        st["exp_avg"][..., d][mask] = 0.0
+        optimizer.step()
+        with torch.no_grad():
+            if not torch.isfinite(coords).all():
+                bad = ~torch.isfinite(coords)
+                coords[bad] = last_valid_coords[bad]
+                st = optimizer.state.get(coords, {})
+                for key in ("exp_avg", "exp_avg_sq"):
+                    if key in st and not torch.isfinite(st[key]).all():
+                        torch.nan_to_num_(st[key], nan=0.0, posinf=0.0, neginf=0.0)
+            coords[:, :, 0].clamp_(0, nx - 1)
+            coords[:, :, 1].clamp_(0, ny - 1)
+            coords[:, :, 2].clamp_(0, z_max - 1)
+            last_valid_coords.copy_(coords)
+
+        if step == cfg.k_safe:
+            with torch.no_grad():
+                preds_now = _predict_unscaled(coords).detach().cpu().numpy()
+            for m in range(M):
+                cxyz = coords[m].detach().cpu().numpy()
+                pred_val = float(preds_now[m])
+                if not (np.isfinite(cxyz).all() and np.isfinite(pred_val)):
+                    print(f"[acquire] skip non-finite frontier snapshot geo={geo.geology_index} m={m}", flush=True)
+                    continue
+                snap = _emit_snapshot(
+                    run_id=geo.geology_index * 10000 + m,
+                    iteration_step=step,
+                    kind="frontier",
+                    coords_xyz=cxyz,
+                    is_injector_list=is_injector_list,
+                    predicted_revenue=pred_val,
+                    geo=geo,
+                    geo_path=geo_path,
+                    geo_name=geo_name,
+                    geo_meta=geo_meta,
+                    well_configs_dir=well_configs_dir,
+                    snapshots_json_dir=snapshots_json_dir,
+                    to_julia_wells_text=ctx.to_julia_wells_text,
+                )
+                snapshots.append(snap)
+                cand_payloads.append({
+                    "snap": snap,
+                    "coords_xyz": cxyz.tolist(),
+                    "is_injector": list(is_injector_list),
+                })
+
+        if step == cfg.k_adv and adv_idx:
+            with torch.no_grad():
+                preds_now = _predict_unscaled(coords).detach().cpu().numpy()
+            for m in sorted(adv_idx):
+                cxyz = coords[m].detach().cpu().numpy()
+                pred_val = float(preds_now[m])
+                if not (np.isfinite(cxyz).all() and np.isfinite(pred_val)):
+                    print(f"[acquire] skip non-finite adversarial snapshot geo={geo.geology_index} m={m}", flush=True)
+                    continue
+                snap = _emit_snapshot(
+                    run_id=geo.geology_index * 10000 + m,
+                    iteration_step=step,
+                    kind="adversarial",
+                    coords_xyz=cxyz,
+                    is_injector_list=is_injector_list,
+                    predicted_revenue=pred_val,
+                    geo=geo,
+                    geo_path=geo_path,
+                    geo_name=geo_name,
+                    geo_meta=geo_meta,
+                    well_configs_dir=well_configs_dir,
+                    snapshots_json_dir=snapshots_json_dir,
+                    to_julia_wells_text=ctx.to_julia_wells_text,
+                )
+                snapshots.append(snap)
+                cand_payloads.append({
+                    "snap": snap,
+                    "coords_xyz": cxyz.tolist(),
+                    "is_injector": list(is_injector_list),
+                })
+
+    return snapshots, cand_payloads
+
+
+def _payload_to_candidate(payload: dict[str, Any]) -> Candidate:
+    coords_xyz = np.asarray(payload["coords_xyz"], dtype=np.float32)
+    return _snapshot_to_candidate(payload["snap"], coords_xyz, payload["is_injector"])
+
+
+def _multi_gpu_worker(
+    device_str: str,
+    cfg: AcquisitionConfig,
+    iteration: int,
+    well_configs_dir: str,
+    snapshots_json_dir: str,
+    in_queue,
+    out_queue,
+) -> None:
+    """Subprocess entry. Owns one CUDA device for the lifetime of the
+    acquisition call. Pulls GeologySpec instances off ``in_queue`` and pushes
+    (snapshots, candidate_payloads) onto ``out_queue``. ``None`` is the
+    poison-pill stop signal.
+    """
+    try:
+        # Pin this process to the requested device so any incidental CUDA
+        # ops (e.g. inside torch_geometric) land on the right GPU.
+        if device_str.startswith("cuda:") and torch.cuda.is_available():
+            torch.cuda.set_device(int(device_str.split(":", 1)[1]))
+        ctx = _build_worker_context(cfg, iteration, device_str)
+        wc_dir = Path(well_configs_dir)
+        sj_dir = Path(snapshots_json_dir)
+    except BaseException as e:  # propagate setup errors to parent
+        out_queue.put(("__init_error__", repr(e)))
+        return
+
+    while True:
+        geo = in_queue.get()
+        if geo is None:
+            return
+        try:
+            snaps, cand_payloads = _run_one_geology(
+                cfg=cfg,
+                geo=geo,
+                iteration=iteration,
+                ctx=ctx,
+                well_configs_dir=wc_dir,
+                snapshots_json_dir=sj_dir,
+            )
+            out_queue.put((device_str, geo.geology_index, snaps, cand_payloads))
+        except BaseException as e:
+            out_queue.put(("__error__", geo.geology_index, repr(e)))
+
+
+def _run_acquisition_multi_gpu(
+    *,
+    cfg: AcquisitionConfig,
+    iteration: int,
+    devices: list[str],
+    well_configs_dir: Path,
+    snapshots_json_dir: Path,
+) -> tuple[list[dict[str, Any]], list[Candidate]]:
+    import torch.multiprocessing as tmp
+
+    mp_ctx = tmp.get_context("spawn")
+    in_queue = mp_ctx.Queue()
+    out_queue = mp_ctx.Queue()
+
+    for geo in cfg.geologies:
+        in_queue.put(geo)
+    for _ in devices:
+        in_queue.put(None)  # one poison pill per worker
+
+    procs = []
+    for dev in devices:
+        p = mp_ctx.Process(
+            target=_multi_gpu_worker,
+            args=(
+                dev, cfg, iteration,
+                str(well_configs_dir), str(snapshots_json_dir),
+                in_queue, out_queue,
+            ),
+        )
+        p.start()
+        procs.append(p)
+
+    snapshots: list[dict[str, Any]] = []
+    candidates: list[Candidate] = []
+    expected = len(cfg.geologies)
+    received = 0
+    errors: list[str] = []
+
+    try:
+        while received < expected:
+            msg = out_queue.get()
+            if msg[0] == "__init_error__":
+                errors.append(f"worker init failure: {msg[1]}")
+                # If one worker died at init, we still need to drain the rest
+                # via the poison pills already queued. Mark all of that worker's
+                # share as failed so we don't deadlock.
+                expected -= 1
+                continue
+            if msg[0] == "__error__":
+                errors.append(f"worker error on geo={msg[1]}: {msg[2]}")
+                received += 1
+                continue
+            _dev, _geo_idx, snaps, cand_payloads = msg
+            snapshots.extend(snaps)
+            for payload in cand_payloads:
+                candidates.append(_payload_to_candidate(payload))
+            received += 1
+    finally:
+        for p in procs:
+            p.join(timeout=30)
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=5)
+
+    if errors:
+        raise RuntimeError("Multi-GPU acquisition failures:\n  " + "\n  ".join(errors))
+
+    return snapshots, candidates
+
+
+def run_acquisition(
+    cfg: AcquisitionConfig,
+    *,
+    out_dir: Path,
+    iteration: int,
+    run_id_prefix: str = "al",
+) -> dict[str, Any]:
+    """Run multi-geology acquisition and emit a manifest at ``out_dir``.
+
+    Returns the parsed manifest dict; also writes:
+      - ``out_dir/well_configs/<snapshot_id>.jl`` per snapshot
+      - ``out_dir/snapshots_json/<snapshot_id>.json`` per snapshot
+      - ``out_dir/manifest.json`` aggregate
+    """
+    # Surrogate imports + heavy state (model, scaler, normalization) are
+    # loaded inside ``_build_worker_context`` so the same path works for
+    # in-process and spawned-worker execution.
+    out_dir = Path(out_dir)
+    well_configs_dir = out_dir / "well_configs"
+    snapshots_json_dir = out_dir / "snapshots_json"
+    well_configs_dir.mkdir(parents=True, exist_ok=True)
+    snapshots_json_dir.mkdir(parents=True, exist_ok=True)
+
+    devices = list(cfg.devices) if cfg.devices else [cfg.device]
 
     snapshots: list[dict[str, Any]] = []
     candidates: list[Candidate] = []
     started = time.time()
 
-    for geo in cfg.geologies:
-        geo_path = Path(geo.geology_h5_file)
-        geo_name = geo.geology_name or geo_path.stem
-        with h5py.File(geo_path, "r") as src:
-            geo_meta = _read_geology_metadata_safe(read_geology_metadata, src, geo_name)
-
-        loaded = _load_geology(
-            geo_path, norm_config,
-            PROPERTIES, PERM_PROPS, get_valid_mask, find_z_cutoff,
+    if len(devices) <= 1:
+        # In-process path. Load model once, iterate geologies serially.
+        device_str = devices[0]
+        ctx = _build_worker_context(cfg, iteration, device_str)
+        for geo in cfg.geologies:
+            snaps, cand_payloads = _run_one_geology(
+                cfg=cfg,
+                geo=geo,
+                iteration=iteration,
+                ctx=ctx,
+                well_configs_dir=well_configs_dir,
+                snapshots_json_dir=snapshots_json_dir,
+            )
+            snapshots.extend(snaps)
+            for payload in cand_payloads:
+                candidates.append(_payload_to_candidate(payload))
+    else:
+        # Multi-GPU path. Spawn one worker per device; geologies are pulled off
+        # a shared queue. Each worker loads model+scaler once per process.
+        # Order of completion is not deterministic, so we sort the merged
+        # snapshot list at the end to keep the manifest reproducible.
+        snapshots, candidates = _run_acquisition_multi_gpu(
+            cfg=cfg,
+            iteration=iteration,
+            devices=devices,
+            well_configs_dir=well_configs_dir,
+            snapshots_json_dir=snapshots_json_dir,
         )
-        nx, ny, z_max = loaded["nx"], loaded["ny"], loaded["z_max"]
-        physics_dict, full_shape = loaded["physics_dict"], loaded["full_shape"]
-        z_cutoff = loaded["z_cutoff"]
-        temp0_full = loaded["temp0_full"]
-
-        # LHS init for this geology.
-        x_lo, x_hi = float(cfg.edge_buffer), float(nx - 1 - cfg.edge_buffer)
-        y_lo, y_hi = float(cfg.edge_buffer), float(ny - 1 - cfg.edge_buffer)
-        lhs = sampler.random(n=cfg.n_starts_per_geology)
-        cfgs: list[list[dict]] = []
-        for n in range(cfg.n_starts_per_geology):
-            c = []
-            for w in range(num_wells):
-                rx = x_lo + lhs[n, 2 * w] * (x_hi - x_lo)
-                ry = y_lo + lhs[n, 2 * w + 1] * (y_hi - y_lo)
-                depth = min(int(cfg.wells[w].depth), int(z_max))
-                c.append({
-                    "x": float(rx), "y": float(ry),
-                    "depth": int(depth), "type": cfg.wells[w].type,
-                })
-            cfgs.append(c)
-
-        static_graphs = _build_static_batch_for_starts(
-            cfgs, geo_path, physics_dict, full_shape, z_cutoff, nx, ny,
-            cfg.revenue_target, scaler,
-            extract_well_data, build_wells_table, extract_vertical_profiles,
-            build_single_hetero_data, temp0_full,
-        )
-        batch_data = Batch.from_data_list(static_graphs).to(device)
-
-        # Continuous coords initialized from LHS.
-        starts = [
-            [[w["x"], w["y"], float(w["depth"])] for w in c] for c in cfgs
-        ]
-        coords = torch.tensor(starts, dtype=torch.float32, device=device)
-        coords.requires_grad = True
-        optimizer = optim.Adam([coords], lr=cfg.learning_rate)
-        M = cfg.n_starts_per_geology
-        last_valid_coords = coords.detach().clone()
-
-        def _predict_unscaled(c: torch.Tensor) -> torch.Tensor:
-            batch_data["well"].pos_xyz = c.view(-1, 3)
-            pred_scaled = model(batch_data).view(M)
-            return pred_scaled * target_scale + target_mean
-
-        # Pre-pick which starts will be tagged as adversarial when we hit K_adv.
-        n_adv = max(0, int(round(M * cfg.adv_fraction)))
-        adv_idx = set(int(i) for i in rng.choice(M, size=n_adv, replace=False)) if n_adv > 0 else set()
-
-        # Run gradient descent up to K_adv. Snapshot at K_safe (frontier) and
-        # K_adv (adversarial subset). Suppress per-step intermediate snapshots.
-        K_total = max(cfg.k_safe, cfg.k_adv)
-        for step in range(1, K_total + 1):
-            optimizer.zero_grad()
-            preds = _predict_unscaled(coords)
-            loss = -preds.sum()
-            loss.backward()
-
-            # Boundary projection (matches run_ensemble_active_learning.py logic).
-            with torch.no_grad():
-                grads = coords.grad
-                # Surrogate's grid_sample can emit non-finite grads near edges;
-                # zero them out before step() so Adam doesn't poison coords.
-                if not torch.isfinite(grads).all():
-                    torch.nan_to_num_(grads, nan=0.0, posinf=0.0, neginf=0.0)
-                for d, max_val in enumerate([nx - 1, ny - 1, z_max - 1]):
-                    mask_lo = (coords[:, :, d] <= 1e-4) & (grads[:, :, d] > 0)
-                    mask_hi = (coords[:, :, d] >= max_val - 1e-4) & (grads[:, :, d] < 0)
-                    mask = mask_lo | mask_hi
-                    if mask.any():
-                        grads[..., d][mask] = 0.0
-                        st = optimizer.state.get(coords, {})
-                        if "exp_avg" in st:
-                            st["exp_avg"][..., d][mask] = 0.0
-            optimizer.step()
-            with torch.no_grad():
-                # If a coord went non-finite (e.g. Adam moment was already poisoned),
-                # roll back to the last all-finite snapshot rather than serialize NaN.
-                if not torch.isfinite(coords).all():
-                    bad = ~torch.isfinite(coords)
-                    coords[bad] = last_valid_coords[bad]
-                    # Also clear any non-finite Adam moments for those entries.
-                    st = optimizer.state.get(coords, {})
-                    for key in ("exp_avg", "exp_avg_sq"):
-                        if key in st and not torch.isfinite(st[key]).all():
-                            torch.nan_to_num_(st[key], nan=0.0, posinf=0.0, neginf=0.0)
-                coords[:, :, 0].clamp_(0, nx - 1)
-                coords[:, :, 1].clamp_(0, ny - 1)
-                coords[:, :, 2].clamp_(0, z_max - 1)
-                last_valid_coords.copy_(coords)
-
-            if step == cfg.k_safe:
-                with torch.no_grad():
-                    preds_now = _predict_unscaled(coords).detach().cpu().numpy()
-                for m in range(M):
-                    cxyz = coords[m].detach().cpu().numpy()
-                    pred_val = float(preds_now[m])
-                    if not (np.isfinite(cxyz).all() and np.isfinite(pred_val)):
-                        print(f"[acquire] skip non-finite frontier snapshot geo={geo.geology_index} m={m}", flush=True)
-                        continue
-                    snap = _emit_snapshot(
-                        run_id=geo.geology_index * 10000 + m,
-                        iteration_step=step,
-                        kind="frontier",
-                        coords_xyz=cxyz,
-                        is_injector_list=is_injector_list,
-                        predicted_revenue=pred_val,
-                        geo=geo,
-                        geo_path=geo_path,
-                        geo_name=geo_name,
-                        geo_meta=geo_meta,
-                        well_configs_dir=well_configs_dir,
-                        snapshots_json_dir=snapshots_json_dir,
-                        to_julia_wells_text=to_julia_wells_text,
-                    )
-                    snapshots.append(snap)
-                    candidates.append(_snapshot_to_candidate(snap, cxyz, is_injector_list))
-
-            if step == cfg.k_adv and adv_idx:
-                with torch.no_grad():
-                    preds_now = _predict_unscaled(coords).detach().cpu().numpy()
-                for m in sorted(adv_idx):
-                    cxyz = coords[m].detach().cpu().numpy()
-                    pred_val = float(preds_now[m])
-                    if not (np.isfinite(cxyz).all() and np.isfinite(pred_val)):
-                        print(f"[acquire] skip non-finite adversarial snapshot geo={geo.geology_index} m={m}", flush=True)
-                        continue
-                    snap = _emit_snapshot(
-                        run_id=geo.geology_index * 10000 + m,
-                        iteration_step=step,
-                        kind="adversarial",
-                        coords_xyz=cxyz,
-                        is_injector_list=is_injector_list,
-                        predicted_revenue=pred_val,
-                        geo=geo,
-                        geo_path=geo_path,
-                        geo_name=geo_name,
-                        geo_meta=geo_meta,
-                        well_configs_dir=well_configs_dir,
-                        snapshots_json_dir=snapshots_json_dir,
-                        to_julia_wells_text=to_julia_wells_text,
-                    )
-                    snapshots.append(snap)
-                    candidates.append(_snapshot_to_candidate(snap, cxyz, is_injector_list))
+        snapshots.sort(key=_snapshot_sort_key)
+        candidates.sort(key=lambda c: (c.geology_index, _KIND_ORDER.get(c.kind, 99), c.run_id))
 
     # Write aggregate manifest matching cli_surrogate_array_prepare.jl schema.
     manifest = {

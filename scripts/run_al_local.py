@@ -655,7 +655,8 @@ def _acquire_and_select_locally(
         log_every_n_steps=int(acq_cfg.get("log_every_n_steps", 25)),
         revenue_target=state.target,
         seed=int(acq_cfg.get("seed", 42)),
-        device="cuda:0",
+        device=str(acq_cfg.get("devices", ["cuda:0"])[0]),
+        devices=[str(d) for d in acq_cfg.get("devices", ["cuda:0"])],
     )
     started = time.time()
     out_dir = ws / "acquire" / f"iter_{iter_idx:04d}"
