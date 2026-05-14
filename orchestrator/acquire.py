@@ -197,6 +197,16 @@ def _build_static_batch_for_starts(
                 node_encoder=node_encoder,
                 enrich_global_attr=enrich_global_attr,
             )
+            n_wells_actual = int(raw_graph["well"].x.shape[0])
+            n_wells_expected = len(w_cfg)
+            if n_wells_actual != n_wells_expected:
+                raise RuntimeError(
+                    f"Static batch graph {m_idx}: built {n_wells_actual} wells, "
+                    f"expected {n_wells_expected}. Likely cause: a well was "
+                    f"placed on a fully-invalid temp column and extract_well_data "
+                    f"dropped it. The LHS sampler should already resample "
+                    f"dead-rock placements; this should not happen."
+                )
             static_graphs.append(scaler.transform_graph(raw_graph))
     return static_graphs
 
@@ -380,6 +390,31 @@ def _run_one_geology(
 
     x_lo, x_hi = float(cfg.edge_buffer), float(nx - 1 - cfg.edge_buffer)
     y_lo, y_hi = float(cfg.edge_buffer), float(ny - 1 - cfg.edge_buffer)
+
+    # Precompute valid-XY columns within the edge buffer for resampling wells
+    # whose LHS placement happens to land on dead rock (entire Z column has
+    # temp0 <= -900). Without this filter, extract_well_data would drop the
+    # well entirely (well_mask = is_well == 1 is empty for that column), the
+    # static batch ends up with < M*num_wells wells, and the CNN node encoder
+    # crashes downstream with a stale well_batch / pos_xyz shape mismatch.
+    has_valid_z = np.any(temp0_full > -900, axis=0)  # (X, Y) bool
+    ix_lo, ix_hi = int(np.ceil(x_lo)), int(np.floor(x_hi))
+    iy_lo, iy_hi = int(np.ceil(y_lo)), int(np.floor(y_hi))
+    edge_window = np.zeros_like(has_valid_z, dtype=bool)
+    edge_window[ix_lo : ix_hi + 1, iy_lo : iy_hi + 1] = True
+    valid_xy = has_valid_z & edge_window
+    valid_xy_indices = np.argwhere(valid_xy)
+    if valid_xy_indices.size == 0:
+        raise RuntimeError(
+            f"Geology {geo.geology_index}: no valid (x,y) columns inside the "
+            f"edge buffer {cfg.edge_buffer}; cannot place wells."
+        )
+
+    def _well_xy_valid(rx_: float, ry_: float, depth_: int) -> bool:
+        ix_ = int(np.clip(int(round(rx_)), 0, nx - 1))
+        iy_ = int(np.clip(int(round(ry_)), 0, ny - 1))
+        return bool(np.any(temp0_full[: max(1, depth_), ix_, iy_] > -900))
+
     lhs = sampler.random(n=cfg.n_starts_per_geology)
     cfgs: list[list[dict]] = []
     for n in range(cfg.n_starts_per_geology):
@@ -388,6 +423,15 @@ def _run_one_geology(
             rx = x_lo + lhs[n, 2 * w] * (x_hi - x_lo)
             ry = y_lo + lhs[n, 2 * w + 1] * (y_hi - y_lo)
             depth = min(int(cfg.wells[w].depth), int(z_max))
+            # If the LHS placement lands on a dead-rock column, resample uniformly
+            # from the valid-XY pool until we find a column with at least one
+            # active Z cell inside [0, depth).
+            tries = 0
+            while not _well_xy_valid(rx, ry, depth) and tries < 100:
+                pick = valid_xy_indices[int(rng.integers(0, len(valid_xy_indices)))]
+                rx = float(pick[0])
+                ry = float(pick[1])
+                tries += 1
             c.append({
                 "x": float(rx), "y": float(ry),
                 "depth": int(depth), "type": cfg.wells[w].type,
