@@ -103,6 +103,9 @@ def run_train(
     ]
     if cache_to_gpu:
         cmd.append("--cache-to-gpu")
+    # NOTE: train.py defaults to --stratified-split, so we don't pass it here.
+    # The geology index is derived automatically from case_id patterns + the
+    # filenum/scenario CSV. Pass --no-stratified-split via extra_args to revert.
 
     is_warm = warm_start_checkpoint is not None
     if is_warm:

@@ -26,6 +26,14 @@ class IterationRecord:
     batch_signed_pct_bias: float | None = None
     frontier_mape: float | None = None
     adversarial_mape: float | None = None
+    # Floored-MAPE and MAE counterparts. The floored MAPE divides by
+    # `max(|real|, 0.1 * cohort_median_real)` so geo-8-style small-denominator
+    # cases don't artificially balloon the metric. MAE is reported alongside to
+    # disambiguate "absolute error worsened" from "denominator shrank."
+    batch_mape_floored: float | None = None
+    batch_mae: float | None = None
+    frontier_mae: float | None = None
+    adversarial_mae: float | None = None
     n_train_samples: int | None = None
     train_val_loss: float | None = None
     wallclock_acquire_min: float | None = None

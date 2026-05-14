@@ -17,7 +17,9 @@ plus per-snapshot ``.jl`` files written via ``to_julia_wells_text`` from
 from __future__ import annotations
 
 import json
+import os
 import pickle
+import signal
 import sys
 import time
 from dataclasses import dataclass
@@ -526,6 +528,31 @@ def _payload_to_candidate(payload: dict[str, Any]) -> Candidate:
     return _snapshot_to_candidate(payload["snap"], coords_xyz, payload["is_injector"])
 
 
+def _install_parent_death_signal() -> None:
+    """On Linux, request SIGTERM when our parent process dies.
+
+    Without this, killing the orchestrator (Ctrl-C, SIGKILL, kernel OOM killer,
+    SLURM job timeout, etc.) leaves the multi-GPU worker subprocesses orphaned —
+    they get re-parented to PID 1 and continue running, holding GPU memory and
+    file handles until manually `pkill`-ed.
+
+    The PR_SET_PDEATHSIG prctl wires the kernel to send SIGTERM to this process
+    the moment its parent exits. Linux-only; silently no-op elsewhere.
+    """
+    try:
+        import sys as _sys
+        if not _sys.platform.startswith("linux"):
+            return
+        import ctypes
+        PR_SET_PDEATHSIG = 1
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        # Send SIGTERM (15) when parent dies. SIGTERM lets Python's atexit run.
+        libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0)
+    except Exception:
+        # Best-effort; failure here is not a reason to crash the worker.
+        pass
+
+
 def _multi_gpu_worker(
     device_str: str,
     cfg: AcquisitionConfig,
@@ -540,6 +567,20 @@ def _multi_gpu_worker(
     (snapshots, candidate_payloads) onto ``out_queue``. ``None`` is the
     poison-pill stop signal.
     """
+    # Auto-terminate if the parent dies — prevents orphan workers from holding
+    # the GPU when the orchestrator is killed.
+    _install_parent_death_signal()
+    # Also handle SIGTERM gracefully so the worker exits cleanly (no zombie).
+    def _sigterm(_sig, _frame):
+        # Drain queues just enough to avoid mp_ctx deadlocks; then exit.
+        try:
+            out_queue.put(("__init_error__", "worker received SIGTERM"))
+        except Exception:
+            pass
+        os._exit(0)
+    signal.signal(signal.SIGTERM, _sigterm)
+    signal.signal(signal.SIGINT, _sigterm)
+
     try:
         # Pin this process to the requested device so any incidental CUDA
         # ops (e.g. inside torch_geometric) land on the right GPU.
@@ -568,6 +609,36 @@ def _multi_gpu_worker(
             out_queue.put((device_str, geo.geology_index, snaps, cand_payloads))
         except BaseException as e:
             out_queue.put(("__error__", geo.geology_index, repr(e)))
+
+
+def _terminate_procs(procs: list, join_timeout: float = 5.0) -> None:
+    """Terminate (then kill, if needed) every still-alive worker.
+
+    Used both in the normal `finally` cleanup and in the signal-handler path.
+    Idempotent: safe to call multiple times.
+    """
+    for p in procs:
+        if p.is_alive():
+            try:
+                p.terminate()
+            except Exception:
+                pass
+    for p in procs:
+        try:
+            p.join(timeout=join_timeout)
+        except Exception:
+            pass
+    # Anything still alive gets SIGKILL.
+    for p in procs:
+        if p.is_alive():
+            try:
+                p.kill()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            try:
+                p.join(timeout=2)
+            except Exception:
+                pass
 
 
 def _run_acquisition_multi_gpu(
@@ -602,6 +673,28 @@ def _run_acquisition_multi_gpu(
         p.start()
         procs.append(p)
 
+    # Install a signal handler in the PARENT that tears down workers cleanly
+    # on Ctrl-C / SIGTERM (e.g. when the orchestrator is killed). Combined with
+    # PR_SET_PDEATHSIG in the worker, this gives us defense-in-depth: workers
+    # die from either the parent's signal handler OR the kernel notification
+    # when the parent vanishes abruptly.
+    _prev_sigint = signal.getsignal(signal.SIGINT)
+    _prev_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def _parent_signal_cleanup(sig, frame):
+        _terminate_procs(procs)
+        # Re-raise via KeyboardInterrupt so the surrounding `try` cleanup runs
+        # and the calling code sees a clean exception.
+        raise KeyboardInterrupt(f"acquisition aborted by signal {sig}")
+
+    try:
+        signal.signal(signal.SIGINT, _parent_signal_cleanup)
+        signal.signal(signal.SIGTERM, _parent_signal_cleanup)
+    except (ValueError, OSError):
+        # signal.signal only works on the main thread; if we're being invoked
+        # from a worker thread (e.g. AL orchestrator background thread), skip.
+        pass
+
     snapshots: list[dict[str, Any]] = []
     candidates: list[Candidate] = []
     expected = len(cfg.geologies)
@@ -628,11 +721,14 @@ def _run_acquisition_multi_gpu(
                 candidates.append(_payload_to_candidate(payload))
             received += 1
     finally:
-        for p in procs:
-            p.join(timeout=30)
-            if p.is_alive():
-                p.terminate()
-                p.join(timeout=5)
+        _terminate_procs(procs, join_timeout=30.0)
+        # Restore prior signal handlers so we don't poison the orchestrator's
+        # behavior in later phases.
+        try:
+            signal.signal(signal.SIGINT, _prev_sigint)
+            signal.signal(signal.SIGTERM, _prev_sigterm)
+        except (ValueError, OSError):
+            pass
 
     if errors:
         raise RuntimeError("Multi-GPU acquisition failures:\n  " + "\n  ".join(errors))

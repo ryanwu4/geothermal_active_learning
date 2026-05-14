@@ -49,8 +49,20 @@ def _revenue_plateau(state: RunState, window: int, threshold_rel: float) -> bool
 
 
 def _mape_plateau(state: RunState, window: int, target: float) -> bool:
-    """True if the last ``window`` iterations all have batch MAPE <= target."""
-    mapes = [r.batch_mape for r in state.history if r.batch_mape is not None]
+    """True if the last ``window`` iterations all have floored MAPE <= target.
+
+    Uses ``batch_mape_floored`` (denominator floored at 10% of cohort-median
+    real revenue) so that small-revenue cohorts like geo 8 don't keep the
+    raw MAPE artificially above the target indefinitely. Falls back to
+    ``batch_mape`` for older state records that pre-date the floored metric.
+    """
+    mapes: list[float] = []
+    for r in state.history:
+        val = getattr(r, "batch_mape_floored", None)
+        if val is None:
+            val = r.batch_mape
+        if val is not None:
+            mapes.append(val)
     if len(mapes) < window:
         return False
     return all(m <= target for m in mapes[-window:])

@@ -72,7 +72,8 @@
     "max_iterations": 20,
     "plateau_window": 20,
     "plateau_threshold_relative": 0.005,
-    "target_mape": null
+    "target_mape": 0.10,
+    "target_mape_window": 20
   },
 
   "wells": [

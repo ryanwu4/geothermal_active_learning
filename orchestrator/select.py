@@ -214,17 +214,21 @@ def select_batch(
     adv_selected = _select_adversarial(adversarial_pool, adversarial_target)
 
     # If one pool was short, top up from the other so we hit batch_size when
-    # possible.
+    # possible. Use id-based set membership: `Candidate` is a dataclass with a
+    # numpy `coords_xyz` field, so default `__eq__` would do element-wise array
+    # comparison and raise "ambiguous truth value" when scanning the pool.
     short = batch_size - (len(front_selected) + len(adv_selected))
     if short > 0:
         if len(front_selected) < frontier_target:
+            selected_ids = {id(c) for c in adv_selected}
             extras = _select_adversarial(
-                [c for c in adversarial_pool if c not in adv_selected], short
+                [c for c in adversarial_pool if id(c) not in selected_ids], short
             )
             adv_selected.extend(extras)
         elif len(adv_selected) < adversarial_target:
+            selected_ids = {id(c) for c in front_selected}
             extras = _select_frontier_per_geology(
-                [c for c in frontier_pool if c not in front_selected], short
+                [c for c in frontier_pool if id(c) not in selected_ids], short
             )
             front_selected.extend(extras)
 

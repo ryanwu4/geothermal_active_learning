@@ -149,6 +149,10 @@ def main() -> int:
     rec.batch_signed_pct_bias = metrics.batch_signed_pct_bias
     rec.frontier_mape = metrics.frontier_mape
     rec.adversarial_mape = metrics.adversarial_mape
+    rec.batch_mape_floored = metrics.batch_mape_floored
+    rec.batch_mae = metrics.batch_mae
+    rec.frontier_mae = metrics.frontier_mae
+    rec.adversarial_mae = metrics.adversarial_mae
     rec.best_real_revenue = metrics.best_real_revenue_so_far
     rec.n_train_samples = metrics.n_train_samples
     rec.wallclock_ingest_min = ingest_elapsed_min

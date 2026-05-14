@@ -17,6 +17,38 @@ The orchestrator is implemented as a chain of dependent SLURM jobs — there is 
 long-running daemon. Each phase requests its own resources (GPU for training and
 acquisition, CPU for ingest) and the 3-day SLURM cap is irrelevant.
 
+## Behaviour notes (May 2026)
+
+- **Stopping criteria**: in addition to `max_iterations` and the revenue-plateau
+  check, an MAPE-target stop (`target_mape` / `target_mape_window`) fires when
+  the *floored* MAPE has been below `target_mape` for `target_mape_window`
+  consecutive iterations. The floor is `max(|real|, 0.1 × cohort_median_real)`
+  so geo-8-style small-denominator candidates don't keep MAPE artificially high.
+  See `configs/al_hybrid.json` for defaults.
+- **Frontier slot allocation**: each iteration distributes frontier selection
+  slots *equally* across geologies (was proportional to candidate count, which
+  silently penalised geologies whose Adam runs went non-finite).
+- **Stratified train/val/test split** is enabled by default during the retrain
+  step (`--stratified-split` is appended to the surrogate-side `train.py`
+  invocation by `orchestrator/retrain.py`). Train.py derives the per-case
+  geology index automatically from the case_id pattern (AL cases via
+  `run_num // 10000`) and from the `filenum_to_scenario_mapping.csv` +
+  `geologies_full*.json` files for bootstrap cases — no auxiliary JSON map
+  needs to be maintained.
+- **Worker death-on-parent**: multi-GPU acquisition workers register
+  `PR_SET_PDEATHSIG` so they receive `SIGTERM` automatically when the
+  orchestrator process exits (Ctrl-C, SLURM timeout, OOM kill). They also
+  install their own SIGTERM/SIGINT handlers for graceful shutdown. The parent
+  installs a top-level handler that calls `terminate()`/`kill()` on every
+  worker before raising `KeyboardInterrupt`. Combined, killing the orchestrator
+  cleanly releases the GPUs — no orphan acquisition processes.
+- **Surrogate hparam round-trip**: `orchestrator/acquire.py` reads
+  `node_encoder` and `enrich_global_attr` from the loaded checkpoint's hparams
+  (falling back to the legacy `profile` / `False` for older checkpoints) so the
+  graphs built for acquisition always match the scaler the model was trained
+  with. No more `"X has N features, but StandardScaler is expecting M"` errors
+  when the surrogate side flips defaults.
+
 ## Layout
 
 ```
