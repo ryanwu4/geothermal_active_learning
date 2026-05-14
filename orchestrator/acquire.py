@@ -404,10 +404,11 @@ def _run_one_geology(
     edge_window[ix_lo : ix_hi + 1, iy_lo : iy_hi + 1] = True
     valid_xy = has_valid_z & edge_window
     valid_xy_indices = np.argwhere(valid_xy)
-    if valid_xy_indices.size == 0:
+    if valid_xy_indices.shape[0] < num_wells:
         raise RuntimeError(
-            f"Geology {geo.geology_index}: no valid (x,y) columns inside the "
-            f"edge buffer {cfg.edge_buffer}; cannot place wells."
+            f"Geology {geo.geology_index}: only {valid_xy_indices.shape[0]} valid "
+            f"(x,y) columns inside the edge buffer {cfg.edge_buffer}; need at "
+            f"least {num_wells} to place all wells."
         )
 
     def _well_xy_valid(rx_: float, ry_: float, depth_: int) -> bool:
@@ -419,19 +420,43 @@ def _run_one_geology(
     cfgs: list[list[dict]] = []
     for n in range(cfg.n_starts_per_geology):
         c = []
+        # Track integer (ix, iy) cells already claimed by wells in this candidate.
+        # extract_well_data dedups by (x_idx, y_idx) — if two wells round to the
+        # same column they merge into one table entry and the graph ends up with
+        # < num_wells wells, breaking the M*num_wells layout the acquisition
+        # forward pass assumes.
+        used_cells: set[tuple[int, int]] = set()
         for w in range(num_wells):
             rx = x_lo + lhs[n, 2 * w] * (x_hi - x_lo)
             ry = y_lo + lhs[n, 2 * w + 1] * (y_hi - y_lo)
             depth = min(int(cfg.wells[w].depth), int(z_max))
-            # If the LHS placement lands on a dead-rock column, resample uniformly
-            # from the valid-XY pool until we find a column with at least one
-            # active Z cell inside [0, depth).
+
+            def _cell_of(rx_: float, ry_: float) -> tuple[int, int]:
+                return (
+                    int(np.clip(int(round(rx_)), 0, nx - 1)),
+                    int(np.clip(int(round(ry_)), 0, ny - 1)),
+                )
+
+            # Resample until the well lands on a valid Z column AND on a cell
+            # not already taken by an earlier well in this candidate.
             tries = 0
-            while not _well_xy_valid(rx, ry, depth) and tries < 100:
+            while True:
+                cell = _cell_of(rx, ry)
+                if _well_xy_valid(rx, ry, depth) and cell not in used_cells:
+                    break
+                if tries >= 200:
+                    raise RuntimeError(
+                        f"Geology {geo.geology_index} candidate {n} well {w}: "
+                        f"failed to find a valid, unused (x,y) cell after "
+                        f"{tries} resamples. "
+                        f"used={len(used_cells)}/{valid_xy_indices.shape[0]} "
+                        f"valid cells in window."
+                    )
                 pick = valid_xy_indices[int(rng.integers(0, len(valid_xy_indices)))]
                 rx = float(pick[0])
                 ry = float(pick[1])
                 tries += 1
+            used_cells.add(cell)
             c.append({
                 "x": float(rx), "y": float(ry),
                 "depth": int(depth), "type": cfg.wells[w].type,
