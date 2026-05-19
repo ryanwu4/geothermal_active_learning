@@ -324,12 +324,14 @@ def _rewrite_manifest_paths(local_manifest: Path, remappings: list[tuple[str, st
 
 
 def _render_local_plots(state: RunState, ws: Path) -> None:
-    """Render the state-derived diagnostic plots into ``<ws>/plots/``.
+    """Render the full diagnostic dashboard into ``<ws>/plots/``.
 
-    Uses the same plotting functions as ``scripts/plot_convergence.py`` but
-    only the subset that derives from ``state.history`` — we don't have the
-    Sherlock-side per-iteration ``per_candidate_metrics.json`` files locally,
-    so the scatter / distribution plots are skipped here.
+    Mirrors ``scripts/plot_convergence.py``. State-only plots run unconditionally;
+    candidate-level / holdout / well-position plots need supporting files
+    mirrored locally (``per_candidate_metrics.json`` via
+    ``_pull_per_candidate_metrics`` after ingest; train.py's enriched CSVs and
+    acquire/iter_NNNN/snapshots_json/* are produced on bend by the train and
+    acquire phases).
     """
     try:
         # Defer import: matplotlib pulls in a lot, no need at module load.
@@ -349,11 +351,25 @@ def _render_local_plots(state: RunState, ws: Path) -> None:
         return
     pc._set_style()
     try:
-        pc.plot_best_revenue(history, out_dir)
+        rows = pc._all_candidate_rows(ws, history)
+        pc.plot_best_revenue(history, rows, out_dir)
         pc.plot_calibration_metrics(history, out_dir)
         pc.plot_per_geology_mape_heatmap(history, out_dir)
         pc.plot_training_growth(history, out_dir)
         pc.plot_wallclock_breakdown(history, out_dir)
+        pc.plot_predicted_vs_real_scatter(rows, out_dir)
+        pc.plot_real_revenue_distribution(rows, out_dir)
+        pc.plot_topk_mean_gap(rows, out_dir)
+        pc.plot_pred_real_kde_shift(rows, out_dir)
+        holdout_rows = pc._all_holdout_rows(ws, history)
+        pc.plot_holdout_mape_over_iters(holdout_rows, out_dir)
+        pc.plot_holdout_per_geology_heatmap(holdout_rows, out_dir)
+        pc.plot_holdout_pred_vs_real_scatter(holdout_rows, out_dir)
+        well_rows = pc._load_well_coord_rows(ws, history)
+        pc.plot_well_position_heatmaps(well_rows, out_dir)
+        pc.plot_well_position_heatmaps_by_kind(well_rows, out_dir)
+        pc.plot_well_position_heatmaps_over_iters(well_rows, out_dir)
+        pc.plot_best_well_config(ws, well_rows, out_dir)
     except Exception as e:
         # Plotting is diagnostic — never let a plot bug kill the AL loop.
         print(f"[local-driver] plot rendering failed: {e}", file=sys.stderr)
@@ -401,6 +417,23 @@ def _pull_state(remote: RemoteSession, remote_run_root: str, ws: Path) -> RunSta
     dst = _state_mirror_path(ws)
     remote.pull(f"{remote_run_root}/state.json", dst)
     return RunState.load(dst)
+
+
+def _pull_per_candidate_metrics(
+    remote: RemoteSession, remote_run_root: str, iteration: int, ws: Path
+) -> None:
+    """Mirror Sherlock's per_candidate_metrics.json for one iteration to bend.
+
+    Tiny JSON (~100 KB) but required for candidate-level diagnostic plots
+    (scatter, distribution, violin overlay, well-position heatmaps, holdout-
+    eval-by-geology). Iters that haven't ingested yet won't have it — no-op.
+    """
+    remote_path = f"{remote_run_root}/iter_{iteration:04d}/per_candidate_metrics.json"
+    if remote.run(["test", "-f", remote_path], check=False).returncode != 0:
+        return
+    local = ws / f"iter_{iteration:04d}" / "per_candidate_metrics.json"
+    local.parent.mkdir(parents=True, exist_ok=True)
+    remote.pull(remote_path, local)
 
 
 def _push_state(remote: RemoteSession, remote_run_root: str, state: RunState, ws: Path) -> None:
@@ -980,6 +1013,7 @@ def main() -> int:
             # just-completed iteration's metrics show up immediately.
             try:
                 fresh_state = _pull_state(remote, remote_run_root, ws)
+                _pull_per_candidate_metrics(remote, remote_run_root, iteration, ws)
                 _render_local_plots(fresh_state, ws)
             except SshUnavailable:
                 raise
