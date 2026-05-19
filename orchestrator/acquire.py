@@ -526,13 +526,27 @@ def _cma_seed_starts(
     # We need to evaluate popsize candidates per generation through the surrogate.
     # Build a static graph batch once for ``popsize`` slots with placeholder coords;
     # then reuse, mutating only well positions on each forward.
+    #
+    # CRITICAL: every well in every placeholder must land on a DISTINCT valid
+    # (x, y) cell. ``extract_well_data`` dedups by (x_idx, y_idx), so if any
+    # two wells share a cell the resulting graph drops one and the batched
+    # forward expects fewer wells than we supply. Picking unique cells from
+    # ``valid_xy_indices`` guarantees a 12-well topology; the exact positions
+    # don't matter because each CMA-ES generation overwrites
+    # ``batch_data["well"].pos_xyz`` with the sampled coords.
+    if valid_xy_indices.shape[0] < num_wells:
+        return []
+    stride = max(1, valid_xy_indices.shape[0] // num_wells)
+    placeholder_cells = valid_xy_indices[::stride][:num_wells]
+    if placeholder_cells.shape[0] < num_wells:
+        placeholder_cells = valid_xy_indices[:num_wells]
     placeholder_cfgs: list[list[dict]] = []
     for _ in range(int(cfg.cma_popsize)):
         c = []
         for w in range(num_wells):
             c.append({
-                "x": 0.5 * (x_lo + x_hi),
-                "y": 0.5 * (y_lo + y_hi),
+                "x": float(placeholder_cells[w, 0]),
+                "y": float(placeholder_cells[w, 1]),
                 "depth": int(min(wells_spec[w].depth, z_max)),
                 "type": wells_spec[w].type,
             })
