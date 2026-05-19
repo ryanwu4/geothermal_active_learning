@@ -1,17 +1,18 @@
-"""Candidate selection — pick a diverse, frontier-heavy batch for INTERSECT.
+"""Candidate selection — pick a diverse, multi-kind batch for INTERSECT.
 
 Inputs are flat lists of candidate snapshots; each snapshot describes a single
 well configuration in a single geology and carries a surrogate-predicted
-revenue along with its kind ("frontier" or "adversarial").
+revenue along with its kind:
+  * ``frontier``     — LHS-seeded Adam at k_safe; diversity-selected (FPS).
+  * ``adversarial``  — LHS-seeded Adam at k_adv; round-robin top-revenue.
+  * ``exploit``      — elite-seeded Adam at k_safe; round-robin top-revenue.
+  * ``cma``          — CMA-ES-seeded Adam at k_safe; round-robin top-revenue.
 
-The selection rule (matching the plan):
-  * Frontier subset = ``round(B * frontier_fraction)`` candidates, chosen by
-    taking the highest-revenue points per geology and then enforcing diversity
-    across geologies via greedy farthest-point selection in flattened
-    well-config space.
-  * Adversarial subset = ``B - frontier_count`` candidates, chosen as the
-    highest-revenue adversarial points per geology with no further diversity
-    pass (small set, intent is to probe specific exploits).
+Selection supports two modes:
+  * Back-compat (legacy 2-kind): ``frontier_fraction`` knob splits the batch
+    between frontier and adversarial, matching the original AL design.
+  * 4-kind: ``kind_fractions`` dict allocates per-kind targets; each pool is
+    selected by its own rule (FPS for frontier, top-revenue for the others).
 """
 from __future__ import annotations
 
@@ -19,6 +20,10 @@ from dataclasses import dataclass, field
 from typing import Sequence
 
 import numpy as np
+
+
+# Valid kind tags; mirrors orchestrator/acquire.py:_KIND_ORDER.
+_VALID_KINDS = ("frontier", "adversarial", "exploit", "cma")
 
 
 @dataclass
@@ -32,7 +37,7 @@ class Candidate:
     snapshot_id: str
     run_id: int
     iteration: int
-    kind: str  # "frontier" or "adversarial"
+    kind: str  # one of "frontier", "adversarial", "exploit", "cma"
     predicted_revenue: float
     coords_xyz: np.ndarray  # (n_wells, 3) float32
     is_injector: list[bool]
@@ -159,10 +164,16 @@ def _select_frontier_per_geology(
     return selected
 
 
-def _select_adversarial(
+def _select_top_per_geology(
     candidates: Sequence[Candidate], target: int
 ) -> list[Candidate]:
-    """Top-revenue adversarial picks, distributed across geologies."""
+    """Top-revenue picks, distributed round-robin across geologies. No FPS.
+
+    Shared selection rule for ``adversarial``, ``exploit``, and ``cma`` kinds —
+    all three should *concentrate* on high-predicted-revenue picks rather than
+    diversify, because their job is exploitation (exploit/cma) or probing
+    specific high-revenue surrogate predictions (adversarial).
+    """
     if target <= 0 or not candidates:
         return []
 
@@ -172,9 +183,6 @@ def _select_adversarial(
 
     geo_keys = sorted(by_geo.keys())
     selected: list[Candidate] = []
-    # Round-robin picking across geologies, taking the top-remaining-revenue
-    # candidate at each turn. This spreads adversarial probes across geologies
-    # rather than concentrating them on a single high-disagreement field.
     iters = {g: iter(sorted(by_geo[g], key=lambda c: -c.predicted_revenue)) for g in geo_keys}
     while len(selected) < target:
         progress = False
@@ -191,45 +199,111 @@ def _select_adversarial(
     return selected
 
 
+# Back-compat alias for the original 2-kind selection path.
+_select_adversarial = _select_top_per_geology
+
+
 def select_batch(
     candidates: Sequence[Candidate],
     *,
     batch_size: int,
-    frontier_fraction: float,
+    frontier_fraction: float | None = None,
+    kind_fractions: dict[str, float] | None = None,
 ) -> list[Candidate]:
-    """Pick ``batch_size`` candidates with the configured frontier/adversarial mix.
+    """Pick ``batch_size`` candidates with the configured kind mix.
 
-    Order in the returned list is ``frontier first, adversarial last`` so
-    downstream code can identify the boundary by ``kind`` if needed.
+    Two calling conventions:
+      * Legacy (2-kind): pass ``frontier_fraction`` only. Adversarial gets the
+        remainder. Matches the original AL design.
+      * 4-kind: pass ``kind_fractions`` with any subset of
+        ``{"frontier","adversarial","exploit","cma"}``. Fractions need not sum
+        to 1.0 — they're normalized to integer per-kind targets that sum to
+        ``batch_size``. Any kind not listed gets target=0.
+
+    Returned order: frontier → adversarial → exploit → cma (stable for
+    downstream consumers that may key off position).
     """
     if batch_size <= 0:
         return []
-    frontier_target = max(0, int(round(batch_size * frontier_fraction)))
-    adversarial_target = batch_size - frontier_target
 
-    frontier_pool = [c for c in candidates if c.kind == "frontier"]
-    adversarial_pool = [c for c in candidates if c.kind == "adversarial"]
-
-    front_selected = _select_frontier_per_geology(frontier_pool, frontier_target)
-    adv_selected = _select_adversarial(adversarial_pool, adversarial_target)
-
-    # If one pool was short, top up from the other so we hit batch_size when
-    # possible. Use id-based set membership: `Candidate` is a dataclass with a
-    # numpy `coords_xyz` field, so default `__eq__` would do element-wise array
-    # comparison and raise "ambiguous truth value" when scanning the pool.
-    short = batch_size - (len(front_selected) + len(adv_selected))
-    if short > 0:
-        if len(front_selected) < frontier_target:
-            selected_ids = {id(c) for c in adv_selected}
-            extras = _select_adversarial(
-                [c for c in adversarial_pool if id(c) not in selected_ids], short
+    # Resolve per-kind targets.
+    if kind_fractions is not None:
+        fractions = {k: max(0.0, float(v)) for k, v in kind_fractions.items() if k in _VALID_KINDS}
+        total = sum(fractions.values())
+        if total <= 0:
+            return []
+        # Allocate by rounding, then fix sum by adjusting the largest residual.
+        raw = {k: batch_size * (v / total) for k, v in fractions.items()}
+        targets = {k: int(round(v)) for k, v in raw.items()}
+        diff = batch_size - sum(targets.values())
+        if diff != 0:
+            # Distribute the rounding remainder to the kinds with largest
+            # fractional residuals (positive diff) or smallest (negative diff).
+            residuals = sorted(
+                ((k, raw[k] - targets[k]) for k in targets),
+                key=lambda t: -t[1] if diff > 0 else t[1],
             )
-            adv_selected.extend(extras)
-        elif len(adv_selected) < adversarial_target:
-            selected_ids = {id(c) for c in front_selected}
-            extras = _select_frontier_per_geology(
-                [c for c in frontier_pool if id(c) not in selected_ids], short
-            )
-            front_selected.extend(extras)
+            for i in range(abs(diff)):
+                k = residuals[i % len(residuals)][0]
+                targets[k] += 1 if diff > 0 else -1
+        for k in _VALID_KINDS:
+            targets.setdefault(k, 0)
+    else:
+        ff = 0.85 if frontier_fraction is None else float(frontier_fraction)
+        frontier_target = max(0, int(round(batch_size * ff)))
+        adversarial_target = batch_size - frontier_target
+        targets = {
+            "frontier": frontier_target,
+            "adversarial": adversarial_target,
+            "exploit": 0,
+            "cma": 0,
+        }
 
-    return list(front_selected) + list(adv_selected)
+    pools = {k: [c for c in candidates if c.kind == k] for k in _VALID_KINDS}
+
+    front_selected = _select_frontier_per_geology(pools["frontier"], targets["frontier"])
+    adv_selected = _select_top_per_geology(pools["adversarial"], targets["adversarial"])
+    exploit_selected = _select_top_per_geology(pools["exploit"], targets["exploit"])
+    cma_selected = _select_top_per_geology(pools["cma"], targets["cma"])
+
+    chosen: dict[str, list[Candidate]] = {
+        "frontier": front_selected,
+        "adversarial": adv_selected,
+        "exploit": exploit_selected,
+        "cma": cma_selected,
+    }
+
+    # Backfill any short pool from the largest-surplus pool. Tags are preserved
+    # — a frontier candidate filling in for cma still reads as ``kind=frontier``.
+    def _surplus(kind: str) -> int:
+        return len(pools[kind]) - len(chosen[kind])
+
+    def _short() -> int:
+        return batch_size - sum(len(v) for v in chosen.values())
+
+    while _short() > 0:
+        # Pick the surplus-largest source kind.
+        source_kinds = sorted(_VALID_KINDS, key=lambda k: -_surplus(k))
+        if _surplus(source_kinds[0]) <= 0:
+            break  # nothing left anywhere
+        src = source_kinds[0]
+        # Find the most-short destination to direct the backfill into.
+        dst = max(_VALID_KINDS, key=lambda k: targets[k] - len(chosen[k]))
+        existing_ids = {id(c) for c in chosen[src]}
+        available = [c for c in pools[src] if id(c) not in existing_ids]
+        if not available:
+            break
+        # Use the appropriate selector for the source kind.
+        selector = _select_frontier_per_geology if src == "frontier" else _select_top_per_geology
+        take = min(_short(), len(available))
+        extras = selector(available, take)
+        if not extras:
+            break
+        chosen[dst].extend(extras)
+
+    return (
+        list(chosen["frontier"])
+        + list(chosen["adversarial"])
+        + list(chosen["exploit"])
+        + list(chosen["cma"])
+    )

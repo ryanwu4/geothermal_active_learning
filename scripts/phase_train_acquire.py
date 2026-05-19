@@ -202,6 +202,15 @@ def main() -> int:
     ]
     wells = [WellSpec(type=w["type"], depth=int(w["depth"])) for w in config["wells"]]
 
+    # Collect prior-iter per_candidate_metrics.json paths for the elite path to
+    # rank by real INTERSECT revenue. Cold start (iter 0): list is empty,
+    # acquire falls back to LHS for the elite kind.
+    prior_metrics: list[Path] = []
+    for it_prior in range(state.iteration):
+        p = paths.iter_dir(it_prior) / "per_candidate_metrics.json"
+        if p.exists():
+            prior_metrics.append(p)
+
     acq = AcquisitionConfig(
         surrogate_repo=surrogate_repo,
         checkpoint_path=Path(state.current_checkpoint),
@@ -220,6 +229,14 @@ def main() -> int:
         seed=int(acq_cfg.get("seed", 42)),
         device=str(acq_cfg.get("devices", ["cuda:0"])[0]),
         devices=[str(d) for d in acq_cfg.get("devices", ["cuda:0"])],
+        n_elite_per_geology=int(acq_cfg.get("n_elite_per_geology", 0)),
+        n_cma_per_geology=int(acq_cfg.get("n_cma_per_geology", 0)),
+        elite_top_k=int(acq_cfg.get("elite_top_k", 10)),
+        elite_seed_noise=float(acq_cfg.get("elite_seed_noise", 2.0)),
+        cma_popsize=int(acq_cfg.get("cma_popsize", 16)),
+        cma_generations=int(acq_cfg.get("cma_generations", 10)),
+        cma_sigma_init=float(acq_cfg.get("cma_sigma_init", 5.0)),
+        prior_metrics=prior_metrics,
     )
     acq_started = time.time()
     acq_result = run_acquisition(
@@ -228,12 +245,30 @@ def main() -> int:
     acq_elapsed_min = (time.time() - acq_started) / 60.0
     print(f"Acquired {len(acq_result['candidates'])} raw candidates in {acq_elapsed_min:.2f} min")
 
-    # ----- Step 3: select frontier+adversarial batch -----
-    selected = select_batch(
-        acq_result["candidates"],
-        batch_size=int(sel_cfg["batch_size"]),
-        frontier_fraction=float(sel_cfg.get("frontier_fraction", 0.85)),
+    # ----- Step 3: select batch -----
+    # 4-kind mode if any of the new fraction keys are present; otherwise
+    # fall back to the legacy frontier/adversarial split.
+    kind_fraction_keys = ("frontier_fraction", "adversarial_fraction", "exploit_fraction", "cma_fraction")
+    has_kind_fractions = any(
+        k in sel_cfg for k in kind_fraction_keys if k != "frontier_fraction"
     )
+    if has_kind_fractions:
+        kind_fractions = {
+            k.replace("_fraction", ""): float(sel_cfg[k])
+            for k in kind_fraction_keys
+            if k in sel_cfg
+        }
+        selected = select_batch(
+            acq_result["candidates"],
+            batch_size=int(sel_cfg["batch_size"]),
+            kind_fractions=kind_fractions,
+        )
+    else:
+        selected = select_batch(
+            acq_result["candidates"],
+            batch_size=int(sel_cfg["batch_size"]),
+            frontier_fraction=float(sel_cfg.get("frontier_fraction", 0.85)),
+        )
     print(f"Selected {len(selected)} candidates for IX submission")
 
     selected_manifest = paths.iter_manifest(state.iteration)

@@ -34,6 +34,13 @@ class IterationRecord:
     batch_mae: float | None = None
     frontier_mae: float | None = None
     adversarial_mae: float | None = None
+    # 4-kind acquisition rollups (added alongside elite/cma kinds). All None on
+    # older runs that pre-date the change; that's intentional — plot code uses
+    # ``.get(...)`` so missing fields stay invisible rather than rendering as 0.
+    exploit_mape: float | None = None
+    exploit_mae: float | None = None
+    cma_mape: float | None = None
+    cma_mae: float | None = None
     n_train_samples: int | None = None
     train_val_loss: float | None = None
     wallclock_acquire_min: float | None = None

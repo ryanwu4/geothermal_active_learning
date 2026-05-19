@@ -38,7 +38,7 @@ class CandidateMetric:
     output_file_name: str
     geology_index: int
     geology_config_id: int | str | None
-    kind: str  # "frontier" | "adversarial"
+    kind: str  # "frontier" | "adversarial" | "exploit" | "cma"
     predicted_revenue: float
     real_revenue: float
     abs_pct_error: float
@@ -67,6 +67,11 @@ class IngestMetrics:
     batch_mape_floored: float | None = None
     frontier_mae: float | None = None
     adversarial_mae: float | None = None
+    # 4-kind per-kind rollups (added with the elite/cma acquisition paths).
+    exploit_mape: float | None = None
+    exploit_mae: float | None = None
+    cma_mape: float | None = None
+    cma_mae: float | None = None
     # New: per-candidate rows + per-geology rollups for richer post-run plots.
     candidates: list[CandidateMetric] | None = None
     per_geology: dict[str, dict[str, float | int | None]] | None = None
@@ -310,6 +315,8 @@ def ingest_iteration(
     batch_signed_pct_bias = _mean_finite([c.signed_pct_error for c in candidates])
     frontier_mape = _mean_finite([c.abs_pct_error for c in candidates if c.kind == "frontier"])
     adversarial_mape = _mean_finite([c.abs_pct_error for c in candidates if c.kind == "adversarial"])
+    exploit_mape = _mean_finite([c.abs_pct_error for c in candidates if c.kind == "exploit"])
+    cma_mape = _mean_finite([c.abs_pct_error for c in candidates if c.kind == "cma"])
 
     # Floored MAPE: divide by max(|real|, 0.1 * cohort_median_real). Lets MAPE remain
     # interpretable on the geo-8-like cohort with small true values.
@@ -326,6 +333,8 @@ def ingest_iteration(
     batch_mae = _mean_finite([c.abs_error for c in candidates])
     frontier_mae = _mean_finite([c.abs_error for c in candidates if c.kind == "frontier"])
     adversarial_mae = _mean_finite([c.abs_error for c in candidates if c.kind == "adversarial"])
+    exploit_mae = _mean_finite([c.abs_error for c in candidates if c.kind == "exploit"])
+    cma_mae = _mean_finite([c.abs_error for c in candidates if c.kind == "cma"])
 
     # Per-geology rollup — useful for spotting geologies the surrogate
     # systematically struggles on, and for the convergence plot script.
@@ -385,6 +394,10 @@ def ingest_iteration(
         batch_mape_floored=batch_mape_floored,
         frontier_mae=frontier_mae,
         adversarial_mae=adversarial_mae,
+        exploit_mape=exploit_mape,
+        exploit_mae=exploit_mae,
+        cma_mape=cma_mape,
+        cma_mae=cma_mae,
         candidates=candidates,
         per_geology=per_geology,
         n_failed_per_status=n_failed_per_status,

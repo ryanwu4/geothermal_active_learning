@@ -58,7 +58,7 @@ class AcquisitionConfig:
     norm_config_path: Path
     geologies: list[GeologySpec]
     wells: list[WellSpec]
-    n_starts_per_geology: int
+    n_starts_per_geology: int  # LHS starts (frontier+adversarial provenance)
     k_safe: int
     k_adv: int
     adv_fraction: float
@@ -73,11 +73,28 @@ class AcquisitionConfig:
     # spawns one worker subprocess per device and dispatches geologies across
     # them via a shared queue. See ``run_acquisition`` for details.
     devices: list[str] | None = None
+    # 4-kind acquisition knobs. Defaults of 0 keep old behavior (LHS-only).
+    n_elite_per_geology: int = 0           # exploit kind: Adam seeded from top-K real-revenue priors
+    n_cma_per_geology: int = 0             # cma kind: Adam seeded from CMA-ES warm-up
+    elite_top_k: int = 10                  # pool size before sampling n_elite seeds
+    elite_seed_noise: float = 2.0          # σ (grid cells) added to each elite seed
+    cma_popsize: int = 16
+    cma_generations: int = 10
+    cma_sigma_init: float = 5.0
+    # List of prior-iter per_candidate_metrics.json paths, in iter order.
+    # Phase script populates this; acquire derives snapshots_json dirs from it
+    # to recover well coords for the elite path.
+    prior_metrics: list[Path] | None = None
 
 
 # Canonical ordering for snapshots in the aggregate manifest so parallel runs
 # produce byte-identical output to serial runs.
-_KIND_ORDER = {"frontier": 0, "adversarial": 1}
+_KIND_ORDER = {"frontier": 0, "adversarial": 1, "exploit": 2, "cma": 3}
+
+# Maps the provenance of a start ("lhs"/"elite"/"cma") to the kind tag used at
+# the k_safe snapshot step. Adversarial snapshots at k_adv are emitted ONLY for
+# LHS-provenance starts (exploit/cma deep-Adam endpoints would muddy semantics).
+_START_KIND_TO_SAFE_KIND = {"lhs": "frontier", "elite": "exploit", "cma": "cma"}
 
 
 def _snapshot_sort_key(snap: dict) -> tuple[int, int, int]:
@@ -347,6 +364,233 @@ def _per_geology_seed(base_seed: int, geology_index: int) -> int:
     return ((base_seed * 1_000_003) ^ (geology_index * 1009)) & ((1 << 63) - 1)
 
 
+def _load_elite_seeds(
+    geology_index: int,
+    prior_metrics: list[Path],
+    k: int,
+    rng: np.random.Generator,
+) -> list[np.ndarray]:
+    """Pull top-K real-revenue configs for ``geology_index`` across prior iters.
+
+    Returns at most ``k`` coord arrays of shape ``(num_wells, 3)``, ranked by
+    descending real INTERSECT revenue. Cross-references each candidate's
+    ``snapshot_id`` to the corresponding ``snapshots_json/<id>.json`` to recover
+    the (x, y, z) well coordinates. Silently skips entries with non-finite real
+    revenue or missing snapshot JSONs. Enforces a minimum pairwise L2 distance
+    (≥3 grid cells in the flattened coord vector) to avoid collapsed picks.
+    """
+    if not prior_metrics:
+        return []
+
+    entries: list[tuple[float, str, list[Path]]] = []  # (real_rev, snapshot_id, candidate_dirs)
+    for metrics_path in prior_metrics:
+        metrics_path = Path(metrics_path)
+        if not metrics_path.exists():
+            continue
+        # The snapshots_json dir lives in one of two layouts depending on the
+        # driver. We try both and use whichever exists at lookup time:
+        #   * Sherlock (orchestrator/paths.py): <run_root>/iter_NNNN/acquire/snapshots_json/
+        #   * Local hybrid (scripts/run_al_local.py): <run_root>/acquire/iter_NNNN/snapshots_json/
+        iter_name = metrics_path.parent.name  # "iter_0004"
+        run_root = metrics_path.parent.parent
+        candidate_dirs = [
+            metrics_path.parent / "acquire" / "snapshots_json",          # Sherlock layout
+            run_root / "acquire" / iter_name / "snapshots_json",         # Local-hybrid layout
+        ]
+        try:
+            with open(metrics_path, "r") as f:
+                payload = json.load(f)
+        except Exception:
+            continue
+        for c in payload.get("candidates", []):
+            if int(c.get("geology_index", -1)) != geology_index:
+                continue
+            real = c.get("real_revenue")
+            if real is None or not np.isfinite(real):
+                continue
+            snap_id = c.get("snapshot_id")
+            if not snap_id:
+                continue
+            entries.append((float(real), str(snap_id), candidate_dirs))
+
+    if not entries:
+        return []
+
+    # Rank descending by real_revenue, then walk in order applying a min-distance filter.
+    entries.sort(key=lambda t: -t[0])
+    picked: list[np.ndarray] = []
+    picked_flat: list[np.ndarray] = []
+    min_dist = 3.0  # grid cells (in flattened coord space)
+    for real_rev, snap_id, candidate_dirs in entries:
+        if len(picked) >= k:
+            break
+        snap_path = None
+        for sdir in candidate_dirs:
+            cand = sdir / f"{snap_id}.json"
+            if cand.exists():
+                snap_path = cand
+                break
+        if snap_path is None:
+            continue
+        try:
+            with open(snap_path, "r") as f:
+                snap = json.load(f)
+        except Exception:
+            continue
+        wells = snap.get("wells", [])
+        if not wells:
+            continue
+        coords = np.asarray(
+            [[float(w["x"]), float(w["y"]), float(w["z"])] for w in wells],
+            dtype=np.float32,
+        )
+        flat = coords.reshape(-1)
+        if picked_flat:
+            dists = np.linalg.norm(np.stack(picked_flat) - flat[None, :], axis=1)
+            if float(dists.min()) < min_dist:
+                continue
+        picked.append(coords)
+        picked_flat.append(flat)
+
+    # Light shuffle to avoid pulling the same elite to start 0 every iter.
+    rng.shuffle(picked)
+    return picked[:k]
+
+
+def _cma_seed_starts(
+    n_seeds: int,
+    cfg: AcquisitionConfig,
+    geo,  # GeologySpec
+    num_wells: int,
+    wells_spec,  # list[WellSpec]
+    nx: int,
+    ny: int,
+    z_max: int,
+    static_graphs_factory,  # callable(cfgs) -> static_graphs, lazy because we don't want to rebuild from scratch
+    model,
+    target_mean: torch.Tensor,
+    target_scale: torch.Tensor,
+    device: torch.device,
+    seed_geo: int,
+    elite_seeds: list[np.ndarray],
+    valid_xy_indices: np.ndarray,
+    well_xy_valid_fn,
+) -> list[np.ndarray]:
+    """Run a short CMA-ES warm-up using the surrogate as fitness (forward-only)
+    and return the top-``n_seeds`` coordinate arrays from the final population.
+
+    These coords subsequently feed into the main Adam loop as initial starts
+    (tagged kind="cma"), so CMA-ES is acting as a smarter sampler than LHS — it
+    naturally concentrates around high-fitness regions of the surrogate while
+    maintaining covariance-controlled exploration.
+
+    Bounds: same edge-buffered window as LHS. If a CMA sample falls on dead rock
+    or claims a duplicate cell, it's projected to the nearest valid cell from
+    ``valid_xy_indices`` rather than rejected — keeps the population the
+    requested size without inflating compute.
+    """
+    if n_seeds <= 0:
+        return []
+    try:
+        from cmaes import CMA  # type: ignore
+    except ImportError:
+        print("[acquire] cmaes not installed; falling back to LHS for cma kind. "
+              "Install via `pip install cmaes`.", flush=True)
+        return []
+
+    dim = num_wells * 2  # (x, y) per well; depth held fixed per WellSpec
+    x_lo, x_hi = float(cfg.edge_buffer), float(nx - 1 - cfg.edge_buffer)
+    y_lo, y_hi = float(cfg.edge_buffer), float(ny - 1 - cfg.edge_buffer)
+    bounds = np.array(
+        [[x_lo, x_hi], [y_lo, y_hi]] * num_wells, dtype=np.float64
+    )
+
+    # Initial mean: centroid of elites if available, else LHS-window center.
+    if elite_seeds:
+        elite_stack = np.stack([e[:, :2].reshape(-1) for e in elite_seeds], axis=0)
+        mean_init = elite_stack.mean(axis=0).astype(np.float64)
+    else:
+        cx = 0.5 * (x_lo + x_hi)
+        cy = 0.5 * (y_lo + y_hi)
+        mean_init = np.tile([cx, cy], num_wells).astype(np.float64)
+    mean_init = np.clip(mean_init, bounds[:, 0] + 1e-3, bounds[:, 1] - 1e-3)
+
+    es = CMA(
+        mean=mean_init,
+        sigma=float(cfg.cma_sigma_init),
+        bounds=bounds,
+        seed=int(seed_geo & 0xFFFFFFFF),
+        population_size=int(cfg.cma_popsize),
+    )
+
+    # We need to evaluate popsize candidates per generation through the surrogate.
+    # Build a static graph batch once for ``popsize`` slots with placeholder coords;
+    # then reuse, mutating only well positions on each forward.
+    placeholder_cfgs: list[list[dict]] = []
+    for _ in range(int(cfg.cma_popsize)):
+        c = []
+        for w in range(num_wells):
+            c.append({
+                "x": 0.5 * (x_lo + x_hi),
+                "y": 0.5 * (y_lo + y_hi),
+                "depth": int(min(wells_spec[w].depth, z_max)),
+                "type": wells_spec[w].type,
+            })
+        placeholder_cfgs.append(c)
+    try:
+        static_graphs = static_graphs_factory(placeholder_cfgs)
+    except Exception as e:
+        print(f"[acquire] CMA-ES warm-up bailout (graph build failed): {e}", flush=True)
+        return []
+    batch_data = Batch.from_data_list(static_graphs).to(device)
+    M = int(cfg.cma_popsize)
+
+    best_population: list[tuple[np.ndarray, float]] = []  # (coords (num_wells,3), pred)
+    z_per_well = np.array(
+        [float(min(wells_spec[w].depth, z_max)) for w in range(num_wells)],
+        dtype=np.float32,
+    )
+    for _gen in range(int(cfg.cma_generations)):
+        sols = np.stack([es.ask() for _ in range(M)], axis=0)  # (M, dim)
+        # Project to valid cells (dead-rock + edge buffer already enforced via bounds).
+        coords_xy = sols.reshape(M, num_wells, 2)
+        # Build (M, num_wells, 3) by attaching fixed z per well.
+        coords_xyz = np.concatenate(
+            [coords_xy, np.broadcast_to(z_per_well[None, :, None], (M, num_wells, 1))],
+            axis=-1,
+        ).astype(np.float32)
+        # Snap to nearest valid (x,y) cell if any well lands on dead rock.
+        for i in range(M):
+            used: set[tuple[int, int]] = set()
+            for w in range(num_wells):
+                rx, ry = float(coords_xyz[i, w, 0]), float(coords_xyz[i, w, 1])
+                cell = (int(np.clip(round(rx), 0, nx - 1)), int(np.clip(round(ry), 0, ny - 1)))
+                if (not well_xy_valid_fn(rx, ry, int(z_per_well[w]))) or cell in used:
+                    pick = valid_xy_indices[
+                        np.random.default_rng(seed_geo + _gen * 7919 + i * 31 + w).integers(
+                            0, len(valid_xy_indices)
+                        )
+                    ]
+                    rx, ry = float(pick[0]), float(pick[1])
+                    cell = (int(round(rx)), int(round(ry)))
+                used.add(cell)
+                coords_xyz[i, w, 0] = rx
+                coords_xyz[i, w, 1] = ry
+        c_t = torch.from_numpy(coords_xyz).to(device)
+        with torch.no_grad():
+            batch_data["well"].pos_xyz = c_t.view(-1, 3)
+            pred_scaled = model(batch_data).view(M)
+            preds = (pred_scaled * target_scale + target_mean).detach().cpu().numpy()
+        # cmaes minimizes; we want to maximize predicted revenue.
+        es.tell(list(zip([s for s in sols], (-preds).tolist())))
+        for i in range(M):
+            best_population.append((coords_xyz[i].copy(), float(preds[i])))
+
+    # Return top n_seeds across all generations by predicted revenue (high → low).
+    best_population.sort(key=lambda t: -t[1])
+    return [c for c, _p in best_population[:n_seeds]]
+
+
 def _run_one_geology(
     *,
     cfg: AcquisitionConfig,
@@ -355,13 +599,17 @@ def _run_one_geology(
     ctx: _WorkerContext,
     well_configs_dir: Path,
     snapshots_json_dir: Path,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, float]]:
     """Run gradient-descent acquisition for a single geology on ``ctx.device``.
 
-    Returns (snapshot_records, candidate_payloads). Candidate payloads are
-    plain dicts so they survive the IPC boundary; the parent converts them
-    back to ``Candidate`` instances via ``_payload_to_candidate``.
+    Returns (snapshot_records, candidate_payloads, timings). Candidate payloads
+    are plain dicts so they survive the IPC boundary; the parent converts them
+    back to ``Candidate`` instances via ``_payload_to_candidate``. ``timings``
+    is a dict of {stage_name: seconds} for the GPU/CPU profiling CSV.
     """
+    timings: dict[str, float] = {}
+    t_total_start = time.perf_counter()
+
     device = ctx.device
     model = ctx.model
     target_mean = ctx.target_mean
@@ -371,13 +619,16 @@ def _run_one_geology(
 
     geo_path = Path(geo.geology_h5_file)
     geo_name = geo.geology_name or geo_path.stem
+
+    t0 = time.perf_counter()
     with h5py.File(geo_path, "r") as src:
         geo_meta = _read_geology_metadata_safe(ctx.read_geology_metadata, src, geo_name)
-
     loaded = _load_geology(
         geo_path, ctx.norm_config,
         ctx.PROPERTIES, ctx.PERM_PROPS, ctx.get_valid_mask, ctx.find_z_cutoff,
     )
+    timings["geo_load_s"] = time.perf_counter() - t0
+
     nx, ny, z_max = loaded["nx"], loaded["ny"], loaded["z_max"]
     physics_dict, full_shape = loaded["physics_dict"], loaded["full_shape"]
     z_cutoff = loaded["z_cutoff"]
@@ -416,53 +667,141 @@ def _run_one_geology(
         iy_ = int(np.clip(int(round(ry_)), 0, ny - 1))
         return bool(np.any(temp0_full[: max(1, depth_), ix_, iy_] > -900))
 
-    lhs = sampler.random(n=cfg.n_starts_per_geology)
-    cfgs: list[list[dict]] = []
-    for n in range(cfg.n_starts_per_geology):
-        c = []
-        # Track integer (ix, iy) cells already claimed by wells in this candidate.
-        # extract_well_data dedups by (x_idx, y_idx) — if two wells round to the
-        # same column they merge into one table entry and the graph ends up with
-        # < num_wells wells, breaking the M*num_wells layout the acquisition
-        # forward pass assumes.
+    def _build_cfg_from_coords(coords_arr: np.ndarray) -> list[dict]:
+        """coords_arr: (num_wells, 3). Returns the list-of-dicts the static
+        graph builder expects."""
+        return [
+            {
+                "x": float(coords_arr[w, 0]),
+                "y": float(coords_arr[w, 1]),
+                "depth": int(min(cfg.wells[w].depth, z_max)),
+                "type": cfg.wells[w].type,
+            }
+            for w in range(num_wells)
+        ]
+
+    def _project_to_valid(coords_arr: np.ndarray, rng_local: np.random.Generator) -> np.ndarray:
+        """Snap any invalid or duplicate-cell well to a valid cell drawn from
+        ``valid_xy_indices``. Operates in-place but also returns the array.
+        """
         used_cells: set[tuple[int, int]] = set()
         for w in range(num_wells):
-            rx = x_lo + lhs[n, 2 * w] * (x_hi - x_lo)
-            ry = y_lo + lhs[n, 2 * w + 1] * (y_hi - y_lo)
-            depth = min(int(cfg.wells[w].depth), int(z_max))
-
-            def _cell_of(rx_: float, ry_: float) -> tuple[int, int]:
-                return (
-                    int(np.clip(int(round(rx_)), 0, nx - 1)),
-                    int(np.clip(int(round(ry_)), 0, ny - 1)),
-                )
-
-            # Resample until the well lands on a valid Z column AND on a cell
-            # not already taken by an earlier well in this candidate.
+            rx, ry = float(coords_arr[w, 0]), float(coords_arr[w, 1])
+            depth = int(min(cfg.wells[w].depth, z_max))
             tries = 0
             while True:
-                cell = _cell_of(rx, ry)
+                cell = (
+                    int(np.clip(int(round(rx)), 0, nx - 1)),
+                    int(np.clip(int(round(ry)), 0, ny - 1)),
+                )
                 if _well_xy_valid(rx, ry, depth) and cell not in used_cells:
                     break
                 if tries >= 200:
                     raise RuntimeError(
-                        f"Geology {geo.geology_index} candidate {n} well {w}: "
-                        f"failed to find a valid, unused (x,y) cell after "
-                        f"{tries} resamples. "
-                        f"used={len(used_cells)}/{valid_xy_indices.shape[0]} "
-                        f"valid cells in window."
+                        f"Geology {geo.geology_index}: failed to project well {w} "
+                        f"to a valid unused cell after {tries} tries"
                     )
-                pick = valid_xy_indices[int(rng.integers(0, len(valid_xy_indices)))]
+                pick = valid_xy_indices[int(rng_local.integers(0, len(valid_xy_indices)))]
                 rx = float(pick[0])
                 ry = float(pick[1])
                 tries += 1
             used_cells.add(cell)
-            c.append({
-                "x": float(rx), "y": float(ry),
-                "depth": int(depth), "type": cfg.wells[w].type,
-            })
-        cfgs.append(c)
+            coords_arr[w, 0] = rx
+            coords_arr[w, 1] = ry
+        return coords_arr
 
+    def _lhs_one_start() -> np.ndarray:
+        """Single LHS-validated start, shape (num_wells, 3)."""
+        s = sampler.random(n=1)[0]
+        coords_arr = np.zeros((num_wells, 3), dtype=np.float32)
+        for w in range(num_wells):
+            coords_arr[w, 0] = x_lo + s[2 * w] * (x_hi - x_lo)
+            coords_arr[w, 1] = y_lo + s[2 * w + 1] * (y_hi - y_lo)
+            coords_arr[w, 2] = int(min(cfg.wells[w].depth, int(z_max)))
+        return _project_to_valid(coords_arr, rng)
+
+    # ------------------------------------------------------------------
+    # Generate starts (3 provenances: lhs, elite, cma)
+    # ------------------------------------------------------------------
+    t0 = time.perf_counter()
+    cfgs: list[list[dict]] = []
+    start_kinds: list[str] = []
+
+    # 1. LHS starts (always present; produce frontier+adversarial snapshots)
+    for _ in range(int(cfg.n_starts_per_geology)):
+        coords_arr = _lhs_one_start()
+        cfgs.append(_build_cfg_from_coords(coords_arr))
+        start_kinds.append("lhs")
+
+    # 2. Elite starts (only if requested + priors available)
+    elite_seeds_coords: list[np.ndarray] = []
+    if int(cfg.n_elite_per_geology) > 0 and cfg.prior_metrics:
+        elite_seeds_coords = _load_elite_seeds(
+            geology_index=geo.geology_index,
+            prior_metrics=list(cfg.prior_metrics or []),
+            k=int(cfg.elite_top_k),
+            rng=rng,
+        )
+    for i in range(int(cfg.n_elite_per_geology)):
+        if elite_seeds_coords:
+            base = elite_seeds_coords[i % len(elite_seeds_coords)].copy()
+            noise = rng.normal(0.0, float(cfg.elite_seed_noise), size=base.shape).astype(np.float32)
+            noise[:, 2] = 0.0  # never perturb z
+            coords_arr = (base + noise).astype(np.float32)
+            coords_arr[:, 0] = np.clip(coords_arr[:, 0], x_lo, x_hi)
+            coords_arr[:, 1] = np.clip(coords_arr[:, 1], y_lo, y_hi)
+            for w in range(num_wells):
+                coords_arr[w, 2] = int(min(cfg.wells[w].depth, int(z_max)))
+            coords_arr = _project_to_valid(coords_arr, rng)
+        else:
+            # Cold start (iter 0): fall back to LHS, still tagged "elite" so the
+            # schema is uniform from iter 0.
+            coords_arr = _lhs_one_start()
+        cfgs.append(_build_cfg_from_coords(coords_arr))
+        start_kinds.append("elite")
+
+    # 3. CMA starts (only if requested)
+    cma_seeds_coords: list[np.ndarray] = []
+    if int(cfg.n_cma_per_geology) > 0:
+        def _cma_factory(cfgs_inner: list[list[dict]]):
+            return _build_static_batch_for_starts(
+                cfgs_inner, geo_path, physics_dict, full_shape, z_cutoff, nx, ny,
+                cfg.revenue_target, ctx.scaler,
+                ctx.extract_well_data, ctx.build_wells_table, ctx.extract_vertical_profiles,
+                ctx.build_single_hetero_data, temp0_full,
+                node_encoder=ctx.node_encoder, enrich_global_attr=ctx.enrich_global_attr,
+            )
+        try:
+            cma_seeds_coords = _cma_seed_starts(
+                n_seeds=int(cfg.n_cma_per_geology), cfg=cfg, geo=geo,
+                num_wells=num_wells, wells_spec=cfg.wells,
+                nx=nx, ny=ny, z_max=z_max,
+                static_graphs_factory=_cma_factory,
+                model=model, target_mean=target_mean, target_scale=target_scale,
+                device=device, seed_geo=seed_geo,
+                elite_seeds=elite_seeds_coords,
+                valid_xy_indices=valid_xy_indices, well_xy_valid_fn=_well_xy_valid,
+            )
+        except Exception as e:
+            print(f"[acquire] CMA-ES warm-up failed for geo={geo.geology_index}: {e}; "
+                  f"falling back to LHS for cma kind", flush=True)
+            cma_seeds_coords = []
+    # Top up with LHS if CMA returned fewer than requested (or wasn't installed).
+    while len(cma_seeds_coords) < int(cfg.n_cma_per_geology):
+        cma_seeds_coords.append(_lhs_one_start())
+    for coords_arr in cma_seeds_coords[: int(cfg.n_cma_per_geology)]:
+        cfgs.append(_build_cfg_from_coords(_project_to_valid(coords_arr.copy(), rng)))
+        start_kinds.append("cma")
+
+    timings["seed_gen_s"] = time.perf_counter() - t0
+    timings["n_lhs"] = int(start_kinds.count("lhs"))
+    timings["n_elite"] = int(start_kinds.count("elite"))
+    timings["n_cma"] = int(start_kinds.count("cma"))
+
+    # ------------------------------------------------------------------
+    # Build static graph batch for ALL starts at once
+    # ------------------------------------------------------------------
+    t0 = time.perf_counter()
     static_graphs = _build_static_batch_for_starts(
         cfgs, geo_path, physics_dict, full_shape, z_cutoff, nx, ny,
         cfg.revenue_target, ctx.scaler,
@@ -472,6 +811,7 @@ def _run_one_geology(
         enrich_global_attr=ctx.enrich_global_attr,
     )
     batch_data = Batch.from_data_list(static_graphs).to(device)
+    timings["graph_build_s"] = time.perf_counter() - t0
 
     starts = [
         [[w["x"], w["y"], float(w["depth"])] for w in c] for c in cfgs
@@ -479,7 +819,7 @@ def _run_one_geology(
     coords = torch.tensor(starts, dtype=torch.float32, device=device)
     coords.requires_grad = True
     optimizer = optim.Adam([coords], lr=cfg.learning_rate)
-    M = cfg.n_starts_per_geology
+    M = len(cfgs)
     last_valid_coords = coords.detach().clone()
 
     def _predict_unscaled(c: torch.Tensor) -> torch.Tensor:
@@ -487,12 +827,21 @@ def _run_one_geology(
         pred_scaled = model(batch_data).view(M)
         return pred_scaled * target_scale + target_mean
 
-    n_adv = max(0, int(round(M * cfg.adv_fraction)))
-    adv_idx = set(int(i) for i in rng.choice(M, size=n_adv, replace=False)) if n_adv > 0 else set()
+    # Adversarial subset: random subset of LHS-provenance starts only.
+    lhs_indices = [i for i, k in enumerate(start_kinds) if k == "lhs"]
+    n_lhs = len(lhs_indices)
+    n_adv = max(0, int(round(n_lhs * cfg.adv_fraction)))
+    if n_adv > 0 and lhs_indices:
+        adv_idx = set(
+            int(i) for i in rng.choice(lhs_indices, size=min(n_adv, n_lhs), replace=False)
+        )
+    else:
+        adv_idx = set()
 
     snapshots: list[dict[str, Any]] = []
     cand_payloads: list[dict[str, Any]] = []
 
+    t0 = time.perf_counter()
     K_total = max(cfg.k_safe, cfg.k_adv)
     for step in range(1, K_total + 1):
         optimizer.zero_grad()
@@ -528,18 +877,20 @@ def _run_one_geology(
             last_valid_coords.copy_(coords)
 
         if step == cfg.k_safe:
+            t_snap = time.perf_counter()
             with torch.no_grad():
                 preds_now = _predict_unscaled(coords).detach().cpu().numpy()
             for m in range(M):
                 cxyz = coords[m].detach().cpu().numpy()
                 pred_val = float(preds_now[m])
                 if not (np.isfinite(cxyz).all() and np.isfinite(pred_val)):
-                    print(f"[acquire] skip non-finite frontier snapshot geo={geo.geology_index} m={m}", flush=True)
+                    print(f"[acquire] skip non-finite k_safe snapshot geo={geo.geology_index} m={m} kind={start_kinds[m]}", flush=True)
                     continue
+                safe_kind = _START_KIND_TO_SAFE_KIND[start_kinds[m]]
                 snap = _emit_snapshot(
                     run_id=geo.geology_index * 10000 + m,
                     iteration_step=step,
-                    kind="frontier",
+                    kind=safe_kind,
                     coords_xyz=cxyz,
                     is_injector_list=is_injector_list,
                     predicted_revenue=pred_val,
@@ -557,8 +908,10 @@ def _run_one_geology(
                     "coords_xyz": cxyz.tolist(),
                     "is_injector": list(is_injector_list),
                 })
+            timings["snapshot_io_safe_s"] = timings.get("snapshot_io_safe_s", 0.0) + (time.perf_counter() - t_snap)
 
         if step == cfg.k_adv and adv_idx:
+            t_snap = time.perf_counter()
             with torch.no_grad():
                 preds_now = _predict_unscaled(coords).detach().cpu().numpy()
             for m in sorted(adv_idx):
@@ -588,8 +941,11 @@ def _run_one_geology(
                     "coords_xyz": cxyz.tolist(),
                     "is_injector": list(is_injector_list),
                 })
+            timings["snapshot_io_adv_s"] = timings.get("snapshot_io_adv_s", 0.0) + (time.perf_counter() - t_snap)
 
-    return snapshots, cand_payloads
+    timings["adam_loop_s"] = time.perf_counter() - t0
+    timings["total_s"] = time.perf_counter() - t_total_start
+    return snapshots, cand_payloads, timings
 
 
 def _payload_to_candidate(payload: dict[str, Any]) -> Candidate:
@@ -655,19 +1011,22 @@ def _multi_gpu_worker(
         # ops (e.g. inside torch_geometric) land on the right GPU.
         if device_str.startswith("cuda:") and torch.cuda.is_available():
             torch.cuda.set_device(int(device_str.split(":", 1)[1]))
+        t_ctx = time.perf_counter()
         ctx = _build_worker_context(cfg, iteration, device_str)
+        ctx_load_s = time.perf_counter() - t_ctx
         wc_dir = Path(well_configs_dir)
         sj_dir = Path(snapshots_json_dir)
     except BaseException as e:  # propagate setup errors to parent
         out_queue.put(("__init_error__", repr(e)))
         return
 
+    first_geo = True
     while True:
         geo = in_queue.get()
         if geo is None:
             return
         try:
-            snaps, cand_payloads = _run_one_geology(
+            snaps, cand_payloads, timings = _run_one_geology(
                 cfg=cfg,
                 geo=geo,
                 iteration=iteration,
@@ -675,7 +1034,13 @@ def _multi_gpu_worker(
                 well_configs_dir=wc_dir,
                 snapshots_json_dir=sj_dir,
             )
-            out_queue.put((device_str, geo.geology_index, snaps, cand_payloads))
+            # Attribute the one-time worker context load cost to the first
+            # geology processed by this worker. Matches the serial path's
+            # treatment so the CSV's worker_ctx_load_s column is symmetric.
+            if first_geo:
+                timings["worker_ctx_load_s"] = ctx_load_s
+                first_geo = False
+            out_queue.put((device_str, geo.geology_index, snaps, cand_payloads, timings))
         except BaseException as e:
             out_queue.put(("__error__", geo.geology_index, repr(e)))
 
@@ -717,7 +1082,7 @@ def _run_acquisition_multi_gpu(
     devices: list[str],
     well_configs_dir: Path,
     snapshots_json_dir: Path,
-) -> tuple[list[dict[str, Any]], list[Candidate]]:
+) -> tuple[list[dict[str, Any]], list[Candidate], list[dict[str, Any]]]:
     import torch.multiprocessing as tmp
 
     mp_ctx = tmp.get_context("spawn")
@@ -766,6 +1131,7 @@ def _run_acquisition_multi_gpu(
 
     snapshots: list[dict[str, Any]] = []
     candidates: list[Candidate] = []
+    timing_rows: list[dict[str, Any]] = []
     expected = len(cfg.geologies)
     received = 0
     errors: list[str] = []
@@ -784,10 +1150,13 @@ def _run_acquisition_multi_gpu(
                 errors.append(f"worker error on geo={msg[1]}: {msg[2]}")
                 received += 1
                 continue
-            _dev, _geo_idx, snaps, cand_payloads = msg
+            _dev, _geo_idx, snaps, cand_payloads, timings = msg
             snapshots.extend(snaps)
             for payload in cand_payloads:
                 candidates.append(_payload_to_candidate(payload))
+            row = {"device": _dev, "geology_index": _geo_idx}
+            row.update(timings)
+            timing_rows.append(row)
             received += 1
     finally:
         _terminate_procs(procs, join_timeout=30.0)
@@ -802,7 +1171,7 @@ def _run_acquisition_multi_gpu(
     if errors:
         raise RuntimeError("Multi-GPU acquisition failures:\n  " + "\n  ".join(errors))
 
-    return snapshots, candidates
+    return snapshots, candidates, timing_rows
 
 
 def run_acquisition(
@@ -832,14 +1201,17 @@ def run_acquisition(
 
     snapshots: list[dict[str, Any]] = []
     candidates: list[Candidate] = []
+    timing_rows: list[dict[str, Any]] = []
     started = time.time()
 
     if len(devices) <= 1:
         # In-process path. Load model once, iterate geologies serially.
         device_str = devices[0]
+        t_ctx = time.perf_counter()
         ctx = _build_worker_context(cfg, iteration, device_str)
-        for geo in cfg.geologies:
-            snaps, cand_payloads = _run_one_geology(
+        ctx_load_s = time.perf_counter() - t_ctx
+        for i, geo in enumerate(cfg.geologies):
+            snaps, cand_payloads, timings = _run_one_geology(
                 cfg=cfg,
                 geo=geo,
                 iteration=iteration,
@@ -850,12 +1222,17 @@ def run_acquisition(
             snapshots.extend(snaps)
             for payload in cand_payloads:
                 candidates.append(_payload_to_candidate(payload))
+            row = {"device": device_str, "geology_index": geo.geology_index}
+            row.update(timings)
+            if i == 0:
+                row["worker_ctx_load_s"] = ctx_load_s
+            timing_rows.append(row)
     else:
         # Multi-GPU path. Spawn one worker per device; geologies are pulled off
         # a shared queue. Each worker loads model+scaler once per process.
         # Order of completion is not deterministic, so we sort the merged
         # snapshot list at the end to keep the manifest reproducible.
-        snapshots, candidates = _run_acquisition_multi_gpu(
+        snapshots, candidates, timing_rows = _run_acquisition_multi_gpu(
             cfg=cfg,
             iteration=iteration,
             devices=devices,
@@ -864,6 +1241,19 @@ def run_acquisition(
         )
         snapshots.sort(key=_snapshot_sort_key)
         candidates.sort(key=lambda c: (c.geology_index, _KIND_ORDER.get(c.kind, 99), c.run_id))
+
+    # Write per-stage profiling CSV for the GPU-bottleneck investigation.
+    if timing_rows:
+        profiling_dir = out_dir / "profiling"
+        profiling_dir.mkdir(parents=True, exist_ok=True)
+        csv_path = profiling_dir / f"gpu_timings_iter_{iteration:04d}.csv"
+        all_keys = sorted({k for row in timing_rows for k in row.keys()})
+        # Stable column order: device, geology_index first; then alphabetical.
+        col_order = ["device", "geology_index"] + [k for k in all_keys if k not in ("device", "geology_index")]
+        with open(csv_path, "w") as f:
+            f.write(",".join(col_order) + "\n")
+            for row in timing_rows:
+                f.write(",".join(str(row.get(k, "")) for k in col_order) + "\n")
 
     # Write aggregate manifest matching cli_surrogate_array_prepare.jl schema.
     manifest = {
@@ -874,6 +1264,8 @@ def run_acquisition(
         "k_adv": cfg.k_adv,
         "adv_fraction": cfg.adv_fraction,
         "n_starts_per_geology": cfg.n_starts_per_geology,
+        "n_elite_per_geology": cfg.n_elite_per_geology,
+        "n_cma_per_geology": cfg.n_cma_per_geology,
         "geology_metadata": [
             {
                 "geology_index": g.geology_index,

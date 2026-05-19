@@ -44,10 +44,17 @@
   },
 
   "acquisition": {
-    "n_starts_per_geology": 15,
+    "n_starts_per_geology": 4,
+    "n_elite_per_geology": 4,
+    "n_cma_per_geology": 4,
+    "elite_top_k": 10,
+    "elite_seed_noise": 2.0,
+    "cma_popsize": 16,
+    "cma_generations": 10,
+    "cma_sigma_init": 5.0,
     "k_safe": 45,
     "k_adv": 300,
-    "adv_fraction": 0.2,
+    "adv_fraction": 1.0,
     "edge_buffer": 10,
     "lr": 0.5,
     "log_every_n_steps": 25,
@@ -57,7 +64,10 @@
 
   "selection": {
     "batch_size": 200,
-    "frontier_fraction": 0.85
+    "frontier_fraction": 0.25,
+    "adversarial_fraction": 0.25,
+    "exploit_fraction": 0.25,
+    "cma_fraction": 0.25
   },
 
   "intersect": {

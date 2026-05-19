@@ -149,10 +149,14 @@ def main() -> int:
     rec.batch_signed_pct_bias = metrics.batch_signed_pct_bias
     rec.frontier_mape = metrics.frontier_mape
     rec.adversarial_mape = metrics.adversarial_mape
+    rec.exploit_mape = metrics.exploit_mape
+    rec.cma_mape = metrics.cma_mape
     rec.batch_mape_floored = metrics.batch_mape_floored
     rec.batch_mae = metrics.batch_mae
     rec.frontier_mae = metrics.frontier_mae
     rec.adversarial_mae = metrics.adversarial_mae
+    rec.exploit_mae = metrics.exploit_mae
+    rec.cma_mae = metrics.cma_mae
     rec.best_real_revenue = metrics.best_real_revenue_so_far
     rec.n_train_samples = metrics.n_train_samples
     rec.wallclock_ingest_min = ingest_elapsed_min
@@ -194,6 +198,13 @@ def main() -> int:
                 "batch_signed_pct_bias": metrics.batch_signed_pct_bias,
                 "frontier_mape": metrics.frontier_mape,
                 "adversarial_mape": metrics.adversarial_mape,
+                "exploit_mape": metrics.exploit_mape,
+                "cma_mape": metrics.cma_mape,
+                "batch_mae": metrics.batch_mae,
+                "frontier_mae": metrics.frontier_mae,
+                "adversarial_mae": metrics.adversarial_mae,
+                "exploit_mae": metrics.exploit_mae,
+                "cma_mae": metrics.cma_mae,
                 "n_completed": metrics.n_completed,
                 "n_submitted": metrics.n_submitted,
                 "completion_rate": metrics.completion_rate,

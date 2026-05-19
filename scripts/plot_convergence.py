@@ -41,9 +41,19 @@ TITLE_SIZE = 16
 TICK_SIZE = 12
 
 # Dodge offset for split-by-kind plots; ±KIND_DODGE around each integer iter.
-KIND_DODGE = 0.20
-KIND_COLORS = {"frontier": MANIM_BLUE, "adversarial": MANIM_RED}
-KIND_OFFSETS = {"frontier": -KIND_DODGE, "adversarial": +KIND_DODGE}
+KIND_DODGE = 0.12  # tighter dodge so 4 kinds fit per iter
+KIND_COLORS = {
+    "frontier": MANIM_BLUE,
+    "adversarial": MANIM_RED,
+    "exploit": MANIM_GREEN,
+    "cma": MANIM_PURPLE,
+}
+KIND_OFFSETS = {
+    "frontier": -0.30,
+    "adversarial": -0.10,
+    "exploit": +0.10,
+    "cma": +0.30,
+}
 
 
 def _set_style() -> None:
@@ -132,7 +142,7 @@ def plot_best_revenue(history: list[dict], rows: list[dict], out_dir: Path) -> N
     if not best_iters and not rows:
         return
 
-    fig, ax = plt.subplots(figsize=(11, 6), facecolor=MANIM_BG)
+    fig, ax = plt.subplots(figsize=(14, 6.5), facecolor=MANIM_BG)
     _style_ax(ax)
 
     rng = np.random.default_rng(0)
@@ -178,6 +188,57 @@ def plot_best_revenue(history: list[dict], rows: list[dict], out_dir: Path) -> N
     _save(fig, out_dir / "best_revenue_so_far.png")
 
 
+def plot_kind_revenue_summary(rows: list[dict], out_dir: Path) -> None:
+    """Per-kind best-so-far running max real_revenue, one line per kind.
+
+    Skips kinds with no candidates (so legacy 2-kind runs render cleanly with
+    only frontier+adversarial lines).
+    """
+    if not rows:
+        return
+    iters = sorted({r["iteration"] for r in rows})
+    if not iters:
+        return
+
+    fig, ax = plt.subplots(figsize=(11, 6), facecolor=MANIM_BG)
+    _style_ax(ax)
+
+    plotted_any = False
+    for kind, color in KIND_COLORS.items():
+        kind_rows = [r for r in rows
+                     if r.get("kind") == kind
+                     and r.get("real_revenue") is not None]
+        if not kind_rows:
+            continue
+        running_max = -np.inf
+        xs: list[int] = []
+        ys: list[float] = []
+        for it in iters:
+            vals = [r["real_revenue"] for r in kind_rows if r["iteration"] == it]
+            if not vals:
+                continue
+            running_max = max(running_max, float(np.max(vals)))
+            xs.append(it)
+            ys.append(running_max)
+        if not xs:
+            continue
+        ax.plot(xs, ys, color=color, marker="o", lw=2,
+                label=kind.capitalize())
+        plotted_any = True
+
+    if not plotted_any:
+        plt.close(fig)
+        return
+
+    ax.set_xlabel("AL iteration")
+    ax.set_ylabel("Best real revenue so far (per kind)")
+    ax.set_title("Per-kind best-so-far Intersect-true revenue")
+    if iters:
+        ax.set_xticks(iters)
+    ax.legend(loc="lower right")
+    _save(fig, out_dir / "kind_revenue_summary.png")
+
+
 def plot_calibration_metrics(history: list[dict], out_dir: Path) -> None:
     """Per-iteration MAPE + signed bias, frontier vs adversarial breakdown."""
     iters = [r["iteration"] for r in history]
@@ -185,20 +246,26 @@ def plot_calibration_metrics(history: list[dict], out_dir: Path) -> None:
     signed = [r.get("batch_signed_pct_bias") for r in history]
     front = [r.get("frontier_mape") for r in history]
     adv = [r.get("adversarial_mape") for r in history]
+    exploit = [r.get("exploit_mape") for r in history]
+    cma = [r.get("cma_mape") for r in history]
 
-    fig, axes = plt.subplots(1, 2, figsize=(15, 5), facecolor=MANIM_BG)
+    fig, axes = plt.subplots(1, 2, figsize=(16, 5.5), facecolor=MANIM_BG)
     _style_ax(axes[0])
     _style_ax(axes[1])
 
     axes[0].plot(iters, [v * 100 if v is not None else np.nan for v in mape],
                  color=MANIM_BLUE, marker="o", lw=2, label="Batch MAPE")
     axes[0].plot(iters, [v * 100 if v is not None else np.nan for v in front],
-                 color=MANIM_GREEN, marker="s", lw=2, label="Frontier MAPE")
+                 color=MANIM_BLUE, marker="s", lw=2, label="Frontier MAPE")
     axes[0].plot(iters, [v * 100 if v is not None else np.nan for v in adv],
                  color=MANIM_RED, marker="^", lw=2, label="Adversarial MAPE")
+    axes[0].plot(iters, [v * 100 if v is not None else np.nan for v in exploit],
+                 color=MANIM_GREEN, marker="D", lw=2, label="Exploit MAPE")
+    axes[0].plot(iters, [v * 100 if v is not None else np.nan for v in cma],
+                 color=MANIM_PURPLE, marker="v", lw=2, label="CMA MAPE")
     axes[0].set_xlabel("AL iteration")
     axes[0].set_ylabel("MAPE (%)")
-    axes[0].set_title("Calibration: |pred − real| / |real|")
+    axes[0].set_title("Calibration: per-kind |pred − real| / |real|")
     axes[0].legend(loc="best")
 
     axes[1].axhline(0, color=MANIM_GREY, lw=1, ls="--")
@@ -719,16 +786,16 @@ def plot_well_position_heatmaps(rows: list[dict], out_dir: Path) -> None:
 
 
 def plot_well_position_heatmaps_by_kind(rows: list[dict], out_dir: Path) -> None:
-    """2×2 hexbin: rows={frontier,adversarial} × cols={injector,producer}."""
+    """4×2 hexbin: rows={frontier,adversarial,exploit,cma} × cols={injector,producer}."""
     if not rows:
         return
-    kinds = ("frontier", "adversarial")
+    kinds = ("frontier", "adversarial", "exploit", "cma")
     types = (("injector", "Blues"), ("producer", "Oranges"))
     xs = [r["x"] for r in rows]
     ys = [r["y"] for r in rows]
     extent = [min(xs), max(xs), min(ys), max(ys)]
 
-    fig, axes = plt.subplots(2, 2, figsize=(15, 13), facecolor=MANIM_BG)
+    fig, axes = plt.subplots(4, 2, figsize=(15, 22), facecolor=MANIM_BG)
     for i, kind in enumerate(kinds):
         for j, (wt, cmap) in enumerate(types):
             ax = axes[i, j]
@@ -746,7 +813,7 @@ def plot_well_position_heatmaps_by_kind(rows: list[dict], out_dir: Path) -> None
             ax.set_ylim(extent[2], extent[3])
             ax.set_xlabel("x")
             ax.set_ylabel("y")
-            ax.set_title(f"{kind} {wt} (n={len(pts)})")
+            ax.set_title(f"{kind} {wt} (n={len(pts)})", color=KIND_COLORS.get(kind, MANIM_WHITE))
     fig.suptitle("Well placement heatmap by kind × type", color=MANIM_WHITE)
     _save(fig, out_dir / "well_position_heatmap_by_kind.png")
 
@@ -971,6 +1038,7 @@ def main() -> int:
     print(f"Generating plots from {args.run_root} -> {out_dir}")
     rows = _all_candidate_rows(args.run_root, history)
     plot_best_revenue(history, rows, out_dir)
+    plot_kind_revenue_summary(rows, out_dir)
     plot_calibration_metrics(history, out_dir)
     plot_per_geology_mape_heatmap(history, out_dir)
     plot_training_growth(history, out_dir)

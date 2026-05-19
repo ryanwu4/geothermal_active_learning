@@ -672,6 +672,13 @@ def _acquire_and_select_locally(
     wells = [WellSpec(type=w["type"], depth=int(w["depth"])) for w in cfg["wells"]]
     norm_config = _local_norm_config(ws)
 
+    # Elite-path priors: glob prior iters' per_candidate_metrics.json from ws.
+    prior_metrics: list[Path] = []
+    for it_prior in range(iter_idx):
+        p = ws / f"iter_{it_prior:04d}" / "per_candidate_metrics.json"
+        if p.exists():
+            prior_metrics.append(p)
+
     acq = AcquisitionConfig(
         surrogate_repo=surrogate_repo,
         checkpoint_path=ckpt,
@@ -690,6 +697,14 @@ def _acquire_and_select_locally(
         seed=int(acq_cfg.get("seed", 42)),
         device=str(acq_cfg.get("devices", ["cuda:0"])[0]),
         devices=[str(d) for d in acq_cfg.get("devices", ["cuda:0"])],
+        n_elite_per_geology=int(acq_cfg.get("n_elite_per_geology", 0)),
+        n_cma_per_geology=int(acq_cfg.get("n_cma_per_geology", 0)),
+        elite_top_k=int(acq_cfg.get("elite_top_k", 10)),
+        elite_seed_noise=float(acq_cfg.get("elite_seed_noise", 2.0)),
+        cma_popsize=int(acq_cfg.get("cma_popsize", 16)),
+        cma_generations=int(acq_cfg.get("cma_generations", 10)),
+        cma_sigma_init=float(acq_cfg.get("cma_sigma_init", 5.0)),
+        prior_metrics=prior_metrics,
     )
     started = time.time()
     out_dir = ws / "acquire" / f"iter_{iter_idx:04d}"
@@ -698,11 +713,25 @@ def _acquire_and_select_locally(
     elapsed_min = (time.time() - started) / 60.0
     print(f"[local-driver] acquired {len(acq_result['candidates'])} candidates in {elapsed_min:.2f} min")
 
-    selected = select_batch(
-        acq_result["candidates"],
-        batch_size=int(sel_cfg["batch_size"]),
-        frontier_fraction=float(sel_cfg.get("frontier_fraction", 0.85)),
-    )
+    kind_fraction_keys = ("frontier_fraction", "adversarial_fraction", "exploit_fraction", "cma_fraction")
+    has_kind_fractions = any(k in sel_cfg for k in kind_fraction_keys if k != "frontier_fraction")
+    if has_kind_fractions:
+        kind_fractions = {
+            k.replace("_fraction", ""): float(sel_cfg[k])
+            for k in kind_fraction_keys
+            if k in sel_cfg
+        }
+        selected = select_batch(
+            acq_result["candidates"],
+            batch_size=int(sel_cfg["batch_size"]),
+            kind_fractions=kind_fractions,
+        )
+    else:
+        selected = select_batch(
+            acq_result["candidates"],
+            batch_size=int(sel_cfg["batch_size"]),
+            frontier_fraction=float(sel_cfg.get("frontier_fraction", 0.85)),
+        )
     manifest_path = ws / "manifests" / f"manifest_iter_{iter_idx:04d}.json"
     write_selected_manifest(
         selected,
