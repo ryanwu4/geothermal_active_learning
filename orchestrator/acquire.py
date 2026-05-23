@@ -16,7 +16,6 @@ plus per-snapshot ``.jl`` files written via ``to_julia_wells_text`` from
 """
 from __future__ import annotations
 
-import copy
 import json
 import os
 import pickle
@@ -607,9 +606,21 @@ def _cma_seed_starts(
             batch_data["well"].pos_xyz = c_t.view(-1, 3)
             pred_scaled = model(batch_data).view(M)
             preds = (pred_scaled * target_scale + target_mean).detach().cpu().numpy()
-        # cmaes minimizes; we want to maximize predicted revenue.
-        es.tell(list(zip([s for s in sols], (-preds).tolist())))
+        # Sanitize non-finite predictions before handing to CMA-ES and before
+        # ranking. cmaes minimizes; we give NaN samples the worst possible
+        # finite fitness (+inf maps to a huge sentinel) so they're rejected
+        # by the rank-based update without contaminating sigma. Without this,
+        # Python's `sort(key=lambda t: -t[1])` puts NaN at the *top* of
+        # best_population (NaN comparisons return False → sort treats it as
+        # not-less-than anything), corrupting the elite pool fed back into
+        # the main Adam loop.
+        finite_mask = np.isfinite(preds)
+        WORST_SENTINEL = 1e30  # large finite penalty for the minimizer
+        cma_fitness = np.where(finite_mask, -preds, WORST_SENTINEL).astype(np.float64)
+        es.tell(list(zip([s for s in sols], cma_fitness.tolist())))
         for i in range(M):
+            if not finite_mask[i]:
+                continue
             best_population.append((coords_xyz[i].copy(), float(preds[i])))
 
     # Return top n_seeds across all generations by predicted revenue (high → low).
@@ -879,6 +890,14 @@ def _run_one_geology(
             grads = coords.grad
             if not torch.isfinite(grads).all():
                 torch.nan_to_num_(grads, nan=0.0, posinf=0.0, neginf=0.0)
+                # Proactively scrub Adam moments when grads were non-finite —
+                # otherwise exp_avg / exp_avg_sq can still carry NaN/Inf from
+                # this step's bad backward and poison every subsequent
+                # optimizer.step(). Mirrors the ensemble-mode guard.
+                st = optimizer.state.get(coords, {})
+                for key in ("exp_avg", "exp_avg_sq"):
+                    if key in st and not torch.isfinite(st[key]).all():
+                        torch.nan_to_num_(st[key], nan=0.0, posinf=0.0, neginf=0.0)
             for d, max_val in enumerate([nx - 1, ny - 1, z_max - 1]):
                 mask_lo = (coords[:, :, d] <= 1e-4) & (grads[:, :, d] > 0)
                 mask_hi = (coords[:, :, d] >= max_val - 1e-4) & (grads[:, :, d] < 0)
@@ -888,15 +907,28 @@ def _run_one_geology(
                     st = optimizer.state.get(coords, {})
                     if "exp_avg" in st:
                         st["exp_avg"][..., d][mask] = 0.0
+                    # Also zero exp_avg_sq at the boundary slice — leaving a
+                    # stale variance there keeps the Adam denominator skewed
+                    # for ~10 steps after the coord pins to the wall.
+                    if "exp_avg_sq" in st:
+                        st["exp_avg_sq"][..., d][mask] = 0.0
         optimizer.step()
         with torch.no_grad():
             if not torch.isfinite(coords).all():
                 bad = ~torch.isfinite(coords)
                 coords[bad] = last_valid_coords[bad]
                 st = optimizer.state.get(coords, {})
+                # Two scrub modes layered together:
+                #   1. Zero Adam moments AT the recovered positions: huge-
+                #      but-finite moments would pass isfinite() and then
+                #      catapult the recovered coord straight back across the
+                #      domain on the next step.
+                #   2. Sanitize any wholly-NaN moments (legacy behavior).
                 for key in ("exp_avg", "exp_avg_sq"):
-                    if key in st and not torch.isfinite(st[key]).all():
-                        torch.nan_to_num_(st[key], nan=0.0, posinf=0.0, neginf=0.0)
+                    if key in st:
+                        st[key][bad] = 0.0
+                        if not torch.isfinite(st[key]).all():
+                            torch.nan_to_num_(st[key], nan=0.0, posinf=0.0, neginf=0.0)
             coords[:, :, 0].clamp_(0, nx - 1)
             coords[:, :, 1].clamp_(0, ny - 1)
             coords[:, :, 2].clamp_(0, z_max - 1)
@@ -1917,9 +1949,22 @@ def _run_acquisition_ensemble(
     num_wells = ctx.num_wells
 
     # ----- Replicate model + scaler buffers to every requested device -----
-    # The model is small relative to the activations, so a deep copy per device
-    # is cheap (model is also eval-only here; weights never update during the
-    # Adam-on-coords loop, so the replicas stay in sync trivially).
+    # IMPORTANT: do NOT deepcopy a LightningModule and then ``.to(d)`` it.
+    # PyTorch Lightning's lifecycle hooks (state-dict pre-hooks, lazy
+    # initialization, internal trainer/checkpoint references) interfere with
+    # both ``__deepcopy__`` and the subsequent ``.to(d)`` move in subtle
+    # version-dependent ways — the symptom in practice was a replica with
+    # all-zero parameters (parameter-sum 0 vs the master's ~30000) which
+    # silently produced NaN predictions for every candidate and wasted 16+
+    # minutes of Adam.
+    #
+    # The reliable pattern (used by ``_build_worker_context`` for the
+    # per-geology multi-GPU path too) is to call ``load_from_checkpoint`` per
+    # device with ``map_location=d``. The checkpoint is small; loading it N
+    # times costs ~1 s × N, amortized over the ~80-minute Adam loop.
+    _ensure_surrogate_imports(cfg.surrogate_repo)
+    from geothermal.model import HeteroGNNRegressor  # type: ignore
+
     device_objs: list[torch.device] = [device]
     models_per_dev: list[Any] = [model]
     target_scales_per_dev: list[torch.Tensor] = [target_scale]
@@ -1928,13 +1973,41 @@ def _run_acquisition_ensemble(
         d = torch.device(d_str)
         if d_str.startswith("cuda:") and torch.cuda.is_available():
             torch.cuda.set_device(int(d_str.split(":", 1)[1]))
-        m_copy = copy.deepcopy(model).to(d)
-        m_copy.eval()
+        m_replica = HeteroGNNRegressor.load_from_checkpoint(
+            str(cfg.checkpoint_path), map_location=d
+        ).to(d)
+        m_replica.eval()
         device_objs.append(d)
-        models_per_dev.append(m_copy)
+        models_per_dev.append(m_replica)
         target_scales_per_dev.append(target_scale.to(d))
         target_means_per_dev.append(target_mean.to(d))
     n_dev = len(device_objs)
+
+    # ----- Sanity-check replicas match master at startup -----
+    # Defense in depth: the load-from-checkpoint replica path is reliable, but
+    # the master and replicas live on different devices and use different
+    # PyTorch loaders. A drift would silently produce NaN predictions later;
+    # this assertion catches it in <100 ms before we burn ~80 minutes of Adam.
+    if n_dev > 1:
+        with torch.no_grad():
+            master_params = sum(
+                float(p.detach().abs().sum().cpu()) for p in model.parameters()
+            )
+            for i in range(1, n_dev):
+                replica_params = sum(
+                    float(p.detach().abs().sum().cpu()) for p in models_per_dev[i].parameters()
+                )
+                if not (abs(master_params - replica_params) < max(1.0, 1e-5 * abs(master_params))):
+                    raise RuntimeError(
+                        f"Ensemble acquisition: model replica on {device_objs[i]} "
+                        f"has parameter-sum {replica_params:.6g} != master {master_params:.6g} "
+                        f"(after load_from_checkpoint to {device_objs[i]}). This indicates a "
+                        f"broken replication and will produce NaN predictions."
+                    )
+        if torch.cuda.is_available():
+            for d in device_objs:
+                if d.type == "cuda":
+                    torch.cuda.synchronize(d)
 
     geologies = list(cfg.geologies)
     K = len(geologies)
@@ -2164,12 +2237,28 @@ def _run_acquisition_ensemble(
         keeps multi-device kernel queues running concurrently — otherwise the
         per-iteration ``.cpu()`` syncs would serialize across devices and
         defeat the parallelism.
+
+        CRITICAL: the per-device coords replicas below are created via
+        ``.to(d)`` which queues an async ``cudaMemcpyPeerAsync`` on the source
+        device's stream. Without an explicit sync, the immediately-following
+        forward on device d can read the replica's memory BEFORE the copy
+        has landed — silently producing NaN predictions for every non-master
+        geology. (PyTorch's caching allocator is supposed to insert this
+        synchronization automatically, but cross-device + main-thread paths
+        are a known fragile corner; in practice the consumer sees garbage.)
+        The Adam loop avoids this race because its replica-creation sync
+        lives in the spawning code path; this no-grad path needs its own.
         """
         preds_per_k: list[torch.Tensor | None] = [None] * K
         cols: list[np.ndarray] = [None] * K  # type: ignore[list-item]
         with torch.no_grad():
             # Pre-stage coords on each device once.
             coords_per_dev = [c_master.detach().to(d) for d in device_objs]
+            # Force every cross-device replica copy to land before any forward
+            # kernel reads it. Cheap (coords is 720 floats per device).
+            for d in device_objs:
+                if d.type == "cuda":
+                    torch.cuda.synchronize(d)
             # Pass 1: launch all forwards (each on its owner device's stream).
             for k_idx, bd in enumerate(batches):
                 dev_idx = batch_owner_dev[k_idx]
@@ -2220,6 +2309,13 @@ def _run_acquisition_ensemble(
         main thread can re-raise after joining.
         """
         try:
+            # Pin this thread to the worker's CUDA device. Some PyTorch internals
+            # (caching allocator, NCCL, etc.) look at the THREAD-LOCAL current
+            # device; if it's left pointing at cuda:0 from the main thread, ops
+            # nominally on cuda:1 can hit subtle stream-ordering pathologies.
+            d = device_objs[dev_idx]
+            if d.type == "cuda":
+                torch.cuda.set_device(d)
             for bd in batches_per_dev[dev_idx]:
                 preds_k = _predict_one_geo(coords_replica, bd, dev_idx)
                 loss_k = -(preds_k.sum() / K_float)
@@ -2227,8 +2323,8 @@ def _run_acquisition_ensemble(
                 # Forward graph for this geology is released here.
             # Block until this device's queue drains so the main thread can
             # safely move the gradient back to the master device.
-            if device_objs[dev_idx].type == "cuda":
-                torch.cuda.synchronize(device_objs[dev_idx])
+            if d.type == "cuda":
+                torch.cuda.synchronize(d)
         except BaseException as e:  # pragma: no cover - propagated to main
             out_errors[dev_idx] = e
 
@@ -2253,6 +2349,14 @@ def _run_acquisition_ensemble(
                     replicas.append(
                         coords.detach().to(device_objs[i]).requires_grad_(True)
                     )
+            # Force every cross-device replica copy to complete BEFORE worker
+            # threads start reading the replicas. Without this, a worker on
+            # cuda:1 can race the cudaMemcpyPeerAsync queued by `.to(cuda:1)`
+            # and read garbage values — silently producing NaN predictions.
+            if device.type == "cuda":
+                for i in range(n_dev):
+                    if device_objs[i].type == "cuda":
+                        torch.cuda.synchronize(device_objs[i])
 
             errors: list[BaseException | None] = [None] * n_dev
             threads: list[threading.Thread] = []
@@ -2288,8 +2392,19 @@ def _run_acquisition_ensemble(
 
         with torch.no_grad():
             grads = coords.grad
-            if not torch.isfinite(grads).all():
+            grad_was_nan = not torch.isfinite(grads).all().item()
+            if grad_was_nan:
                 torch.nan_to_num_(grads, nan=0.0, posinf=0.0, neginf=0.0)
+                # If grads were NaN/Inf this step, Adam's running moments could
+                # also have been poisoned earlier (or will be when accumulating
+                # the sanitized-to-zero value). Proactively scrub the entire
+                # optimizer state, not just the boundary-masked slice. Without
+                # this, a single NaN gradient propagates into exp_avg/exp_avg_sq
+                # and every subsequent optimizer.step produces NaN coords.
+                st = optimizer.state.get(coords, {})
+                for key in ("exp_avg", "exp_avg_sq"):
+                    if key in st and not torch.isfinite(st[key]).all():
+                        torch.nan_to_num_(st[key], nan=0.0, posinf=0.0, neginf=0.0)
             for d, max_val in enumerate([nx - 1, ny - 1, z_max - 1]):
                 mask_lo = (coords[:, :, d] <= 1e-4) & (grads[:, :, d] > 0)
                 mask_hi = (coords[:, :, d] >= max_val - 1e-4) & (grads[:, :, d] < 0)
@@ -2299,19 +2414,43 @@ def _run_acquisition_ensemble(
                     st = optimizer.state.get(coords, {})
                     if "exp_avg" in st:
                         st["exp_avg"][..., d][mask] = 0.0
+                    # Also zero exp_avg_sq at the boundary slice — leaving a
+                    # stale variance there keeps the Adam denominator skewed
+                    # for ~10 steps after the coord pins to the wall.
+                    if "exp_avg_sq" in st:
+                        st["exp_avg_sq"][..., d][mask] = 0.0
         optimizer.step()
         with torch.no_grad():
             if not torch.isfinite(coords).all():
                 bad = ~torch.isfinite(coords)
                 coords[bad] = last_valid_coords[bad]
                 st = optimizer.state.get(coords, {})
+                # Zero Adam moments AT the recovered positions (huge-but-finite
+                # moments pass isfinite() but would catapult the recovered
+                # coord back across the domain on the next step), then
+                # sanitize any wholly-NaN moments tensor-wide for safety.
                 for key in ("exp_avg", "exp_avg_sq"):
-                    if key in st and not torch.isfinite(st[key]).all():
-                        torch.nan_to_num_(st[key], nan=0.0, posinf=0.0, neginf=0.0)
+                    if key in st:
+                        st[key][bad] = 0.0
+                        if not torch.isfinite(st[key]).all():
+                            torch.nan_to_num_(st[key], nan=0.0, posinf=0.0, neginf=0.0)
             coords[:, :, 0].clamp_(0, nx - 1)
             coords[:, :, 1].clamp_(0, ny - 1)
             coords[:, :, 2].clamp_(0, z_max - 1)
             last_valid_coords.copy_(coords)
+
+        # Periodic Adam-loop diagnostics: if loss is silently going to NaN
+        # mid-run, this is where you'll see it.
+        if step == 1 or step == int(cfg.k_safe) or step % max(1, int(cfg.log_every_n_steps)) == 0:
+            with torch.no_grad():
+                grad_norm = float(coords.grad.abs().max().item()) if coords.grad is not None else float("nan")
+                coord_finite = bool(torch.isfinite(coords).all().item())
+            print(
+                f"[acquire-ensemble] step={step}/{cfg.k_safe} "
+                f"max|grad|={grad_norm:.4g} coords_finite={coord_finite} "
+                f"grad_sanitized_this_step={grad_was_nan}",
+                flush=True,
+            )
     timings["adam_loop_s"] = time.perf_counter() - t0
 
     # ----- Terminal forward + snapshot emit -----
@@ -2323,8 +2462,23 @@ def _run_acquisition_ensemble(
     candidates: list[Candidate] = []
     for m in range(M):
         cxyz = coords[m].detach().cpu().numpy()
-        if not np.isfinite(cxyz).all() or not np.isfinite(preds_final[m]).all():
-            print(f"[acquire-ensemble] skip non-finite snapshot m={m} kind={start_kinds[m]}", flush=True)
+        coords_ok = bool(np.isfinite(cxyz).all())
+        preds_ok = bool(np.isfinite(preds_final[m]).all())
+        if not coords_ok or not preds_ok:
+            # Be explicit about which check failed so future debugging doesn't
+            # require re-instrumenting the function.
+            reason = []
+            if not coords_ok:
+                n_bad = int((~np.isfinite(cxyz)).sum())
+                reason.append(f"coords has {n_bad}/{cxyz.size} non-finite entries; sample={cxyz.flatten()[:6]}")
+            if not preds_ok:
+                bad_geos = [k for k in range(K) if not np.isfinite(preds_final[m, k])]
+                reason.append(f"preds non-finite on geologies {bad_geos[:5]} (of {len(bad_geos)} bad)")
+            print(
+                f"[acquire-ensemble] skip non-finite snapshot m={m} kind={start_kinds[m]}: "
+                f"{'; '.join(reason)}",
+                flush=True,
+            )
             continue
         predictions_by_geology = []
         for k_idx, g in enumerate(geologies):

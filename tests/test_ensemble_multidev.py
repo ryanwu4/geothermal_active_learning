@@ -229,6 +229,16 @@ def run_adam_loop(
                     replicas.append(
                         coords.detach().to(device_objs[i]).requires_grad_(True)
                     )
+            # Match production (orchestrator/acquire.py): force every
+            # cross-device replica copy to land BEFORE worker threads start
+            # reading the replicas. On CPU this is a no-op; on CUDA it
+            # prevents the race that produced silent NaN on cuda:1 forwards.
+            # Keeping the sync here means the test mirrors production exactly,
+            # so if anyone parameterizes the harness to real CUDA devices the
+            # behavior stays consistent.
+            for d in device_objs:
+                if d.type == "cuda":
+                    torch.cuda.synchronize(d)
 
             errors: list[BaseException | None] = [None] * n_dev
             threads: list[threading.Thread] = []
@@ -252,6 +262,10 @@ def run_adam_loop(
                 if replicas[i].grad is None:
                     continue
                 coords.grad.add_(replicas[i].grad.to(master_dev))
+            # Also sync the master device after grad summation, matching
+            # production's post-sum synchronize at acquire.py.
+            if master_dev.type == "cuda":
+                torch.cuda.synchronize(master_dev)
 
             if record_replicas_each_step:
                 replica_weakrefs_per_step.append(
@@ -571,6 +585,10 @@ def test_21_master_replica_is_master_coords():
             replicas.append(
                 coords.detach().to(device_objs[i]).requires_grad_(True)
             )
+    # Mirror production sync (no-op on CPU; meaningful on CUDA).
+    for d in device_objs:
+        if d.type == "cuda":
+            torch.cuda.synchronize(d)
     assert replicas[0] is coords, "master replica must alias coords itself"
     assert replicas[1] is not coords, "non-master replicas must be fresh"
     # The non-master replica must be a *distinct* autograd leaf, so that

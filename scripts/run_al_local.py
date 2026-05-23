@@ -916,23 +916,48 @@ def main() -> int:
             local_acquire_dir = ws / "acquire" / f"iter_{iteration:04d}"
             # Short-circuit: if a previous run produced the manifest and its
             # snapshot/well_config artifacts, reuse them instead of re-running
-            # acquisition (which would overwrite identical files).
-            reused = (
+            # acquisition (which would overwrite identical files). But only
+            # reuse if the manifest actually carries snapshots — an empty
+            # manifest is the fingerprint of a failed acquisition (e.g., all
+            # multistarts diverged to NaN) and must trigger a fresh run, not
+            # be silently passed downstream to the Julia stager which would
+            # then refuse with "No tasks were materialized".
+            reuse_artifacts_present = (
                 manifest_path.exists()
                 and (local_acquire_dir / "snapshots_json").is_dir()
                 and (local_acquire_dir / "well_configs").is_dir()
             )
-            if reused:
+            reused = False
+            if reuse_artifacts_present:
                 existing = json.loads(manifest_path.read_text())
-                n_selected = len(existing.get("snapshots", []))
-                acq_min = 0.0
-                print(f"[local-driver] reusing existing manifest at {manifest_path} "
-                      f"({n_selected} snapshots) — skipping acquire+select")
-            else:
+                n_existing = len(existing.get("snapshots", []))
+                if n_existing > 0:
+                    reused = True
+                    n_selected = n_existing
+                    acq_min = 0.0
+                    print(f"[local-driver] reusing existing manifest at {manifest_path} "
+                          f"({n_selected} snapshots) — skipping acquire+select")
+                else:
+                    print(f"[local-driver] existing manifest at {manifest_path} has 0 "
+                          f"snapshots (previous acquisition failed) — re-running acquire+select")
+            if not reused:
                 manifest_path, n_selected, acq_min = _acquire_and_select_locally(
                     cfg=cfg, state=state, ws=ws, iter_idx=iteration,
                     ckpt=ckpt, scaler=scaler,
                 )
+                # If the fresh acquisition ALSO produced 0 selections, bail
+                # loudly here rather than letting the Julia stager fail with
+                # an opaque "No tasks were materialized" — the issue is on
+                # the Python side (model divergence / NaN), not in staging.
+                if n_selected == 0:
+                    raise RuntimeError(
+                        f"Acquisition produced 0 selected candidates for iter "
+                        f"{iteration} ({manifest_path}). Every multistart was "
+                        f"skipped as non-finite — check the per-step "
+                        f"[acquire-ensemble] diagnostics above (max|grad|, "
+                        f"coords_finite, grad_sanitized_this_step) and the "
+                        f"per-snapshot skip reasons to locate the divergence."
+                    )
             last_step = f"acquired+selected iter {iteration}" + (" (reused)" if reused else "")
 
             # The manifest references absolute paths to per-snapshot JSONs and
