@@ -1021,6 +1021,17 @@ def _multi_gpu_worker(
     signal.signal(signal.SIGINT, _sigterm)
 
     try:
+        # Cap intra-op thread parallelism so 2 workers × default(=ncores)
+        # threads doesn't oversubscribe a single physical CPU. The parent set
+        # OMP/MKL/OPENBLAS env vars before spawn (see _run_acquisition_multi_gpu)
+        # so numpy/BLAS pick them up at import; this call belts-and-suspenders
+        # PyTorch's intra-op pool, which is set independently from the env vars.
+        omp = int(os.environ.get("OMP_NUM_THREADS", "1") or "1")
+        torch.set_num_threads(max(1, omp))
+        try:
+            torch.set_num_interop_threads(1)
+        except RuntimeError:
+            pass  # already set elsewhere; ignore
         # Pin this process to the requested device so any incidental CUDA
         # ops (e.g. inside torch_geometric) land on the right GPU.
         if device_str.startswith("cuda:") and torch.cuda.is_available():
@@ -1097,7 +1108,29 @@ def _run_acquisition_multi_gpu(
     well_configs_dir: Path,
     snapshots_json_dir: Path,
 ) -> tuple[list[dict[str, Any]], list[Candidate], list[dict[str, Any]]]:
+    import multiprocessing
     import torch.multiprocessing as tmp
+
+    n_workers = len(devices)
+    # Cap each worker's intra-op CPU thread pool so 2 workers × N-core default
+    # doesn't oversubscribe physical cores. Without this, htop shows 200%-300%
+    # CPU per worker on bend_gpu and wallclock plateaus regardless of GPU count.
+    # Leave 1 core for the parent + OS; divide the rest evenly. Floor at 1.
+    total_cores = multiprocessing.cpu_count()
+    threads_per_worker = max(1, (total_cores - 1) // max(1, n_workers))
+    # These env vars must be set BEFORE spawning so the child inherits them
+    # at numpy/torch import time (the BLAS libraries snapshot the env once).
+    _thread_env_keys = (
+        "OMP_NUM_THREADS", "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+    )
+    _prior_env: dict[str, str | None] = {}
+    for k in _thread_env_keys:
+        _prior_env[k] = os.environ.get(k)
+        # Don't override an explicit user-set value; users tuning by hand win.
+        if _prior_env[k] is None:
+            os.environ[k] = str(threads_per_worker)
 
     mp_ctx = tmp.get_context("spawn")
     in_queue = mp_ctx.Queue()
@@ -1120,6 +1153,11 @@ def _run_acquisition_multi_gpu(
         )
         p.start()
         procs.append(p)
+    print(
+        f"[acquire] multi-GPU dispatch: n_workers={n_workers}, "
+        f"threads_per_worker={threads_per_worker} (total_cores={total_cores})",
+        flush=True,
+    )
 
     # Install a signal handler in the PARENT that tears down workers cleanly
     # on Ctrl-C / SIGTERM (e.g. when the orchestrator is killed). Combined with
@@ -1181,6 +1219,14 @@ def _run_acquisition_multi_gpu(
             signal.signal(signal.SIGTERM, _prev_sigterm)
         except (ValueError, OSError):
             pass
+        # Restore thread-count env vars to whatever they were before. This
+        # matters because later phases (training, plotting) run in the same
+        # process and may want the original default thread budget.
+        for k, v in _prior_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
     if errors:
         raise RuntimeError("Multi-GPU acquisition failures:\n  " + "\n  ".join(errors))

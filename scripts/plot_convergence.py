@@ -99,8 +99,15 @@ def _save(fig, out_path: Path) -> None:
 
 
 def _load_state(run_root: Path) -> dict:
-    with open(run_root / "state.json", "r") as f:
-        return json.load(f)
+    # Local-hybrid driver writes ``state_mirror.json`` (pulled from Sherlock);
+    # the canonical Sherlock orchestrator writes ``state.json``. Try both so
+    # the same plotting CLI works in either mode.
+    for name in ("state.json", "state_mirror.json"):
+        p = run_root / name
+        if p.exists():
+            with open(p, "r") as f:
+                return json.load(f)
+    raise FileNotFoundError(f"No state.json or state_mirror.json in {run_root}")
 
 
 def _load_per_candidate(run_root: Path, iteration: int) -> dict | None:
@@ -237,6 +244,575 @@ def plot_kind_revenue_summary(rows: list[dict], out_dir: Path) -> None:
         ax.set_xticks(iters)
     ax.legend(loc="lower right")
     _save(fig, out_dir / "kind_revenue_summary.png")
+
+
+# -----------------------------------------------------------------------------
+# Per-geology kind-attribution plots
+#
+# These answer "which acquisition kind discovers the best well config for each
+# geology, at each iteration?" — a finer question than "which kind has the
+# global max revenue?" (latter is dominated by whichever geology is most
+# lucrative). See the suite of 5 plots below; each one is a different lens on
+# the same per-(geology, iter) winner attribution.
+# -----------------------------------------------------------------------------
+
+
+def _per_cell_best_by_kind(rows: list[dict]) -> dict[tuple[int, int], dict[str, float]]:
+    """Returns ``{(geo_idx, iter): {kind: best_real_revenue}}``.
+
+    Only kinds present in ``KIND_COLORS`` are bucketed; rows with missing or
+    non-finite ``real_revenue`` are silently skipped. A (geo, iter) cell with
+    no finite candidates is absent from the result (not present as an empty
+    dict) so callers can skip it.
+    """
+    out: dict[tuple[int, int], dict[str, float]] = {}
+    for r in rows:
+        rr = r.get("real_revenue")
+        if rr is None:
+            continue
+        try:
+            rrf = float(rr)
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(rrf):
+            continue
+        kind = r.get("kind")
+        if kind not in KIND_COLORS:
+            continue
+        try:
+            key = (int(r["geology_index"]), int(r["iteration"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        bucket = out.setdefault(key, {})
+        if rrf > bucket.get(kind, -np.inf):
+            bucket[kind] = rrf
+    return out
+
+
+def _per_cell_winner(rows: list[dict]) -> dict[tuple[int, int], str]:
+    """Returns ``{(geo, iter): winning_kind}`` based on per-cell best real revenue."""
+    bests = _per_cell_best_by_kind(rows)
+    return {
+        cell: max(by_kind.items(), key=lambda kv: kv[1])[0]
+        for cell, by_kind in bests.items()
+        if by_kind
+    }
+
+
+def plot_cumulative_wins_per_kind(rows: list[dict], out_dir: Path) -> None:
+    """Bar chart: across all (geology, iter) cells, how many did each kind win?
+
+    The "headline" attribution plot — single bar per kind, height = cell count.
+    A kind that produces the best real-revenue config in many cells across the
+    run is the one earning its keep.
+    """
+    if not rows:
+        return
+    winners = _per_cell_winner(rows)
+    if not winners:
+        return
+    counts = {k: 0 for k in KIND_COLORS}
+    for w in winners.values():
+        counts[w] = counts.get(w, 0) + 1
+
+    fig, ax = plt.subplots(figsize=(9, 5.5), facecolor=MANIM_BG)
+    _style_ax(ax)
+    kinds = list(KIND_COLORS.keys())
+    heights = [counts[k] for k in kinds]
+    colors = [KIND_COLORS[k] for k in kinds]
+    bars = ax.bar(kinds, heights, color=colors, edgecolor=MANIM_WHITE, linewidth=0.5)
+    total = sum(heights)
+    for bar, h in zip(bars, heights):
+        if total > 0:
+            pct = 100.0 * h / total
+            label = f"{h}  ({pct:.0f}%)"
+        else:
+            label = str(h)
+        ax.text(bar.get_x() + bar.get_width() / 2, h, label,
+                ha="center", va="bottom", color=MANIM_WHITE, fontsize=TICK_SIZE)
+    ax.set_xlabel("Acquisition kind")
+    ax.set_ylabel("# (geology, iter) cells won")
+    ax.set_title(f"Cumulative wins per kind ({total} cells total = "
+                 f"{len({c[0] for c in winners})} geologies × "
+                 f"{len({c[1] for c in winners})} iters)")
+    _save(fig, out_dir / "wins_cumulative_per_kind.png")
+
+
+def plot_per_geology_winner_heatmap(rows: list[dict], out_dir: Path) -> None:
+    """2D categorical heatmap: rows=geologies, cols=iters, cell color=winning kind.
+
+    The most information-dense view of per-cell attribution. Reveals patterns
+    a bar chart hides:
+      * geologies where one kind wins consistently (a horizontal band of color)
+      * iters where one kind suddenly takes over (a vertical band)
+      * whether the winner shifts from frontier → exploit as priors accumulate
+    """
+    if not rows:
+        return
+    winners = _per_cell_winner(rows)
+    if not winners:
+        return
+    geos = sorted({c[0] for c in winners})
+    iters = sorted({c[1] for c in winners})
+    kinds = list(KIND_COLORS.keys())
+    kind_to_idx = {k: i for i, k in enumerate(kinds)}
+    # -1 = missing cell; encoded as a dim grey via a separate background fill.
+    grid = np.full((len(geos), len(iters)), -1, dtype=np.int8)
+    for (g, it), winner in winners.items():
+        i = geos.index(g)
+        j = iters.index(it)
+        grid[i, j] = kind_to_idx[winner]
+
+    from matplotlib.colors import ListedColormap, BoundaryNorm
+    cmap = ListedColormap([KIND_COLORS[k] for k in kinds])
+    bounds = np.arange(-0.5, len(kinds) + 0.5, 1.0)
+    norm = BoundaryNorm(bounds, cmap.N)
+
+    fig, ax = plt.subplots(
+        figsize=(max(8, 0.55 * len(iters) + 3), max(5, 0.35 * len(geos) + 2)),
+        facecolor=MANIM_BG,
+    )
+    _style_ax(ax)
+    # Background fill for missing cells (no candidate of any kind in that cell).
+    ax.set_facecolor("#181818")
+    masked = np.ma.masked_where(grid < 0, grid)
+    im = ax.imshow(masked, aspect="auto", cmap=cmap, norm=norm,
+                   interpolation="nearest", origin="upper")
+    ax.set_xticks(range(len(iters)))
+    ax.set_xticklabels(iters)
+    ax.set_yticks(range(len(geos)))
+    ax.set_yticklabels([f"geo {g}" for g in geos])
+    ax.set_xlabel("AL iteration")
+    ax.set_ylabel("Geology")
+    ax.set_title("Per-cell winner: which kind produced the best real revenue?")
+    # Custom discrete colorbar with kind labels.
+    cbar = fig.colorbar(im, ax=ax, ticks=range(len(kinds)),
+                        boundaries=bounds, fraction=0.04, pad=0.02)
+    cbar.ax.set_yticklabels([k.capitalize() for k in kinds])
+    cbar.ax.tick_params(colors=MANIM_WHITE)
+    _save(fig, out_dir / "per_geology_winner_heatmap.png")
+
+
+def plot_per_geology_faceted_best(rows: list[dict], out_dir: Path) -> None:
+    """Small-multiples grid: one subplot per geology, 4 lines per panel (one
+    per kind) showing per-kind running max real revenue within that geology.
+
+    Use this to drill into *why* a kind won (or lost) a specific (geo, iter)
+    cell on the winner heatmap. Lines that stay parallel = kinds are equally
+    competitive on that geology; lines that diverge = one kind found a regime
+    the others miss.
+    """
+    if not rows:
+        return
+    geos = sorted({int(r["geology_index"]) for r in rows
+                   if r.get("geology_index") is not None})
+    iters = sorted({int(r["iteration"]) for r in rows
+                    if r.get("iteration") is not None})
+    if not geos or not iters:
+        return
+    bests = _per_cell_best_by_kind(rows)
+
+    cols = min(5, len(geos))
+    rows_n = int(np.ceil(len(geos) / cols))
+    fig, axes = plt.subplots(
+        rows_n, cols,
+        figsize=(cols * 3.2, rows_n * 2.6),
+        facecolor=MANIM_BG, squeeze=False, sharex=True,
+    )
+    for gi, geo in enumerate(geos):
+        ax = axes[gi // cols, gi % cols]
+        _style_ax(ax)
+        any_plotted = False
+        for kind, color in KIND_COLORS.items():
+            xs: list[int] = []
+            ys: list[float] = []
+            running = -np.inf
+            for it in iters:
+                v = bests.get((geo, it), {}).get(kind)
+                if v is None:
+                    continue
+                running = max(running, float(v))
+                xs.append(it)
+                ys.append(running)
+            if xs:
+                ax.plot(xs, ys, color=color, lw=1.5, marker="o", ms=2.5,
+                        label=kind if gi == 0 else None)
+                any_plotted = True
+        ax.set_title(f"geo {geo}", color=MANIM_WHITE, fontsize=TICK_SIZE)
+        ax.tick_params(axis="both", labelsize=8)
+        if not any_plotted:
+            ax.text(0.5, 0.5, "no data", ha="center", va="center",
+                    color=MANIM_GREY, transform=ax.transAxes)
+    # Hide unused panels.
+    for k in range(len(geos), rows_n * cols):
+        axes[k // cols, k % cols].axis("off")
+    # Single shared legend at the top.
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    if handles:
+        fig.legend(handles, [lbl.capitalize() for lbl in labels],
+                   loc="upper center", ncol=len(labels),
+                   bbox_to_anchor=(0.5, 1.01), facecolor="#111111")
+    fig.suptitle("Per-geology best real revenue per kind (running max)",
+                 color=MANIM_WHITE, y=1.04)
+    fig.text(0.5, 0.02, "AL iteration", ha="center", color=MANIM_WHITE)
+    fig.text(0.005, 0.5, "Best real revenue per kind", va="center",
+             rotation="vertical", color=MANIM_WHITE)
+    _save(fig, out_dir / "per_geology_faceted_best.png")
+
+
+def plot_win_rate_over_iters(rows: list[dict], out_dir: Path) -> None:
+    """Line chart: at each iter, share of geologies won by each kind.
+
+    The temporal version of ``plot_cumulative_wins_per_kind``. Tells you
+    whether the answer shifts as priors accumulate — e.g., does exploit's
+    share rise across iters, or does frontier stay dominant?
+    """
+    if not rows:
+        return
+    winners = _per_cell_winner(rows)
+    if not winners:
+        return
+    iters = sorted({c[1] for c in winners})
+    kinds = list(KIND_COLORS.keys())
+    # Per-iter share per kind.
+    fig, ax = plt.subplots(figsize=(11, 5.5), facecolor=MANIM_BG)
+    _style_ax(ax)
+    for kind in kinds:
+        ys: list[float] = []
+        for it in iters:
+            cells_this_iter = [w for (g, i), w in winners.items() if i == it]
+            if not cells_this_iter:
+                ys.append(np.nan)
+                continue
+            ys.append(100.0 * sum(1 for w in cells_this_iter if w == kind) / len(cells_this_iter))
+        ax.plot(iters, ys, color=KIND_COLORS[kind], marker="o", lw=2,
+                label=kind.capitalize())
+    ax.axhline(25.0, color=MANIM_GREY, lw=1, ls="--", alpha=0.6, zorder=0)
+    ax.set_xlabel("AL iteration")
+    ax.set_ylabel("Share of geologies won (%)")
+    ax.set_title("Per-iter win share by kind (dashed line = 25% baseline)")
+    ax.set_ylim(0, 100)
+    ax.set_xticks(iters)
+    ax.legend(loc="upper right")
+    _save(fig, out_dir / "wins_share_over_iters.png")
+
+
+def plot_per_geology_best_so_far_facets(rows: list[dict], out_dir: Path) -> None:
+    """Small-multiples grid: one line per geology, showing the running max of
+    real revenue across ALL kinds combined. Each point on the line is colored
+    by which kind produced that step's improvement, so you can see which
+    algorithm earned each geology's progress.
+
+    Distinct from ``plot_per_geology_faceted_best`` (4 per-kind lines per
+    panel showing kind-specific running maxes); this view collapses the kinds
+    into one cohort-wide running max curve per geology and tags each step.
+    """
+    if not rows:
+        return
+    geos = sorted({int(r["geology_index"]) for r in rows
+                   if r.get("geology_index") is not None})
+    iters = sorted({int(r["iteration"]) for r in rows
+                    if r.get("iteration") is not None})
+    if not geos or not iters:
+        return
+
+    # Build per-geology per-iter (best_real_value, kind_responsible).
+    per_geo_iter: dict[tuple[int, int], tuple[float, str]] = {}
+    for r in rows:
+        rv = r.get("real_revenue")
+        if rv is None:
+            continue
+        try:
+            rvf = float(rv)
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(rvf):
+            continue
+        try:
+            key = (int(r["geology_index"]), int(r["iteration"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        kind = r.get("kind", "")
+        prev = per_geo_iter.get(key)
+        if prev is None or rvf > prev[0]:
+            per_geo_iter[key] = (rvf, kind)
+
+    cols = min(5, len(geos))
+    rows_n = int(np.ceil(len(geos) / cols))
+    fig, axes = plt.subplots(
+        rows_n, cols,
+        figsize=(cols * 3.4, rows_n * 2.8),
+        facecolor=MANIM_BG, squeeze=False, sharex=True,
+    )
+    for gi, geo in enumerate(geos):
+        ax = axes[gi // cols, gi % cols]
+        _style_ax(ax)
+        running = -np.inf
+        xs: list[int] = []
+        ys: list[float] = []
+        marker_colors: list[str] = []
+        prev_running = -np.inf
+        improvement_iter: int | None = None
+        improvement_val: float | None = None
+        for it in iters:
+            cell = per_geo_iter.get((geo, it))
+            if cell is None:
+                continue
+            val, kind = cell
+            if val > running:
+                running = val
+                # Improvement happened — color this marker by the kind that
+                # caused it. Plateau steps (val ≤ running) use grey.
+                marker_colors.append(KIND_COLORS.get(kind, MANIM_GREY))
+                if improvement_iter is None or running > (improvement_val or -np.inf):
+                    improvement_iter = it
+                    improvement_val = running
+            else:
+                marker_colors.append(MANIM_GREY)
+            xs.append(it)
+            ys.append(running)
+            prev_running = running
+        if xs:
+            # Underlying connecting line (subtle white).
+            ax.plot(xs, ys, color=MANIM_WHITE, lw=1.0, alpha=0.55, zorder=2)
+            # Markers colored by improvement-kind.
+            ax.scatter(xs, ys, c=marker_colors, s=42, zorder=3,
+                       edgecolors="none")
+            # Dotted vertical line at the lifetime-best iter.
+            if improvement_iter is not None:
+                ax.axvline(improvement_iter, color=MANIM_ORANGE,
+                           lw=1.2, ls=":", alpha=0.7, zorder=1)
+            ax.set_title(
+                f"geo {geo} (best={running:.2e} @ iter {improvement_iter})",
+                color=MANIM_WHITE, fontsize=TICK_SIZE,
+            )
+        else:
+            ax.text(0.5, 0.5, "no data", ha="center", va="center",
+                    color=MANIM_GREY, transform=ax.transAxes)
+            ax.set_title(f"geo {geo}", color=MANIM_WHITE, fontsize=TICK_SIZE)
+        ax.tick_params(axis="both", labelsize=8)
+    # Hide unused panels.
+    for k in range(len(geos), rows_n * cols):
+        axes[k // cols, k % cols].axis("off")
+
+    # Build a single shared legend at the top showing the kind colormap.
+    from matplotlib.lines import Line2D
+    legend_handles = [
+        Line2D([], [], marker="o", linestyle="", color=color,
+               label=kind.capitalize(), markersize=8)
+        for kind, color in KIND_COLORS.items()
+    ]
+    legend_handles.append(
+        Line2D([], [], marker="o", linestyle="", color=MANIM_GREY,
+               label="No improvement", markersize=8)
+    )
+    legend_handles.append(
+        Line2D([], [], color=MANIM_ORANGE, lw=1.5, ls=":",
+               label="Lifetime-best iter")
+    )
+    fig.legend(handles=legend_handles, loc="upper center",
+               ncol=len(legend_handles),
+               bbox_to_anchor=(0.5, 1.02), facecolor="#111111")
+    fig.suptitle("Per-geology best real revenue so far "
+                 "(marker color = improvement source)",
+                 color=MANIM_WHITE, y=1.06)
+    fig.text(0.5, 0.01, "AL iteration", ha="center", color=MANIM_WHITE)
+    fig.text(0.005, 0.5, "Best real revenue so far", va="center",
+             rotation="vertical", color=MANIM_WHITE)
+    _save(fig, out_dir / "per_geology_best_so_far_facets.png")
+
+
+def plot_best_revenue_with_geo_updates(
+    history: list[dict], rows: list[dict], out_dir: Path
+) -> None:
+    """Dual-axis plot: bar = how many geologies hit their lifetime best at
+    this iter; lines = per-geology best real revenue so far, one line per
+    geology colored by geology id (continuous viridis colormap).
+
+    The bar at the back shows where the cohort is *discovering* new bests;
+    the lines on top show *which* geologies are doing the discovering and
+    at what revenue level. A geology whose line is flat across iters has
+    plateaued; one whose line steps up at the same iter as a tall bar is
+    contributing to that bar's count.
+    """
+    if not rows:
+        return
+
+    # Build per-geology running max real revenue across iters.
+    geos = sorted({int(r["geology_index"]) for r in rows
+                   if r.get("geology_index") is not None})
+    iters = sorted({int(r["iteration"]) for r in rows
+                    if r.get("iteration") is not None})
+    if not geos or not iters:
+        return
+
+    # Per (geo, iter): best real revenue seen at that iter (across all kinds).
+    per_geo_iter: dict[tuple[int, int], float] = {}
+    for r in rows:
+        rv = r.get("real_revenue")
+        if rv is None:
+            continue
+        try:
+            rvf = float(rv)
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(rvf):
+            continue
+        try:
+            key = (int(r["geology_index"]), int(r["iteration"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if rvf > per_geo_iter.get(key, -np.inf):
+            per_geo_iter[key] = rvf
+
+    # Per geology: running max across iters, plus EVERY iter at which the
+    # per-geo running max stepped up (a new best-so-far). Each step-up is a
+    # discovery event and contributes to the bar count for that iter.
+    geo_lines: dict[int, tuple[list[int], list[float]]] = {}
+    step_up_iters: list[int] = []
+    for geo in geos:
+        xs: list[int] = []
+        ys: list[float] = []
+        running = -np.inf
+        for it in iters:
+            v = per_geo_iter.get((geo, it))
+            if v is None:
+                continue
+            if v > running:
+                running = v
+                step_up_iters.append(it)
+            xs.append(it)
+            ys.append(running)
+        if xs:
+            geo_lines[geo] = (xs, ys)
+
+    bar_vals = [sum(1 for s in step_up_iters if s == it) for it in iters]
+
+    fig, ax_bar = plt.subplots(figsize=(13, 7), facecolor=MANIM_BG)
+    _style_ax(ax_bar)
+    ax_bar.bar(
+        iters, bar_vals,
+        color=MANIM_PURPLE, alpha=0.45, edgecolor=MANIM_PURPLE,
+        linewidth=1.0, label="Geos with new best-so-far at this iter",
+        zorder=1,
+    )
+    ax_bar.set_xlabel("AL iteration")
+    ax_bar.set_ylabel("# geologies with new best-so-far at this iter",
+                     color=MANIM_PURPLE)
+    ax_bar.tick_params(axis="y", colors=MANIM_PURPLE)
+    for it, h in zip(iters, bar_vals):
+        if h > 0:
+            ax_bar.text(it, h + 0.05, str(h), ha="center",
+                        color=MANIM_PURPLE, fontsize=TICK_SIZE)
+    ax_bar.set_ylim(0, max(max(bar_vals, default=0) + 1, 2))
+    ax_bar.set_xticks(iters)
+
+    ax_line = ax_bar.twinx()
+    ax_line.set_facecolor(MANIM_BG)
+    # Continuous colormap keyed by geology index — readable up to ~20 geologies.
+    cmap = plt.get_cmap("viridis")
+    geo_min, geo_max = min(geos), max(geos)
+    geo_span = max(1, geo_max - geo_min)
+    for geo in geos:
+        if geo not in geo_lines:
+            continue
+        xs, ys = geo_lines[geo]
+        color = cmap((geo - geo_min) / geo_span)
+        ax_line.plot(xs, ys, color=color, lw=1.6, marker="o", ms=4,
+                     alpha=0.95, zorder=3)
+    ax_line.set_ylabel("Best real revenue so far (per geology)",
+                      color=MANIM_WHITE)
+    ax_line.tick_params(axis="y", colors=MANIM_WHITE)
+    ax_line.spines["right"].set_color(MANIM_WHITE)
+    ax_line.spines["left"].set_color(MANIM_PURPLE)
+    ax_line.grid(False)
+
+    # Discrete-style colorbar to map color → geology index.
+    import matplotlib as mpl
+    norm = mpl.colors.Normalize(vmin=geo_min, vmax=geo_max)
+    sm = mpl.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=ax_line, pad=0.08, fraction=0.04,
+                        ticks=geos)
+    cbar.ax.set_yticklabels([str(g) for g in geos])
+    cbar.ax.tick_params(colors=MANIM_WHITE, labelsize=9)
+    cbar.set_label("Geology index", color=MANIM_WHITE)
+
+    ax_bar.set_title(
+        f"Per-geology best real revenue vs iter "
+        f"({len(geo_lines)} geologies, "
+        f"bar = # geos with new best-so-far at that iter)"
+    )
+
+    # Combined legend (one entry for bar; per-geology lines explained by
+    # colorbar so we don't list 15 line entries).
+    h1, l1 = ax_bar.get_legend_handles_labels()
+    ax_bar.legend(h1, l1, loc="upper left", facecolor="#111111")
+
+    _save(fig, out_dir / "best_revenue_with_geo_updates.png")
+
+
+def plot_per_kind_gap_distribution(rows: list[dict], out_dir: Path) -> None:
+    """Violin: for each (geology, iter) cell and each kind that competed in
+    that cell, plot ``cell_best_overall − kind_best_in_cell`` (≥ 0). A kind
+    consistently near zero is reliable even when not winning outright.
+
+    Tells you whether a kind that 'loses' is losing by a hair or by a mile.
+    """
+    if not rows:
+        return
+    bests = _per_cell_best_by_kind(rows)
+    if not bests:
+        return
+    gaps: dict[str, list[float]] = {k: [] for k in KIND_COLORS}
+    for cell, by_kind in bests.items():
+        if not by_kind:
+            continue
+        cell_max = max(by_kind.values())
+        for kind, val in by_kind.items():
+            gaps[kind].append(float(cell_max - val))
+    # Drop kinds with no samples to keep the violin layout clean.
+    plotted_kinds = [k for k in KIND_COLORS if gaps[k]]
+    if not plotted_kinds:
+        return
+
+    fig, ax = plt.subplots(figsize=(10, 6), facecolor=MANIM_BG)
+    _style_ax(ax)
+    data = [gaps[k] for k in plotted_kinds]
+    positions = list(range(1, len(plotted_kinds) + 1))
+    parts = ax.violinplot(data, positions=positions, widths=0.85,
+                          showmeans=False, showmedians=False, showextrema=False)
+    for body, k in zip(parts["bodies"], plotted_kinds):
+        body.set_facecolor(KIND_COLORS[k])
+        body.set_edgecolor(KIND_COLORS[k])
+        body.set_alpha(0.55)
+    # Overlay median + mean markers.
+    for pos, k in zip(positions, plotted_kinds):
+        vals = gaps[k]
+        if not vals:
+            continue
+        ax.scatter([pos], [float(np.median(vals))], color=MANIM_WHITE,
+                   marker="_", s=300, linewidths=2, zorder=4)
+        ax.scatter([pos], [float(np.mean(vals))], color=MANIM_ORANGE,
+                   marker="D", s=45, zorder=5,
+                   label="Mean" if k == plotted_kinds[0] else None)
+        ax.scatter([pos], [0.0], color=MANIM_GREEN, marker="*", s=60,
+                   zorder=6,
+                   label="Cell winner" if k == plotted_kinds[0] else None)
+        # Show win count above each violin so the viewer can tell whether a
+        # tight distribution means "always wins" or "rarely competes".
+        win_count = sum(1 for v in vals if v == 0.0)
+        ax.text(pos, max(vals) * 1.04 if max(vals) > 0 else 0.05,
+                f"wins={win_count}/{len(vals)}",
+                ha="center", color=MANIM_WHITE, fontsize=TICK_SIZE)
+
+    ax.set_xticks(positions)
+    ax.set_xticklabels([k.capitalize() for k in plotted_kinds])
+    ax.set_ylabel("Gap to cell-best real revenue (lower = better)")
+    ax.set_xlabel("Acquisition kind")
+    ax.set_title("Per-cell gap distribution: how far behind the cell winner?")
+    ax.legend(loc="upper right")
+    _save(fig, out_dir / "per_kind_gap_distribution.png")
 
 
 def plot_calibration_metrics(history: list[dict], out_dir: Path) -> None:
@@ -1039,6 +1615,17 @@ def main() -> int:
     rows = _all_candidate_rows(args.run_root, history)
     plot_best_revenue(history, rows, out_dir)
     plot_kind_revenue_summary(rows, out_dir)
+    # Per-geology kind-attribution suite (5 plots): cumulative wins bar,
+    # winner heatmap, per-geology faceted best-so-far, win-share over iters,
+    # gap distribution. Together they answer: "which kind finds the most
+    # bests for each geology, and by how much does it beat the others?"
+    plot_cumulative_wins_per_kind(rows, out_dir)
+    plot_per_geology_winner_heatmap(rows, out_dir)
+    plot_per_geology_faceted_best(rows, out_dir)
+    plot_win_rate_over_iters(rows, out_dir)
+    plot_per_kind_gap_distribution(rows, out_dir)
+    plot_best_revenue_with_geo_updates(history, rows, out_dir)
+    plot_per_geology_best_so_far_facets(rows, out_dir)
     plot_calibration_metrics(history, out_dir)
     plot_per_geology_mape_heatmap(history, out_dir)
     plot_training_growth(history, out_dir)
