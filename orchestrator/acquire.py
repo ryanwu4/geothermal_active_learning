@@ -16,11 +16,13 @@ plus per-snapshot ``.jl`` files written via ``to_julia_wells_text`` from
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 import pickle
 import signal
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -1900,19 +1902,39 @@ def _run_acquisition_ensemble(
     well_configs_dir.mkdir(parents=True, exist_ok=True)
     snapshots_json_dir.mkdir(parents=True, exist_ok=True)
 
-    device_str = (cfg.devices or [cfg.device])[0]
+    device_strs = list(cfg.devices) if cfg.devices else [cfg.device]
     started = time.time()
     timings: dict[str, float] = {}
 
     t_ctx = time.perf_counter()
-    ctx = _build_worker_context(cfg, iteration, device_str)
+    ctx = _build_worker_context(cfg, iteration, device_strs[0])
     timings["worker_ctx_load_s"] = time.perf_counter() - t_ctx
-    device = ctx.device
-    model = ctx.model
-    target_mean = ctx.target_mean
-    target_scale = ctx.target_scale
+    device = ctx.device                       # master device
+    model = ctx.model                          # master model (cuda:0)
+    target_mean = ctx.target_mean              # on master
+    target_scale = ctx.target_scale            # on master
     is_injector_list = ctx.is_injector_list
     num_wells = ctx.num_wells
+
+    # ----- Replicate model + scaler buffers to every requested device -----
+    # The model is small relative to the activations, so a deep copy per device
+    # is cheap (model is also eval-only here; weights never update during the
+    # Adam-on-coords loop, so the replicas stay in sync trivially).
+    device_objs: list[torch.device] = [device]
+    models_per_dev: list[Any] = [model]
+    target_scales_per_dev: list[torch.Tensor] = [target_scale]
+    target_means_per_dev: list[torch.Tensor] = [target_mean]
+    for d_str in device_strs[1:]:
+        d = torch.device(d_str)
+        if d_str.startswith("cuda:") and torch.cuda.is_available():
+            torch.cuda.set_device(int(d_str.split(":", 1)[1]))
+        m_copy = copy.deepcopy(model).to(d)
+        m_copy.eval()
+        device_objs.append(d)
+        models_per_dev.append(m_copy)
+        target_scales_per_dev.append(target_scale.to(d))
+        target_means_per_dev.append(target_mean.to(d))
+    n_dev = len(device_objs)
 
     geologies = list(cfg.geologies)
     K = len(geologies)
@@ -2082,9 +2104,14 @@ def _run_acquisition_ensemble(
     timings["n_frontier"] = int(n_frontier)
 
     # ----- Build K static-graph batches (one per geology), each size M -----
+    # Each batch is placed on a device chosen round-robin across cfg.devices,
+    # so n_dev GPUs each own roughly K/n_dev geologies. The threaded Adam loop
+    # below dispatches per-device forwards in parallel, accumulating gradients
+    # back onto the master coords tensor.
     t0 = time.perf_counter()
     batches: list[Any] = []
-    for g, d in zip(geologies, geology_loaded):
+    batch_owner_dev: list[int] = []  # parallel to `batches`
+    for k_idx, (g, d) in enumerate(zip(geologies, geology_loaded)):
         static_graphs = _build_static_batch_for_starts(
             cfgs, Path(g.geology_h5_file), d["physics_dict"], d["full_shape"],
             d["z_cutoff"], d["nx"], d["ny"],
@@ -2093,8 +2120,17 @@ def _run_acquisition_ensemble(
             ctx.build_single_hetero_data, d["temp0_full"],
             node_encoder=ctx.node_encoder, enrich_global_attr=ctx.enrich_global_attr,
         )
-        batches.append(Batch.from_data_list(static_graphs).to(device))
+        dev_idx = k_idx % n_dev
+        batches.append(Batch.from_data_list(static_graphs).to(device_objs[dev_idx]))
+        batch_owner_dev.append(dev_idx)
+    # Per-device batch lists for the threaded forward+backward loop.
+    batches_per_dev: list[list[Any]] = [[] for _ in range(n_dev)]
+    for bd, dev_idx in zip(batches, batch_owner_dev):
+        batches_per_dev[dev_idx].append(bd)
     timings["graph_build_s"] = time.perf_counter() - t0
+    timings["n_devices"] = float(n_dev)
+    for i in range(n_dev):
+        timings[f"n_batches_dev{i}"] = float(len(batches_per_dev[i]))
 
     starts = [
         [[w["x"], w["y"], float(w["depth"])] for w in c] for c in cfgs
@@ -2104,33 +2140,151 @@ def _run_acquisition_ensemble(
     optimizer = optim.Adam([coords], lr=cfg.learning_rate)
     last_valid_coords = coords.detach().clone()
 
-    def _predict_all_geos(c: torch.Tensor) -> torch.Tensor:
-        """Forward the same M coords through all K geology batches.
+    def _predict_one_geo(c: torch.Tensor, bd, dev_idx: int) -> torch.Tensor:
+        """Forward M coords through one geology batch on its owning device.
 
-        Returns a (M, K) tensor of *unscaled* predicted revenue.
+        ``c`` must already live on the same device as ``bd`` / the model
+        replica. Returns an ``(M,)`` tensor of unscaled predictions on that
+        device.
         """
-        cv = c.view(-1, 3)
-        cols: list[torch.Tensor] = []
-        for bd in batches:
-            bd["well"].pos_xyz = cv
-            pred_scaled = model(bd).view(M)
-            cols.append(pred_scaled * target_scale + target_mean)
-        return torch.stack(cols, dim=1)  # (M, K)
+        bd["well"].pos_xyz = c.view(-1, 3)
+        pred_scaled = models_per_dev[dev_idx](bd).view(M)
+        return pred_scaled * target_scales_per_dev[dev_idx] + target_means_per_dev[dev_idx]
+
+    def _predict_all_geos_no_grad(c_master: torch.Tensor) -> np.ndarray:
+        """Forward all K geology batches without autograd; for logging only.
+
+        Returns an ``(M, K)`` numpy array of unscaled predictions. Each forward
+        runs on its owning device with no autograd graph kept, so peak memory
+        stays at one geology's forward across the whole sweep — even with
+        many K and multiple GPUs.
+
+        Forwards are launched in a single pass (async on each device's default
+        stream), then collected in a second pass via ``.cpu().numpy()``. This
+        keeps multi-device kernel queues running concurrently — otherwise the
+        per-iteration ``.cpu()`` syncs would serialize across devices and
+        defeat the parallelism.
+        """
+        preds_per_k: list[torch.Tensor | None] = [None] * K
+        cols: list[np.ndarray] = [None] * K  # type: ignore[list-item]
+        with torch.no_grad():
+            # Pre-stage coords on each device once.
+            coords_per_dev = [c_master.detach().to(d) for d in device_objs]
+            # Pass 1: launch all forwards (each on its owner device's stream).
+            for k_idx, bd in enumerate(batches):
+                dev_idx = batch_owner_dev[k_idx]
+                preds_per_k[k_idx] = _predict_one_geo(
+                    coords_per_dev[dev_idx], bd, dev_idx
+                ).detach()
+            # Pass 2: collect (each ``.cpu().numpy()`` syncs only its own device).
+            for k_idx, p in enumerate(preds_per_k):
+                assert p is not None
+                cols[k_idx] = p.cpu().numpy()
+        return np.stack(cols, axis=1)  # (M, K)
 
     # Pre-step seed forward to capture seed_predicted_emv per candidate.
     t0 = time.perf_counter()
-    with torch.no_grad():
-        preds_seed = _predict_all_geos(coords).detach().cpu().numpy()  # (M, K)
+    preds_seed = _predict_all_geos_no_grad(coords)  # (M, K)
     seed_predicted_emv = preds_seed.mean(axis=1).astype(float)
     timings["seed_forward_s"] = time.perf_counter() - t0
 
     # ----- Adam loop (k_safe steps, mean-over-K loss) -----
+    # Two memory + parallelism tricks combined:
+    #   (1) Gradient accumulation across geologies. Each Adam step accumulates
+    #       K per-geology backward passes instead of one giant backward over
+    #       the mean-over-K loss. The math is identical
+    #       (d/dx[(1/K) Σ_k f_k(x)] = (1/K) Σ_k df_k/dx), but each forward
+    #       graph is released as soon as its own backward fires — so peak GPU
+    #       memory per device is bounded by a single per-geology forward, not
+    #       K simultaneous ones. Without this, the activations for all K
+    #       forwards have to coexist until one giant backward fires, which
+    #       OOMs as K and the physics-slab CNN footprint grow.
+    #   (2) Multi-device sharding. Each of the cfg.devices GPUs owns a subset
+    #       of the K geology batches and runs its share of forward+backward
+    #       in parallel via Python threads (PyTorch's autograd is thread-safe,
+    #       and CUDA ops release the GIL — separate streams on different
+    #       devices run concurrently). Per-device coords replicas accumulate
+    #       gradients locally; we sum them back onto the master coords.grad
+    #       at the end of each Adam step.
+    K_float = float(K)
+
+    def _accumulate_device_grad(
+        dev_idx: int,
+        coords_replica: torch.Tensor,
+        out_errors: list,
+    ) -> None:
+        """Run all of dev_idx's geology batches through forward+backward.
+
+        Gradients accumulate into ``coords_replica.grad`` (a leaf tensor on the
+        device). Exceptions are surfaced via ``out_errors[dev_idx]`` so the
+        main thread can re-raise after joining.
+        """
+        try:
+            for bd in batches_per_dev[dev_idx]:
+                preds_k = _predict_one_geo(coords_replica, bd, dev_idx)
+                loss_k = -(preds_k.sum() / K_float)
+                loss_k.backward()
+                # Forward graph for this geology is released here.
+            # Block until this device's queue drains so the main thread can
+            # safely move the gradient back to the master device.
+            if device_objs[dev_idx].type == "cuda":
+                torch.cuda.synchronize(device_objs[dev_idx])
+        except BaseException as e:  # pragma: no cover - propagated to main
+            out_errors[dev_idx] = e
+
     t0 = time.perf_counter()
     for step in range(1, int(cfg.k_safe) + 1):
-        optimizer.zero_grad()
-        preds = _predict_all_geos(coords)
-        loss = -preds.mean(dim=1).sum()
-        loss.backward()
+        optimizer.zero_grad(set_to_none=True)
+
+        # Fast path: single device → run inline (no threading overhead).
+        if n_dev == 1:
+            _accumulate_device_grad(0, coords, [None])
+        else:
+            # Build a fresh per-device coords replica each step so gradients
+            # start at zero and never alias the master's autograd graph.
+            replicas: list[torch.Tensor] = []
+            for i in range(n_dev):
+                if i == 0:
+                    # Master device: use coords itself, but reset its grad so
+                    # the per-device sum is well-defined below.
+                    coords.grad = None
+                    replicas.append(coords)
+                else:
+                    replicas.append(
+                        coords.detach().to(device_objs[i]).requires_grad_(True)
+                    )
+
+            errors: list[BaseException | None] = [None] * n_dev
+            threads: list[threading.Thread] = []
+            for i in range(n_dev):
+                t = threading.Thread(
+                    target=_accumulate_device_grad,
+                    args=(i, replicas[i], errors),
+                    name=f"acquire-ensemble-dev{i}",
+                )
+                t.start()
+                threads.append(t)
+            for t in threads:
+                t.join()
+            for err in errors:
+                if err is not None:
+                    raise err
+
+            # Sum per-device gradients onto master coords.grad. Device 0's
+            # contribution is already in coords.grad (its replica IS coords).
+            if coords.grad is None:
+                coords.grad = torch.zeros_like(coords)
+            for i in range(1, n_dev):
+                if replicas[i].grad is None:
+                    continue
+                coords.grad.add_(replicas[i].grad.to(device))
+            # Ensure every cross-device copy queued above has landed on the
+            # master device's stream before the optimizer / projection touches
+            # coords.grad. Each worker thread synchronized its own source
+            # device, but PyTorch may queue P2P copies on a side stream — we
+            # need the master stream to wait too. Cheap (gradient is tiny).
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
 
         with torch.no_grad():
             grads = coords.grad
@@ -2162,8 +2316,7 @@ def _run_acquisition_ensemble(
 
     # ----- Terminal forward + snapshot emit -----
     t0 = time.perf_counter()
-    with torch.no_grad():
-        preds_final = _predict_all_geos(coords).detach().cpu().numpy()  # (M, K)
+    preds_final = _predict_all_geos_no_grad(coords)  # (M, K)
     terminal_predicted_emv = preds_final.mean(axis=1).astype(float)
 
     snapshots: list[dict[str, Any]] = []
@@ -2217,7 +2370,13 @@ def _run_acquisition_ensemble(
     profiling_dir = out_dir / "profiling"
     profiling_dir.mkdir(parents=True, exist_ok=True)
     csv_path = profiling_dir / f"gpu_timings_iter_{iteration:04d}.csv"
-    row = {"device": device_str, "geology_index": "ALL", **timings}
+    row = {
+        # Pipe-separated so the CSV parses cleanly with the default delimiter
+        # (commas would inject extra columns).
+        "device": "|".join(device_strs),
+        "geology_index": "ALL",
+        **timings,
+    }
     col_order = ["device", "geology_index"] + [k for k in sorted(row.keys()) if k not in ("device", "geology_index")]
     with open(csv_path, "w") as f:
         f.write(",".join(col_order) + "\n")
