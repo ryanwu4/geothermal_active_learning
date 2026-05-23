@@ -326,53 +326,35 @@ def _rewrite_manifest_paths(local_manifest: Path, remappings: list[tuple[str, st
 def _render_local_plots(state: RunState, ws: Path) -> None:
     """Render the full diagnostic dashboard into ``<ws>/plots/``.
 
-    Mirrors ``scripts/plot_convergence.py``. State-only plots run unconditionally;
-    candidate-level / holdout / well-position plots need supporting files
-    mirrored locally (``per_candidate_metrics.json`` via
-    ``_pull_per_candidate_metrics`` after ingest; train.py's enriched CSVs and
-    acquire/iter_NNNN/snapshots_json/* are produced on bend by the train and
-    acquire phases).
-    """
-    try:
-        # Defer import: matplotlib pulls in a lot, no need at module load.
-        from dataclasses import asdict
-        import matplotlib
-        matplotlib.use("Agg")  # headless on bend
-        from scripts import plot_convergence as pc  # type: ignore
-    except Exception as e:
-        print(f"[local-driver] plotting deferred — could not import plot_convergence: {e}",
-              file=sys.stderr)
-        return
+    Delegates to ``scripts/plot_convergence.py`` so the hybrid dashboard never
+    drifts from the canonical plot list — any plot added to the convergence
+    script's ``main()`` shows up here automatically.
 
+    Runs in a subprocess so a plot-side import (matplotlib backend, etc.) can't
+    contaminate the driver's interpreter state. Plotting is diagnostic — never
+    let a plot bug kill the AL loop.
+    """
+    if not state.history:
+        return
     out_dir = ws / "plots"
     out_dir.mkdir(parents=True, exist_ok=True)
-    history = [asdict(r) for r in state.history]
-    if not history:
-        return
-    pc._set_style()
+    plot_script = REPO_ROOT / "scripts" / "plot_convergence.py"
+    cmd = [sys.executable, str(plot_script), str(ws), "--out-dir", str(out_dir)]
     try:
-        rows = pc._all_candidate_rows(ws, history)
-        pc.plot_best_revenue(history, rows, out_dir)
-        pc.plot_calibration_metrics(history, out_dir)
-        pc.plot_per_geology_mape_heatmap(history, out_dir)
-        pc.plot_training_growth(history, out_dir)
-        pc.plot_wallclock_breakdown(history, out_dir)
-        pc.plot_predicted_vs_real_scatter(rows, out_dir)
-        pc.plot_real_revenue_distribution(rows, out_dir)
-        pc.plot_topk_mean_gap(rows, out_dir)
-        pc.plot_pred_real_kde_shift(rows, out_dir)
-        holdout_rows = pc._all_holdout_rows(ws, history)
-        pc.plot_holdout_mape_over_iters(holdout_rows, out_dir)
-        pc.plot_holdout_per_geology_heatmap(holdout_rows, out_dir)
-        pc.plot_holdout_pred_vs_real_scatter(holdout_rows, out_dir)
-        well_rows = pc._load_well_coord_rows(ws, history)
-        pc.plot_well_position_heatmaps(well_rows, out_dir)
-        pc.plot_well_position_heatmaps_by_kind(well_rows, out_dir)
-        pc.plot_well_position_heatmaps_over_iters(well_rows, out_dir)
-        pc.plot_best_well_config(ws, well_rows, out_dir)
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, check=False,
+            env={**os.environ, "MPLBACKEND": "Agg"},
+        )
+        if result.returncode != 0:
+            print(f"[local-driver] plot rendering failed (rc={result.returncode}):\n{result.stderr[-2000:]}",
+                  file=sys.stderr)
+        elif result.stderr.strip():
+            # Surface non-fatal stderr (e.g. matplotlib warnings) in case anything
+            # downstream cares — but don't treat them as failure.
+            print(f"[local-driver] plot rendering stderr (non-fatal):\n{result.stderr[-1000:]}",
+                  file=sys.stderr)
     except Exception as e:
-        # Plotting is diagnostic — never let a plot bug kill the AL loop.
-        print(f"[local-driver] plot rendering failed: {e}", file=sys.stderr)
+        print(f"[local-driver] plot rendering bailed: {e}", file=sys.stderr)
 
 
 def _build_geology_remappings(cfg: dict) -> list[tuple[str, str]]:
@@ -679,6 +661,7 @@ def _acquire_and_select_locally(
         if p.exists():
             prior_metrics.append(p)
 
+    mode = str(acq_cfg.get("mode", "per_geology"))
     acq = AcquisitionConfig(
         surrogate_repo=surrogate_repo,
         checkpoint_path=ckpt,
@@ -686,10 +669,10 @@ def _acquire_and_select_locally(
         norm_config_path=norm_config,
         geologies=geologies,
         wells=wells,
-        n_starts_per_geology=int(acq_cfg["n_starts_per_geology"]),
+        n_starts_per_geology=int(acq_cfg.get("n_starts_per_geology", 0)),
         k_safe=int(acq_cfg["k_safe"]),
-        k_adv=int(acq_cfg["k_adv"]),
-        adv_fraction=float(acq_cfg["adv_fraction"]),
+        k_adv=int(acq_cfg.get("k_adv", acq_cfg["k_safe"])),
+        adv_fraction=float(acq_cfg.get("adv_fraction", 0.0)),
         edge_buffer=int(acq_cfg.get("edge_buffer", 10)),
         learning_rate=float(acq_cfg.get("lr", 0.5)),
         log_every_n_steps=int(acq_cfg.get("log_every_n_steps", 25)),
@@ -705,6 +688,9 @@ def _acquire_and_select_locally(
         cma_generations=int(acq_cfg.get("cma_generations", 10)),
         cma_sigma_init=float(acq_cfg.get("cma_sigma_init", 5.0)),
         prior_metrics=prior_metrics,
+        mode=mode,
+        n_exploit=int(acq_cfg.get("n_exploit", 0)),
+        n_frontier=int(acq_cfg.get("n_frontier", 0)),
     )
     started = time.time()
     out_dir = ws / "acquire" / f"iter_{iter_idx:04d}"
@@ -712,6 +698,21 @@ def _acquire_and_select_locally(
     acq_result = run_acquisition(acq, out_dir=out_dir, iteration=iter_idx)
     elapsed_min = (time.time() - started) / 60.0
     print(f"[local-driver] acquired {len(acq_result['candidates'])} candidates in {elapsed_min:.2f} min")
+
+    if mode == "ensemble":
+        from orchestrator.select import select_batch_ensemble
+        from orchestrator.acquire import write_selected_manifest_ensemble
+        cap = int(sel_cfg.get("batch_size", 0)) or None
+        selected = select_batch_ensemble(acq_result["candidates"], batch_size=cap)
+        manifest_path = ws / "manifests" / f"manifest_iter_{iter_idx:04d}.json"
+        write_selected_manifest_ensemble(
+            selected,
+            out_path=manifest_path,
+            iteration=iter_idx,
+            geologies=geologies,
+            extras={"selection": sel_cfg},
+        )
+        return manifest_path, len(selected), elapsed_min
 
     kind_fraction_keys = ("frontier_fraction", "adversarial_fraction", "exploit_fraction", "cma_fraction")
     has_kind_fractions = any(k in sel_cfg for k in kind_fraction_keys if k != "frontier_fraction")

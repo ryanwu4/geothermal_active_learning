@@ -117,6 +117,15 @@ def main() -> int:
         array_tasks_json=args.array_tasks_json,
         iter_scratch_dir=paths.iter_ix_output_dir(state.iteration),
     )
+    # Build prior_per_candidate_emv_by_iter so the ingest can look up real EMV
+    # for each ensemble-mode candidate's seed source. Only iterations whose
+    # IterationRecord populated per_candidate_emv contribute; per-geology
+    # iterations are skipped (their candidates have no seed_source_*).
+    prior_per_candidate_emv_by_iter: dict[int, dict[str, float]] = {}
+    for rec_hist in state.history:
+        if rec_hist.per_candidate_emv:
+            prior_per_candidate_emv_by_iter[int(rec_hist.iteration)] = dict(rec_hist.per_candidate_emv)
+
     ingest_started = time.time()
     metrics = ingest_iteration(
         iteration=state.iteration,
@@ -131,6 +140,8 @@ def main() -> int:
         next_compiled_h5=next_compiled_h5,
         log_path=paths.logs_dir / f"ingest_iter_{state.iteration:04d}.preprocess.log",
         prior_best_revenue=state.best_real_revenue_so_far(),
+        prior_best_emv=state.best_emv_so_far_value(),
+        prior_per_candidate_emv_by_iter=prior_per_candidate_emv_by_iter or None,
         workers=4,
     )
     ingest_elapsed_min = (time.time() - ingest_started) / 60.0
@@ -161,6 +172,11 @@ def main() -> int:
     rec.n_train_samples = metrics.n_train_samples
     rec.wallclock_ingest_min = ingest_elapsed_min
     rec.per_geology = metrics.per_geology
+    rec.best_emv_in_batch = metrics.best_emv_in_batch
+    rec.best_emv_so_far = metrics.best_emv_so_far
+    rec.per_candidate_emv = metrics.per_candidate_emv
+    rec.exploit_best_emv = metrics.exploit_best_emv
+    rec.exploit_best_per_geology = metrics.exploit_best_per_geology
     state.upsert_iter(rec)
 
     # Write per-candidate calibration rows alongside the iteration's artifacts.
@@ -172,6 +188,10 @@ def main() -> int:
         "n_submitted": metrics.n_submitted,
         "n_completed": metrics.n_completed,
         "candidates": [asdict(c) for c in (metrics.candidates or [])],
+        "per_candidate_emv": metrics.per_candidate_emv,
+        "best_emv_in_batch": metrics.best_emv_in_batch,
+        "exploit_best_emv": metrics.exploit_best_emv,
+        "exploit_best_per_geology": metrics.exploit_best_per_geology,
     }
     with open(per_cand_path, "w") as f:
         json.dump(per_cand_payload, f, indent=2)

@@ -307,3 +307,31 @@ def select_batch(
         + list(chosen["exploit"])
         + list(chosen["cma"])
     )
+
+
+def select_batch_ensemble(
+    candidates: Sequence[Candidate],
+    *,
+    batch_size: int | None = None,
+) -> list[Candidate]:
+    """Flat-pool selector for ensemble mode.
+
+    Each candidate already represents a full well configuration evaluated across
+    the entire geological ensemble, so per-geology slot allocation no longer
+    applies. We just rank by predicted EMV (the same number stored in
+    ``predicted_revenue`` for ensemble candidates) and optionally cap to
+    ``batch_size``. Order: exploit first, then frontier, then anything else —
+    matches the conventional "highest-value cohort first" ordering.
+    """
+    if not candidates:
+        return []
+    pool = list(candidates)
+    kind_priority = {"exploit": 0, "frontier": 1}
+    pool.sort(key=lambda c: (kind_priority.get(c.kind, 99), -float(c.predicted_revenue)))
+    if batch_size is not None and batch_size >= 0 and len(pool) > batch_size:
+        # Cap by predicted EMV across the whole pool (kind-agnostic) so we
+        # don't drop a frontier candidate that scored higher than the worst
+        # exploit. Then re-apply the kind-then-EMV ordering.
+        pool = sorted(pool, key=lambda c: -float(c.predicted_revenue))[:batch_size]
+        pool.sort(key=lambda c: (kind_priority.get(c.kind, 99), -float(c.predicted_revenue)))
+    return pool

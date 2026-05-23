@@ -86,6 +86,16 @@ class AcquisitionConfig:
     # to recover well coords for the elite path.
     prior_metrics: list[Path] | None = None
 
+    # Mode switch. "per_geology" (default) runs the legacy per-geology Adam loop;
+    # "ensemble" runs one Adam loop per candidate against ALL K geologies, with
+    # loss = mean over the ensemble. Ensemble mode ignores the cma/adversarial
+    # knobs and uses n_exploit / n_frontier instead.
+    mode: str = "per_geology"
+    # Ensemble-mode knobs. Each candidate spawns K IX runs (one per geology) so
+    # n_candidates × K is the simulator budget per iteration.
+    n_exploit: int = 0     # ensemble: Adam-from-elite-seed starts (kind="exploit")
+    n_frontier: int = 0    # ensemble: Adam-from-LHS starts (kind="frontier")
+
 
 # Canonical ordering for snapshots in the aggregate manifest so parallel runs
 # produce byte-identical output to serial runs.
@@ -1248,6 +1258,11 @@ def run_acquisition(
       - ``out_dir/snapshots_json/<snapshot_id>.json`` per snapshot
       - ``out_dir/manifest.json`` aggregate
     """
+    if getattr(cfg, "mode", "per_geology") == "ensemble":
+        return _run_acquisition_ensemble(
+            cfg, out_dir=out_dir, iteration=iteration, run_id_prefix=run_id_prefix,
+        )
+
     # Surrogate imports + heavy state (model, scaler, normalization) are
     # loaded inside ``_build_worker_context`` so the same path works for
     # in-process and spawned-worker execution.
@@ -1523,3 +1538,713 @@ def write_selected_manifest(
     with open(out_path, "w") as f:
         json.dump(manifest, f, indent=2)
     return out_path
+
+
+# ============================================================================
+# Ensemble (EMV) acquisition: one candidate × all K geologies per Adam loop.
+# ============================================================================
+
+def _load_elite_seeds_ensemble(
+    prior_metrics: list[Path],
+    k: int,
+    rng: np.random.Generator,
+) -> list[tuple[np.ndarray, str, int]]:
+    """Pull top-K real-EMV configs across prior iters (ensemble mode).
+
+    Returns at most ``k`` triples of ``(coords, source_snapshot_id, source_iteration)``,
+    ranked by descending per-candidate real EMV (mean of K real revenues across
+    the geology runs of that candidate). Candidate EMV is read from
+    ``per_candidate_emv`` if present in the metrics payload; otherwise it's
+    derived by averaging real_revenue grouped by snapshot_id across all rows.
+
+    Coordinates come from each candidate's ``snapshots_json/<id>.json`` file.
+    Enforces a minimum pairwise L2 distance (>=3 grid cells in flattened coord
+    space) to avoid collapsed picks.
+    """
+    if not prior_metrics:
+        return []
+
+    # entries: (emv, snapshot_id, source_iteration, candidate_dirs)
+    entries: list[tuple[float, str, int, list[Path]]] = []
+    for metrics_path in prior_metrics:
+        metrics_path = Path(metrics_path)
+        if not metrics_path.exists():
+            continue
+        # Same dual-layout dance as the per-geology elite reader.
+        iter_name = metrics_path.parent.name  # "iter_0004"
+        run_root = metrics_path.parent.parent
+        candidate_dirs = [
+            metrics_path.parent / "acquire" / "snapshots_json",
+            run_root / "acquire" / iter_name / "snapshots_json",
+        ]
+        try:
+            with open(metrics_path, "r") as f:
+                payload = json.load(f)
+        except Exception:
+            continue
+        iter_idx = int(payload.get("iteration", -1))
+        # Prefer the pre-aggregated per_candidate_emv if it's there.
+        per_cand_emv = payload.get("per_candidate_emv") or {}
+        if not isinstance(per_cand_emv, dict):
+            per_cand_emv = {}
+        # Otherwise, aggregate on the fly from the candidates list. Only
+        # snapshots that fanned out to >1 IX run are real EMVs; per-geology
+        # iterations have one row per snapshot whose "EMV" would just be that
+        # single geology's revenue, which is meaningless for ensemble seeding.
+        if not per_cand_emv:
+            grouped: dict[str, list[float]] = {}
+            for c in payload.get("candidates", []):
+                sid = c.get("snapshot_id")
+                rev = c.get("real_revenue")
+                if not sid or rev is None or not np.isfinite(rev):
+                    continue
+                grouped.setdefault(str(sid), []).append(float(rev))
+            per_cand_emv = {
+                sid: float(np.mean(revs))
+                for sid, revs in grouped.items()
+                if len(revs) > 1
+            }
+        for sid, emv in per_cand_emv.items():
+            if emv is None or not np.isfinite(emv):
+                continue
+            entries.append((float(emv), str(sid), iter_idx, candidate_dirs))
+
+    if not entries:
+        return []
+
+    entries.sort(key=lambda t: -t[0])
+    picked: list[tuple[np.ndarray, str, int]] = []
+    picked_flat: list[np.ndarray] = []
+    min_dist = 3.0
+    for emv, snap_id, src_iter, candidate_dirs in entries:
+        if len(picked) >= k:
+            break
+        snap_path = None
+        for sdir in candidate_dirs:
+            cand = sdir / f"{snap_id}.json"
+            if cand.exists():
+                snap_path = cand
+                break
+        if snap_path is None:
+            continue
+        try:
+            with open(snap_path, "r") as f:
+                snap = json.load(f)
+        except Exception:
+            continue
+        wells = snap.get("wells", [])
+        if not wells:
+            continue
+        coords = np.asarray(
+            [[float(w["x"]), float(w["y"]), float(w["z"])] for w in wells],
+            dtype=np.float32,
+        )
+        flat = coords.reshape(-1)
+        if picked_flat:
+            dists = np.linalg.norm(np.stack(picked_flat) - flat[None, :], axis=1)
+            if float(dists.min()) < min_dist:
+                continue
+        picked.append((coords, snap_id, src_iter))
+        picked_flat.append(flat)
+
+    # Light shuffle so the same elite doesn't always seed candidate 0.
+    order = rng.permutation(len(picked))
+    picked = [picked[int(i)] for i in order]
+    return picked[:k]
+
+
+def _emit_snapshot_ensemble(
+    *,
+    run_id: int,
+    iteration_step: int,
+    kind: str,
+    coords_xyz: np.ndarray,
+    is_injector_list: list[bool],
+    predictions_by_geology: list[dict],
+    predicted_emv: float,
+    seed_source_snapshot_id: str | None,
+    seed_source_iteration: int | None,
+    seed_predicted_emv: float | None,
+    geologies: list[GeologySpec],
+    geology_metas: dict[int, dict],
+    well_configs_dir: Path,
+    snapshots_json_dir: Path,
+    to_julia_wells_text,
+) -> dict[str, Any]:
+    """Write one .jl + one snapshot JSON for an ensemble candidate.
+
+    The .jl carries the predicted EMV as its score; per-geology predictions live
+    inside the snapshot JSON's ``predictions_by_geology`` array. The manifest
+    record's ``well_config_paths_by_geology`` lists K entries pointing to the
+    same .jl, so Julia's array prepare expands one candidate into K IX tasks.
+    """
+    snapshot_id = f"run{run_id:06d}_step{iteration_step:04d}_{kind}"
+    jl_path = well_configs_dir / f"{snapshot_id}.jl"
+    json_path = snapshots_json_dir / f"{snapshot_id}.json"
+
+    # The .jl file is geology-agnostic in ensemble mode; we still record one
+    # geology's metadata in it so existing downstream tools that read the header
+    # have something to log. Use the first geology by convention.
+    first = geologies[0]
+    first_meta = geology_metas.get(first.geology_index, {})
+    jl_text = to_julia_wells_text(
+        coords_xyz=coords_xyz,
+        is_injector_list=is_injector_list,
+        score=predicted_emv,
+        score_label="Predicted EMV (mean discounted revenue across ensemble)",
+        geology_file=str(first.geology_h5_file),
+        geology_name=first.geology_name or Path(first.geology_h5_file).stem,
+        geology_config_id=first_meta.get("geology_config_id"),
+        geology_scenario_name=first_meta.get("scenario_name"),
+        geology_sample_num=first_meta.get("sample_num"),
+        predicted_discounted_revenue=predicted_emv,
+    )
+    jl_path.write_text(jl_text)
+
+    wells_json = []
+    for w, (x, y, z) in enumerate(coords_xyz):
+        is_inj = is_injector_list[w]
+        j_idx = int(round(float(x))) + 1
+        i_idx = int(round(float(y))) + 1
+        k_idx = int(round(float(z))) + 1
+        wells_json.append({
+            "well_id": int(w),
+            "type": "injector" if is_inj else "producer",
+            "x": float(x), "y": float(y), "z": float(z),
+            "i_idx": int(i_idx), "j_idx": int(j_idx), "k_idx": int(k_idx),
+            "rate": float(8000.0 if is_inj else -8000.0),
+        })
+
+    snap_payload = {
+        "snapshot_id": snapshot_id,
+        "run_id": int(run_id),
+        "iteration": int(iteration_step),
+        "kind": kind,
+        "mode": "ensemble",
+        "predicted_emv": float(predicted_emv),
+        "predicted_discounted_total_revenue": float(predicted_emv),  # back-compat alias
+        "seed_source_snapshot_id": seed_source_snapshot_id,
+        "seed_source_iteration": (None if seed_source_iteration is None else int(seed_source_iteration)),
+        "seed_predicted_emv": (None if seed_predicted_emv is None else float(seed_predicted_emv)),
+        "terminal_predicted_emv": float(predicted_emv),
+        "wells": wells_json,
+        "predictions_by_geology": predictions_by_geology,
+    }
+    with open(json_path, "w") as f:
+        json.dump(snap_payload, f, indent=2)
+
+    well_config_paths_by_geology = []
+    for g in geologies:
+        meta = geology_metas.get(g.geology_index, {})
+        # The corresponding predicted revenue for this geology (for the manifest).
+        per_geo_pred = next(
+            (p for p in predictions_by_geology if int(p.get("geology_index", -1)) == g.geology_index),
+            None,
+        )
+        well_config_paths_by_geology.append({
+            "geology_index": g.geology_index,
+            "geology_name": g.geology_name or Path(g.geology_h5_file).stem,
+            "geology_file": str(Path(g.geology_h5_file).resolve()),
+            "geology_config_id": meta.get("geology_config_id"),
+            "geology_scenario_name": meta.get("scenario_name"),
+            "geology_sample_num": meta.get("sample_num"),
+            "well_config_path": str(jl_path),
+            "predicted_discounted_total_revenue": float(per_geo_pred["discounted_total_revenue"]) if per_geo_pred else float("nan"),
+        })
+
+    snapshot_record = {
+        "snapshot_id": snapshot_id,
+        "run_id": int(run_id),
+        "iteration": int(iteration_step),
+        "kind": kind,
+        "mode": "ensemble",
+        "json_path": str(json_path),
+        "well_config_path": str(jl_path),
+        "well_config_paths_by_geology": well_config_paths_by_geology,
+        "predicted_emv": float(predicted_emv),
+        "predicted_discounted_total_revenue": float(predicted_emv),
+        "seed_source_snapshot_id": seed_source_snapshot_id,
+        "seed_source_iteration": (None if seed_source_iteration is None else int(seed_source_iteration)),
+        "seed_predicted_emv": (None if seed_predicted_emv is None else float(seed_predicted_emv)),
+    }
+    return snapshot_record
+
+
+def _snapshot_to_candidate_ensemble(
+    snap: dict, coords_xyz: np.ndarray, is_injector_list: list[bool]
+) -> Candidate:
+    """Build a Candidate from an ensemble snapshot record.
+
+    The Candidate dataclass was designed for per-geology selection. In ensemble
+    mode each snapshot covers all geologies, so we point the candidate's
+    geology fields at the *first* entry in ``well_config_paths_by_geology`` to
+    keep downstream code (stage.py, select.py back-compat) happy; the manifest
+    writer for ensemble mode preserves the full K-element array.
+    """
+    geo_entry = snap["well_config_paths_by_geology"][0]
+    extras = {
+        "mode": "ensemble",
+        "well_config_paths_by_geology": snap["well_config_paths_by_geology"],
+        "predicted_emv": float(snap.get("predicted_emv", snap.get("predicted_discounted_total_revenue", 0.0))),
+        "seed_source_snapshot_id": snap.get("seed_source_snapshot_id"),
+        "seed_source_iteration": snap.get("seed_source_iteration"),
+        "seed_predicted_emv": snap.get("seed_predicted_emv"),
+        "terminal_predicted_emv": snap.get("terminal_predicted_emv", snap.get("predicted_emv")),
+    }
+    return Candidate(
+        geology_index=int(geo_entry["geology_index"]),
+        geology_file=str(geo_entry["geology_file"]),
+        geology_name=str(geo_entry["geology_name"]),
+        geology_config_id=geo_entry.get("geology_config_id"),
+        geology_scenario_name=geo_entry.get("geology_scenario_name"),
+        geology_sample_num=geo_entry.get("geology_sample_num"),
+        snapshot_id=snap["snapshot_id"],
+        run_id=int(snap["run_id"]),
+        iteration=int(snap["iteration"]),
+        kind=snap["kind"],
+        predicted_revenue=float(snap.get("predicted_emv", snap.get("predicted_discounted_total_revenue", 0.0))),
+        coords_xyz=np.asarray(coords_xyz, dtype=np.float32),
+        is_injector=list(is_injector_list),
+        well_config_path=str(snap["well_config_path"]),
+        snapshot_json_path=str(snap.get("json_path", "")),
+        extras=extras,
+    )
+
+
+def write_selected_manifest_ensemble(
+    selected: list[Candidate],
+    *,
+    out_path: Path,
+    iteration: int,
+    geologies: list[GeologySpec],
+    extras: dict | None = None,
+) -> Path:
+    """Manifest writer for ensemble candidates: each candidate fans out to K
+    IX tasks via the full ``well_config_paths_by_geology`` array stashed in
+    ``c.extras``.
+    """
+    snapshots = []
+    for c in selected:
+        wcp_by_geo = c.extras.get("well_config_paths_by_geology") if c.extras else None
+        if not wcp_by_geo:
+            # Fall back to a single-entry per the candidate's recorded geology.
+            wcp_by_geo = [
+                {
+                    "geology_index": c.geology_index,
+                    "geology_name": c.geology_name,
+                    "geology_file": c.geology_file,
+                    "geology_config_id": c.geology_config_id,
+                    "geology_scenario_name": c.geology_scenario_name,
+                    "geology_sample_num": c.geology_sample_num,
+                    "well_config_path": c.well_config_path,
+                }
+            ]
+        snapshots.append({
+            "snapshot_id": c.snapshot_id,
+            "run_id": int(c.run_id),
+            "iteration": int(c.iteration),
+            "kind": c.kind,
+            "mode": "ensemble",
+            "json_path": c.snapshot_json_path,
+            "well_config_path": c.well_config_path,
+            "well_config_paths_by_geology": wcp_by_geo,
+            "predicted_discounted_total_revenue": float(c.predicted_revenue),
+            "predicted_emv": float(c.extras.get("predicted_emv", c.predicted_revenue)) if c.extras else float(c.predicted_revenue),
+            "seed_source_snapshot_id": (c.extras or {}).get("seed_source_snapshot_id"),
+            "seed_source_iteration": (c.extras or {}).get("seed_source_iteration"),
+            "seed_predicted_emv": (c.extras or {}).get("seed_predicted_emv"),
+        })
+
+    manifest = {
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "iteration": iteration,
+        "mode": "ensemble",
+        "snapshot_count": len(snapshots),
+        "snapshots": snapshots,
+        "geology_metadata": [
+            {
+                "geology_index": g.geology_index,
+                "geology_name": g.geology_name or Path(g.geology_h5_file).stem,
+                "geology_file": str(Path(g.geology_h5_file).resolve()),
+            }
+            for g in geologies
+        ],
+    }
+    if extras:
+        manifest.update(extras)
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+    return out_path
+
+
+def _run_acquisition_ensemble(
+    cfg: AcquisitionConfig,
+    *,
+    out_dir: Path,
+    iteration: int,
+    run_id_prefix: str = "al",
+) -> dict[str, Any]:
+    """Ensemble acquisition: each Adam multistart produces one well configuration
+    evaluated against all K geologies (loss = mean over K predicted revenues).
+
+    Two kinds: ``exploit`` (elite-seeded) and ``frontier`` (LHS-seeded). No
+    adversarial / CMA. Each candidate ships K IX tasks. Returns the same dict
+    shape as ``run_acquisition`` for the per-geology path.
+    """
+    out_dir = Path(out_dir)
+    well_configs_dir = out_dir / "well_configs"
+    snapshots_json_dir = out_dir / "snapshots_json"
+    well_configs_dir.mkdir(parents=True, exist_ok=True)
+    snapshots_json_dir.mkdir(parents=True, exist_ok=True)
+
+    device_str = (cfg.devices or [cfg.device])[0]
+    started = time.time()
+    timings: dict[str, float] = {}
+
+    t_ctx = time.perf_counter()
+    ctx = _build_worker_context(cfg, iteration, device_str)
+    timings["worker_ctx_load_s"] = time.perf_counter() - t_ctx
+    device = ctx.device
+    model = ctx.model
+    target_mean = ctx.target_mean
+    target_scale = ctx.target_scale
+    is_injector_list = ctx.is_injector_list
+    num_wells = ctx.num_wells
+
+    geologies = list(cfg.geologies)
+    K = len(geologies)
+    if K == 0:
+        raise RuntimeError("Ensemble acquisition requires at least one geology.")
+
+    # ----- Load every geology's static physics tensors + metadata -----
+    t0 = time.perf_counter()
+    geology_metas: dict[int, dict] = {}
+    geology_loaded: list[dict[str, Any]] = []
+    geology_paths: list[Path] = []
+    for g in geologies:
+        gp = Path(g.geology_h5_file)
+        geology_paths.append(gp)
+        with h5py.File(gp, "r") as src:
+            geology_metas[g.geology_index] = _read_geology_metadata_safe(
+                ctx.read_geology_metadata, src, g.geology_name or gp.stem
+            )
+        geology_loaded.append(_load_geology(
+            gp, ctx.norm_config,
+            ctx.PROPERTIES, ctx.PERM_PROPS, ctx.get_valid_mask, ctx.find_z_cutoff,
+        ))
+    timings["geo_load_s"] = time.perf_counter() - t0
+
+    # Intersection bounds: a coord must fit in every geology's grid. nx/ny are
+    # typically identical across geologies, but z_cutoff can vary — use the min.
+    nx = min(d["nx"] for d in geology_loaded)
+    ny = min(d["ny"] for d in geology_loaded)
+    z_max = min(d["z_max"] for d in geology_loaded)
+    x_lo, x_hi = float(cfg.edge_buffer), float(nx - 1 - cfg.edge_buffer)
+    y_lo, y_hi = float(cfg.edge_buffer), float(ny - 1 - cfg.edge_buffer)
+
+    # A column is "valid" only if it has live rock in every geology AND is
+    # inside the edge buffer. This guarantees the static-graph build can place
+    # all wells in every geology without dropping any.
+    ix_lo, ix_hi = int(np.ceil(x_lo)), int(np.floor(x_hi))
+    iy_lo, iy_hi = int(np.ceil(y_lo)), int(np.floor(y_hi))
+    has_valid_z_all = None
+    for d in geology_loaded:
+        hv = np.any(d["temp0_full"][:z_max] > -900, axis=0)  # (nx, ny) bool
+        has_valid_z_all = hv if has_valid_z_all is None else (has_valid_z_all & hv)
+    edge_window = np.zeros_like(has_valid_z_all, dtype=bool)
+    edge_window[ix_lo : ix_hi + 1, iy_lo : iy_hi + 1] = True
+    valid_xy = has_valid_z_all & edge_window
+    valid_xy_indices = np.argwhere(valid_xy)
+    if valid_xy_indices.shape[0] < num_wells:
+        raise RuntimeError(
+            f"Ensemble acquisition: only {valid_xy_indices.shape[0]} (x,y) columns "
+            f"are simultaneously valid across all {K} geologies inside the edge "
+            f"buffer {cfg.edge_buffer}; need at least {num_wells}."
+        )
+
+    def _well_xy_valid(rx_: float, ry_: float, depth_: int) -> bool:
+        ix_ = int(np.clip(int(round(rx_)), 0, nx - 1))
+        iy_ = int(np.clip(int(round(ry_)), 0, ny - 1))
+        for d in geology_loaded:
+            if not bool(np.any(d["temp0_full"][: max(1, depth_), ix_, iy_] > -900)):
+                return False
+        return True
+
+    seed_global = (cfg.seed + iteration) & ((1 << 63) - 1)
+    rng = np.random.default_rng(seed_global)
+    sampler = qmc.LatinHypercube(d=2 * num_wells, seed=seed_global)
+
+    def _project_to_valid(coords_arr: np.ndarray) -> np.ndarray:
+        used_cells: set[tuple[int, int]] = set()
+        for w in range(num_wells):
+            rx, ry = float(coords_arr[w, 0]), float(coords_arr[w, 1])
+            depth = int(min(cfg.wells[w].depth, z_max))
+            tries = 0
+            while True:
+                cell = (
+                    int(np.clip(int(round(rx)), 0, nx - 1)),
+                    int(np.clip(int(round(ry)), 0, ny - 1)),
+                )
+                if _well_xy_valid(rx, ry, depth) and cell not in used_cells:
+                    break
+                if tries >= 200:
+                    raise RuntimeError(
+                        f"Ensemble acquisition: failed to project well {w} to "
+                        f"a valid unused cell after {tries} tries"
+                    )
+                pick = valid_xy_indices[int(rng.integers(0, len(valid_xy_indices)))]
+                rx = float(pick[0])
+                ry = float(pick[1])
+                tries += 1
+            used_cells.add(cell)
+            coords_arr[w, 0] = rx
+            coords_arr[w, 1] = ry
+        return coords_arr
+
+    def _lhs_one_start() -> np.ndarray:
+        s = sampler.random(n=1)[0]
+        c = np.zeros((num_wells, 3), dtype=np.float32)
+        for w in range(num_wells):
+            c[w, 0] = x_lo + s[2 * w] * (x_hi - x_lo)
+            c[w, 1] = y_lo + s[2 * w + 1] * (y_hi - y_lo)
+            c[w, 2] = int(min(cfg.wells[w].depth, int(z_max)))
+        return _project_to_valid(c)
+
+    def _build_cfg_from_coords(coords_arr: np.ndarray) -> list[dict]:
+        return [
+            {
+                "x": float(coords_arr[w, 0]),
+                "y": float(coords_arr[w, 1]),
+                "depth": int(min(cfg.wells[w].depth, z_max)),
+                "type": cfg.wells[w].type,
+            }
+            for w in range(num_wells)
+        ]
+
+    # ----- Generate M starts (exploit first, then frontier) -----
+    t0 = time.perf_counter()
+    n_exploit = int(cfg.n_exploit)
+    n_frontier = int(cfg.n_frontier)
+    if n_exploit + n_frontier == 0:
+        raise RuntimeError(
+            "Ensemble acquisition: n_exploit + n_frontier must be > 0."
+        )
+
+    elite_triples: list[tuple[np.ndarray, str, int]] = []
+    if n_exploit > 0 and cfg.prior_metrics:
+        elite_triples = _load_elite_seeds_ensemble(
+            prior_metrics=list(cfg.prior_metrics or []),
+            k=int(cfg.elite_top_k),
+            rng=rng,
+        )
+
+    cfgs: list[list[dict]] = []
+    start_kinds: list[str] = []  # "exploit" or "frontier"
+    seed_source_ids: list[str | None] = []
+    seed_source_iters: list[int | None] = []
+
+    for i in range(n_exploit):
+        if elite_triples:
+            base, src_id, src_iter = elite_triples[i % len(elite_triples)]
+            base = base.copy()
+            noise = rng.normal(0.0, float(cfg.elite_seed_noise), size=base.shape).astype(np.float32)
+            noise[:, 2] = 0.0
+            coords_arr = (base + noise).astype(np.float32)
+            coords_arr[:, 0] = np.clip(coords_arr[:, 0], x_lo, x_hi)
+            coords_arr[:, 1] = np.clip(coords_arr[:, 1], y_lo, y_hi)
+            for w in range(num_wells):
+                coords_arr[w, 2] = int(min(cfg.wells[w].depth, int(z_max)))
+            coords_arr = _project_to_valid(coords_arr)
+            seed_source_ids.append(src_id)
+            seed_source_iters.append(src_iter)
+        else:
+            # Cold start: fall back to LHS but still mark this as kind=exploit
+            # so the cohort comparison stays uniform. seed source stays None.
+            coords_arr = _lhs_one_start()
+            seed_source_ids.append(None)
+            seed_source_iters.append(None)
+        cfgs.append(_build_cfg_from_coords(coords_arr))
+        start_kinds.append("exploit")
+
+    for _ in range(n_frontier):
+        coords_arr = _lhs_one_start()
+        cfgs.append(_build_cfg_from_coords(coords_arr))
+        start_kinds.append("frontier")
+        seed_source_ids.append(None)
+        seed_source_iters.append(None)
+
+    M = len(cfgs)
+    timings["seed_gen_s"] = time.perf_counter() - t0
+    timings["n_exploit"] = int(n_exploit)
+    timings["n_frontier"] = int(n_frontier)
+
+    # ----- Build K static-graph batches (one per geology), each size M -----
+    t0 = time.perf_counter()
+    batches: list[Any] = []
+    for g, d in zip(geologies, geology_loaded):
+        static_graphs = _build_static_batch_for_starts(
+            cfgs, Path(g.geology_h5_file), d["physics_dict"], d["full_shape"],
+            d["z_cutoff"], d["nx"], d["ny"],
+            cfg.revenue_target, ctx.scaler,
+            ctx.extract_well_data, ctx.build_wells_table, ctx.extract_vertical_profiles,
+            ctx.build_single_hetero_data, d["temp0_full"],
+            node_encoder=ctx.node_encoder, enrich_global_attr=ctx.enrich_global_attr,
+        )
+        batches.append(Batch.from_data_list(static_graphs).to(device))
+    timings["graph_build_s"] = time.perf_counter() - t0
+
+    starts = [
+        [[w["x"], w["y"], float(w["depth"])] for w in c] for c in cfgs
+    ]
+    coords = torch.tensor(starts, dtype=torch.float32, device=device)
+    coords.requires_grad = True
+    optimizer = optim.Adam([coords], lr=cfg.learning_rate)
+    last_valid_coords = coords.detach().clone()
+
+    def _predict_all_geos(c: torch.Tensor) -> torch.Tensor:
+        """Forward the same M coords through all K geology batches.
+
+        Returns a (M, K) tensor of *unscaled* predicted revenue.
+        """
+        cv = c.view(-1, 3)
+        cols: list[torch.Tensor] = []
+        for bd in batches:
+            bd["well"].pos_xyz = cv
+            pred_scaled = model(bd).view(M)
+            cols.append(pred_scaled * target_scale + target_mean)
+        return torch.stack(cols, dim=1)  # (M, K)
+
+    # Pre-step seed forward to capture seed_predicted_emv per candidate.
+    t0 = time.perf_counter()
+    with torch.no_grad():
+        preds_seed = _predict_all_geos(coords).detach().cpu().numpy()  # (M, K)
+    seed_predicted_emv = preds_seed.mean(axis=1).astype(float)
+    timings["seed_forward_s"] = time.perf_counter() - t0
+
+    # ----- Adam loop (k_safe steps, mean-over-K loss) -----
+    t0 = time.perf_counter()
+    for step in range(1, int(cfg.k_safe) + 1):
+        optimizer.zero_grad()
+        preds = _predict_all_geos(coords)
+        loss = -preds.mean(dim=1).sum()
+        loss.backward()
+
+        with torch.no_grad():
+            grads = coords.grad
+            if not torch.isfinite(grads).all():
+                torch.nan_to_num_(grads, nan=0.0, posinf=0.0, neginf=0.0)
+            for d, max_val in enumerate([nx - 1, ny - 1, z_max - 1]):
+                mask_lo = (coords[:, :, d] <= 1e-4) & (grads[:, :, d] > 0)
+                mask_hi = (coords[:, :, d] >= max_val - 1e-4) & (grads[:, :, d] < 0)
+                mask = mask_lo | mask_hi
+                if mask.any():
+                    grads[..., d][mask] = 0.0
+                    st = optimizer.state.get(coords, {})
+                    if "exp_avg" in st:
+                        st["exp_avg"][..., d][mask] = 0.0
+        optimizer.step()
+        with torch.no_grad():
+            if not torch.isfinite(coords).all():
+                bad = ~torch.isfinite(coords)
+                coords[bad] = last_valid_coords[bad]
+                st = optimizer.state.get(coords, {})
+                for key in ("exp_avg", "exp_avg_sq"):
+                    if key in st and not torch.isfinite(st[key]).all():
+                        torch.nan_to_num_(st[key], nan=0.0, posinf=0.0, neginf=0.0)
+            coords[:, :, 0].clamp_(0, nx - 1)
+            coords[:, :, 1].clamp_(0, ny - 1)
+            coords[:, :, 2].clamp_(0, z_max - 1)
+            last_valid_coords.copy_(coords)
+    timings["adam_loop_s"] = time.perf_counter() - t0
+
+    # ----- Terminal forward + snapshot emit -----
+    t0 = time.perf_counter()
+    with torch.no_grad():
+        preds_final = _predict_all_geos(coords).detach().cpu().numpy()  # (M, K)
+    terminal_predicted_emv = preds_final.mean(axis=1).astype(float)
+
+    snapshots: list[dict[str, Any]] = []
+    candidates: list[Candidate] = []
+    for m in range(M):
+        cxyz = coords[m].detach().cpu().numpy()
+        if not np.isfinite(cxyz).all() or not np.isfinite(preds_final[m]).all():
+            print(f"[acquire-ensemble] skip non-finite snapshot m={m} kind={start_kinds[m]}", flush=True)
+            continue
+        predictions_by_geology = []
+        for k_idx, g in enumerate(geologies):
+            meta = geology_metas.get(g.geology_index, {})
+            predictions_by_geology.append({
+                "geology_index": g.geology_index,
+                "geology_name": g.geology_name or Path(g.geology_h5_file).stem,
+                "geology_file": str(Path(g.geology_h5_file).resolve()),
+                "geology_config_id": meta.get("geology_config_id"),
+                "geology_scenario_name": meta.get("scenario_name"),
+                "geology_sample_num": meta.get("sample_num"),
+                "discounted_total_revenue": float(preds_final[m, k_idx]),
+                # The surrogate's current head predicts revenue only. Use NaN
+                # rather than a hard-coded 0 so any downstream consumer (Julia
+                # task CSV, plotting) doesn't average a placeholder zero into a
+                # real metric.
+                "total_energy_production": float("nan"),
+            })
+        snap = _emit_snapshot_ensemble(
+            run_id=m,
+            iteration_step=int(cfg.k_safe),
+            kind=start_kinds[m],
+            coords_xyz=cxyz,
+            is_injector_list=is_injector_list,
+            predictions_by_geology=predictions_by_geology,
+            predicted_emv=float(terminal_predicted_emv[m]),
+            seed_source_snapshot_id=seed_source_ids[m],
+            seed_source_iteration=seed_source_iters[m],
+            seed_predicted_emv=float(seed_predicted_emv[m]),
+            geologies=geologies,
+            geology_metas=geology_metas,
+            well_configs_dir=well_configs_dir,
+            snapshots_json_dir=snapshots_json_dir,
+            to_julia_wells_text=ctx.to_julia_wells_text,
+        )
+        snapshots.append(snap)
+        candidates.append(
+            _snapshot_to_candidate_ensemble(snap, cxyz, is_injector_list)
+        )
+    timings["snapshot_io_s"] = time.perf_counter() - t0
+
+    # ----- Profiling CSV (single row in ensemble mode) -----
+    profiling_dir = out_dir / "profiling"
+    profiling_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = profiling_dir / f"gpu_timings_iter_{iteration:04d}.csv"
+    row = {"device": device_str, "geology_index": "ALL", **timings}
+    col_order = ["device", "geology_index"] + [k for k in sorted(row.keys()) if k not in ("device", "geology_index")]
+    with open(csv_path, "w") as f:
+        f.write(",".join(col_order) + "\n")
+        f.write(",".join(str(row.get(k, "")) for k in col_order) + "\n")
+
+    manifest = {
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "iteration": iteration,
+        "run_id_prefix": run_id_prefix,
+        "mode": "ensemble",
+        "k_safe": cfg.k_safe,
+        "n_exploit": cfg.n_exploit,
+        "n_frontier": cfg.n_frontier,
+        "geology_metadata": [
+            {
+                "geology_index": g.geology_index,
+                "geology_name": g.geology_name or Path(g.geology_h5_file).stem,
+                "geology_file": str(Path(g.geology_h5_file).resolve()),
+            }
+            for g in geologies
+        ],
+        "snapshot_count": len(snapshots),
+        "snapshots": snapshots,
+        "wallclock_seconds": time.time() - started,
+    }
+    manifest_path = out_dir / "manifest.json"
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+
+    return {"manifest": manifest, "manifest_path": str(manifest_path), "candidates": candidates}

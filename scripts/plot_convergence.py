@@ -1590,6 +1590,365 @@ def plot_wallclock_breakdown(history: list[dict], out_dir: Path) -> None:
 
 
 # -----------------------------------------------------------------------------
+# Ensemble-mode EMV plots
+# -----------------------------------------------------------------------------
+
+
+def _per_iter_emv_by_kind(rows: list[dict]) -> dict[int, dict[str, list[float]]]:
+    """Group rows by (iteration, kind) and compute per-candidate EMV.
+
+    Returns a nested dict {iter: {kind: [emv, ...]}}. EMV per candidate is the
+    mean of real_revenue across all rows sharing the same snapshot_id within an
+    iteration. Iterations without any multi-row snapshots are skipped (those
+    are per-geology iterations and don't have an EMV interpretation).
+    """
+    by_iter_snap: dict[int, dict[str, list[dict]]] = {}
+    for r in rows:
+        it = int(r.get("iteration", -1))
+        sid = r.get("snapshot_id")
+        if it < 0 or not sid:
+            continue
+        by_iter_snap.setdefault(it, {}).setdefault(str(sid), []).append(r)
+    out: dict[int, dict[str, list[float]]] = {}
+    for it, snap_map in by_iter_snap.items():
+        any_multi = any(len(rs) > 1 for rs in snap_map.values())
+        if not any_multi:
+            continue
+        kind_to_emvs: dict[str, list[float]] = {}
+        for sid, rs in snap_map.items():
+            reals = [float(r.get("real_revenue", float("nan"))) for r in rs]
+            reals = [v for v in reals if np.isfinite(v)]
+            if not reals:
+                continue
+            emv = float(np.mean(reals))
+            kind = str(rs[0].get("kind", "frontier"))
+            kind_to_emvs.setdefault(kind, []).append(emv)
+        if kind_to_emvs:
+            out[it] = kind_to_emvs
+    return out
+
+
+def plot_emv_distribution(history: list[dict], rows: list[dict], out_dir: Path) -> None:
+    """Per-iteration violin of per-candidate real EMV, split by kind."""
+    grouped = _per_iter_emv_by_kind(rows)
+    if not grouped:
+        # No ensemble iterations yet; render a placeholder so the dashboard
+        # doesn't silently miss the plot.
+        fig, ax = plt.subplots(figsize=(8, 4))
+        _style_ax(ax)
+        ax.text(0.5, 0.5, "No ensemble-mode iterations yet", ha="center", va="center", color=MANIM_GREY)
+        ax.set_axis_off()
+        _save(fig, out_dir / "emv_distribution.png")
+        return
+
+    iters_sorted = sorted(grouped.keys())
+    fig, ax = plt.subplots(figsize=(max(8, 0.6 * len(iters_sorted) + 4), 5))
+    _style_ax(ax)
+    for kind, color in KIND_COLORS.items():
+        offset = KIND_OFFSETS.get(kind, 0.0)
+        positions = []
+        data = []
+        for it in iters_sorted:
+            vals = grouped[it].get(kind, [])
+            if not vals:
+                continue
+            positions.append(it + offset)
+            data.append(vals)
+        if not data:
+            continue
+        # Scatter for visibility on small cohorts; violins when ≥4 points.
+        for pos, vals in zip(positions, data):
+            seed = abs(int(pos * 100)) % (2**32 - 1)
+            jitter = (np.random.RandomState(seed).rand(len(vals)) - 0.5) * 0.08
+            ax.scatter(np.full(len(vals), pos) + jitter, vals,
+                       s=18, color=color, alpha=0.7, edgecolor="none", label=None)
+        violin_data = [d for d in data if len(d) >= 4]
+        violin_pos = [p for p, d in zip(positions, data) if len(d) >= 4]
+        if violin_data:
+            parts = ax.violinplot(violin_data, positions=violin_pos, widths=0.18,
+                                   showmedians=True, showextrema=False)
+            for pc in parts["bodies"]:
+                pc.set_facecolor(color)
+                pc.set_edgecolor(color)
+                pc.set_alpha(0.35)
+            if "cmedians" in parts:
+                parts["cmedians"].set_color(color)
+        ax.plot([], [], color=color, marker="o", linestyle="None", label=kind)
+
+    # Best-EMV-so-far overlay.
+    best_emv_iters = [int(r["iteration"]) for r in history if r.get("best_emv_so_far") is not None]
+    best_emv_vals = [float(r["best_emv_so_far"]) for r in history if r.get("best_emv_so_far") is not None]
+    if best_emv_iters:
+        ax.plot(best_emv_iters, best_emv_vals, color=MANIM_WHITE, linewidth=1.5,
+                label="best EMV so far")
+
+    ax.set_xticks(iters_sorted)
+    ax.set_xlabel("AL iteration")
+    ax.set_ylabel("Real EMV (mean discounted revenue across ensemble)")
+    ax.set_title("Per-candidate real EMV distribution, by kind")
+    ax.legend(loc="upper left", ncol=2)
+    _save(fig, out_dir / "emv_distribution.png")
+
+
+def plot_best_emv_so_far(history: list[dict], out_dir: Path) -> None:
+    """Single line: running best real EMV across iterations."""
+    iters = [int(r["iteration"]) for r in history if r.get("best_emv_so_far") is not None]
+    vals = [float(r["best_emv_so_far"]) for r in history if r.get("best_emv_so_far") is not None]
+    fig, ax = plt.subplots(figsize=(8, 4))
+    _style_ax(ax)
+    if not iters:
+        ax.text(0.5, 0.5, "No ensemble-mode iterations yet", ha="center", va="center", color=MANIM_GREY)
+        ax.set_axis_off()
+        _save(fig, out_dir / "best_emv_so_far.png")
+        return
+    ax.plot(iters, vals, color=MANIM_BLUE, marker="o", linewidth=2.0, markersize=6)
+    # In-batch best per iter as a dimmer trace, for context on volatility.
+    in_batch_iters = [int(r["iteration"]) for r in history if r.get("best_emv_in_batch") is not None]
+    in_batch_vals = [float(r["best_emv_in_batch"]) for r in history if r.get("best_emv_in_batch") is not None]
+    if in_batch_iters:
+        ax.plot(in_batch_iters, in_batch_vals, color=MANIM_ORANGE, marker="x",
+                linewidth=1.0, alpha=0.7, label="best EMV in batch")
+        ax.legend(loc="lower right")
+    ax.set_xlabel("AL iteration")
+    ax.set_ylabel("Real EMV")
+    ax.set_title("Best ensemble EMV (running)")
+    _save(fig, out_dir / "best_emv_so_far.png")
+
+
+def _exploit_seed_rows(rows: list[dict]) -> list[dict]:
+    """Collapse multi-geo rows of each exploit candidate into one row per snapshot.
+
+    Returns dicts with keys: iteration, snapshot_id, seed_predicted_emv,
+    terminal_predicted_emv, seed_real_emv, terminal_real_emv.
+    """
+    by_iter_snap: dict[tuple[int, str], list[dict]] = {}
+    for r in rows:
+        if str(r.get("kind", "")) != "exploit":
+            continue
+        sid = r.get("snapshot_id")
+        if not sid:
+            continue
+        by_iter_snap.setdefault((int(r["iteration"]), str(sid)), []).append(r)
+
+    out: list[dict] = []
+    for (it, sid), rs in by_iter_snap.items():
+        # All K rows of one snapshot share the same predicted/terminal EMV and
+        # the same seed_source pointer.
+        first = rs[0]
+        seed_pred = first.get("seed_predicted_emv")
+        term_pred = first.get("terminal_predicted_emv")
+        seed_real = first.get("seed_real_emv")
+        reals = [float(r.get("real_revenue", float("nan"))) for r in rs]
+        reals = [v for v in reals if np.isfinite(v)]
+        term_real = float(np.mean(reals)) if reals else None
+        out.append({
+            "iteration": it,
+            "snapshot_id": sid,
+            "seed_predicted_emv": seed_pred,
+            "terminal_predicted_emv": term_pred,
+            "seed_real_emv": seed_real,
+            "terminal_real_emv": term_real,
+            "seed_source_snapshot_id": first.get("seed_source_snapshot_id"),
+        })
+    return out
+
+
+def _scatter_seed_vs_terminal(
+    pts: list[tuple[int, float, float]],
+    out_path: Path,
+    *,
+    title: str,
+    xlabel: str,
+    ylabel: str,
+) -> None:
+    """Helper for the two seed-vs-terminal scatters. ``pts`` is [(iter, x, y), ...]."""
+    fig, ax = plt.subplots(figsize=(6.5, 6))
+    _style_ax(ax)
+    if not pts:
+        ax.text(0.5, 0.5, "No exploit-with-seed candidates yet",
+                ha="center", va="center", color=MANIM_GREY)
+        ax.set_axis_off()
+        _save(fig, out_path)
+        return
+
+    iters_arr = np.array([p[0] for p in pts])
+    xs = np.array([p[1] for p in pts])
+    ys = np.array([p[2] for p in pts])
+    scat = ax.scatter(xs, ys, c=iters_arr, cmap="viridis", s=42, alpha=0.85,
+                      edgecolor=MANIM_WHITE, linewidth=0.3)
+    cbar = fig.colorbar(scat, ax=ax, label="iteration", fraction=0.04, pad=0.04)
+    cbar.ax.yaxis.label.set_color(MANIM_WHITE)
+    cbar.ax.tick_params(colors=MANIM_WHITE)
+
+    lo = float(min(xs.min(), ys.min()))
+    hi = float(max(xs.max(), ys.max()))
+    span = hi - lo
+    pad = 0.02 * span if span > 0 else 1.0
+    ax.plot([lo - pad, hi + pad], [lo - pad, hi + pad],
+            color=MANIM_GREY, linestyle="--", linewidth=1.0, label="y = x")
+    ax.set_xlim(lo - pad, hi + pad)
+    ax.set_ylim(lo - pad, hi + pad)
+
+    above = int(np.sum(ys > xs))
+    total = len(pts)
+    frac = above / total if total else 0.0
+    ax.text(0.02, 0.98,
+            f"{above}/{total} ({100 * frac:.0f}%) above y=x",
+            transform=ax.transAxes, va="top", ha="left", color=MANIM_WHITE,
+            bbox=dict(facecolor="#111111", edgecolor=MANIM_GREY, alpha=0.8))
+
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.legend(loc="lower right")
+    _save(fig, out_path)
+
+
+def plot_exploit_seed_vs_terminal_predicted(rows: list[dict], out_dir: Path) -> None:
+    """Per-seed scatter: predicted EMV at step 0 vs at step k_safe."""
+    pts: list[tuple[int, float, float]] = []
+    for r in _exploit_seed_rows(rows):
+        s = r["seed_predicted_emv"]
+        t = r["terminal_predicted_emv"]
+        if s is None or t is None or not (np.isfinite(s) and np.isfinite(t)):
+            continue
+        pts.append((int(r["iteration"]), float(s), float(t)))
+    _scatter_seed_vs_terminal(
+        pts,
+        out_dir / "exploit_seed_vs_terminal_predicted.png",
+        title="Exploit: predicted EMV at seed vs after Adam",
+        xlabel="Seed predicted EMV (step 0)",
+        ylabel="Terminal predicted EMV (step k_safe)",
+    )
+
+
+def plot_exploit_seed_vs_terminal_real(rows: list[dict], out_dir: Path) -> None:
+    """Per-seed scatter: real EMV of the prior elite seed vs IX-evaluated terminal EMV."""
+    pts: list[tuple[int, float, float]] = []
+    for r in _exploit_seed_rows(rows):
+        s = r["seed_real_emv"]
+        t = r["terminal_real_emv"]
+        if s is None or t is None or not (np.isfinite(s) and np.isfinite(t)):
+            continue
+        pts.append((int(r["iteration"]), float(s), float(t)))
+    _scatter_seed_vs_terminal(
+        pts,
+        out_dir / "exploit_seed_vs_terminal_real.png",
+        title="Exploit: real EMV of seed vs IX-evaluated terminal",
+        xlabel="Seed real EMV (prior iter)",
+        ylabel="Terminal real EMV (this iter, mean over K geos)",
+    )
+
+
+def plot_exploit_emv_progression(history: list[dict], out_dir: Path) -> None:
+    """Per-iter exploit_best_emv vs running best_emv_so_far."""
+    fig, ax = plt.subplots(figsize=(8, 4))
+    _style_ax(ax)
+    iters_ex = [int(r["iteration"]) for r in history if r.get("exploit_best_emv") is not None]
+    vals_ex = [float(r["exploit_best_emv"]) for r in history if r.get("exploit_best_emv") is not None]
+    iters_bo = [int(r["iteration"]) for r in history if r.get("best_emv_so_far") is not None]
+    vals_bo = [float(r["best_emv_so_far"]) for r in history if r.get("best_emv_so_far") is not None]
+    if not iters_ex and not iters_bo:
+        ax.text(0.5, 0.5, "No ensemble-mode iterations yet",
+                ha="center", va="center", color=MANIM_GREY)
+        ax.set_axis_off()
+        _save(fig, out_dir / "exploit_emv_progression.png")
+        return
+    if iters_bo:
+        ax.plot(iters_bo, vals_bo, color=MANIM_WHITE, linewidth=1.5,
+                label="best EMV so far (any kind)")
+    if iters_ex:
+        ax.plot(iters_ex, vals_ex, color=MANIM_GREEN, marker="o", linewidth=1.5,
+                label="best exploit EMV this iter")
+    ax.set_xlabel("AL iteration")
+    ax.set_ylabel("Real EMV")
+    ax.set_title("Exploit cohort EMV progression vs running best")
+    ax.legend(loc="lower right")
+    _save(fig, out_dir / "exploit_emv_progression.png")
+
+
+def plot_exploit_per_geology_progression(history: list[dict], out_dir: Path) -> None:
+    """Per-geology facets: exploit's best per-geo revenue vs running per-geo best."""
+    # Collect the set of geology indices that appear in any history record.
+    geo_set: set[str] = set()
+    for r in history:
+        pg = r.get("per_geology") or {}
+        geo_set.update(pg.keys())
+        ebpg = r.get("exploit_best_per_geology") or {}
+        geo_set.update(ebpg.keys())
+    if not geo_set:
+        fig, ax = plt.subplots(figsize=(8, 4))
+        _style_ax(ax)
+        ax.text(0.5, 0.5, "No ensemble-mode iterations yet",
+                ha="center", va="center", color=MANIM_GREY)
+        ax.set_axis_off()
+        _save(fig, out_dir / "exploit_per_geology_progression.png")
+        return
+    geos = sorted(geo_set, key=lambda s: int(s))
+
+    n = len(geos)
+    cols = int(np.ceil(np.sqrt(n)))
+    rows_n = int(np.ceil(n / cols))
+    fig, axes = plt.subplots(rows_n, cols,
+                             figsize=(3.2 * cols, 2.6 * rows_n),
+                             squeeze=False)
+
+    # Pre-compute running per-geo best (all kinds) for overlay.
+    running_best: dict[str, list[tuple[int, float]]] = {g: [] for g in geos}
+    cur_best: dict[str, float] = {}
+    for rec in history:
+        it = int(rec["iteration"])
+        pg = rec.get("per_geology") or {}
+        for g in geos:
+            entry = pg.get(g)
+            if not entry:
+                continue
+            mr = entry.get("max_real_revenue")
+            if mr is None or not np.isfinite(mr):
+                continue
+            prev = cur_best.get(g)
+            cur_best[g] = float(mr) if prev is None else max(prev, float(mr))
+            running_best[g].append((it, cur_best[g]))
+
+    any_exploit = False
+    for ax, g in zip(axes.flat, geos):
+        _style_ax(ax)
+        # Running per-geo best (all kinds) — context.
+        pts = running_best.get(g, [])
+        if pts:
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            ax.plot(xs, ys, color=MANIM_WHITE, linewidth=1.2, alpha=0.7,
+                    label="best (any kind)")
+        # Exploit per-iter best for this geo — main signal.
+        ex_xs: list[int] = []
+        ex_ys: list[float] = []
+        for rec in history:
+            ebpg = rec.get("exploit_best_per_geology") or {}
+            v = ebpg.get(g)
+            if v is None or not np.isfinite(v):
+                continue
+            ex_xs.append(int(rec["iteration"]))
+            ex_ys.append(float(v))
+            any_exploit = True
+        if ex_xs:
+            ax.plot(ex_xs, ex_ys, color=MANIM_GREEN, marker="o",
+                    linewidth=1.2, label="exploit")
+        ax.set_title(f"geo {g}", fontsize=10)
+        ax.tick_params(labelsize=8)
+    # Hide any unused axes.
+    for ax in axes.flat[len(geos):]:
+        ax.set_axis_off()
+    # Single legend at figure level.
+    handles, labels = axes.flat[0].get_legend_handles_labels()
+    if handles:
+        fig.legend(handles, labels, loc="upper center", ncol=2,
+                   bbox_to_anchor=(0.5, 1.02))
+    fig.suptitle("Exploit per-geology progression", color=MANIM_WHITE, y=1.04)
+    _save(fig, out_dir / "exploit_per_geology_progression.png")
+
+
+# -----------------------------------------------------------------------------
 # Entry
 # -----------------------------------------------------------------------------
 
@@ -1643,6 +2002,15 @@ def main() -> int:
     plot_well_position_heatmaps_by_kind(well_rows, out_dir)
     plot_well_position_heatmaps_over_iters(well_rows, out_dir)
     plot_best_well_config(args.run_root, well_rows, out_dir)
+
+    # Ensemble-mode EMV plots (guarded: produce a placeholder PNG if no
+    # ensemble iterations are present in this run).
+    plot_emv_distribution(history, rows, out_dir)
+    plot_best_emv_so_far(history, out_dir)
+    plot_exploit_seed_vs_terminal_predicted(rows, out_dir)
+    plot_exploit_seed_vs_terminal_real(rows, out_dir)
+    plot_exploit_emv_progression(history, out_dir)
+    plot_exploit_per_geology_progression(history, out_dir)
 
     print(f"\nDone. {len(history)} iteration(s), {len(rows)} candidate rows. Plots in {out_dir}")
     return 0

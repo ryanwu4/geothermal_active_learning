@@ -26,11 +26,12 @@ from orchestrator.acquire import (
     WellSpec,
     run_acquisition,
     write_selected_manifest,
+    write_selected_manifest_ensemble,
 )
 from orchestrator.log import init_run
 from orchestrator.paths import resolve_run_paths
 from orchestrator.retrain import _find_best_checkpoint, run_train, should_train_from_scratch
-from orchestrator.select import select_batch
+from orchestrator.select import select_batch, select_batch_ensemble
 from orchestrator.slurm import submit_sbatch, write_rendered
 from orchestrator.stage import stage_iteration
 from orchestrator.state import IterationRecord, RunState
@@ -211,6 +212,7 @@ def main() -> int:
         if p.exists():
             prior_metrics.append(p)
 
+    mode = str(acq_cfg.get("mode", "per_geology"))
     acq = AcquisitionConfig(
         surrogate_repo=surrogate_repo,
         checkpoint_path=Path(state.current_checkpoint),
@@ -218,10 +220,11 @@ def main() -> int:
         norm_config_path=norm_config_path,
         geologies=geologies,
         wells=wells,
-        n_starts_per_geology=int(acq_cfg["n_starts_per_geology"]),
+        # Per-geology knobs (still required by the dataclass; ignored in ensemble mode).
+        n_starts_per_geology=int(acq_cfg.get("n_starts_per_geology", 0)),
         k_safe=int(acq_cfg["k_safe"]),
-        k_adv=int(acq_cfg["k_adv"]),
-        adv_fraction=float(acq_cfg["adv_fraction"]),
+        k_adv=int(acq_cfg.get("k_adv", acq_cfg["k_safe"])),
+        adv_fraction=float(acq_cfg.get("adv_fraction", 0.0)),
         edge_buffer=int(acq_cfg.get("edge_buffer", 10)),
         learning_rate=float(acq_cfg.get("lr", 0.5)),
         log_every_n_steps=int(acq_cfg.get("log_every_n_steps", 25)),
@@ -237,6 +240,9 @@ def main() -> int:
         cma_generations=int(acq_cfg.get("cma_generations", 10)),
         cma_sigma_init=float(acq_cfg.get("cma_sigma_init", 5.0)),
         prior_metrics=prior_metrics,
+        mode=mode,
+        n_exploit=int(acq_cfg.get("n_exploit", 0)),
+        n_frontier=int(acq_cfg.get("n_frontier", 0)),
     )
     acq_started = time.time()
     acq_result = run_acquisition(
@@ -246,39 +252,54 @@ def main() -> int:
     print(f"Acquired {len(acq_result['candidates'])} raw candidates in {acq_elapsed_min:.2f} min")
 
     # ----- Step 3: select batch -----
-    # 4-kind mode if any of the new fraction keys are present; otherwise
-    # fall back to the legacy frontier/adversarial split.
-    kind_fraction_keys = ("frontier_fraction", "adversarial_fraction", "exploit_fraction", "cma_fraction")
-    has_kind_fractions = any(
-        k in sel_cfg for k in kind_fraction_keys if k != "frontier_fraction"
-    )
-    if has_kind_fractions:
-        kind_fractions = {
-            k.replace("_fraction", ""): float(sel_cfg[k])
-            for k in kind_fraction_keys
-            if k in sel_cfg
-        }
-        selected = select_batch(
-            acq_result["candidates"],
-            batch_size=int(sel_cfg["batch_size"]),
-            kind_fractions=kind_fractions,
-        )
+    if mode == "ensemble":
+        # Each candidate already represents a full ensemble configuration; rank
+        # by predicted EMV. The selection cap is optional in ensemble mode.
+        cap = int(sel_cfg.get("batch_size", 0)) or None
+        selected = select_batch_ensemble(acq_result["candidates"], batch_size=cap)
     else:
-        selected = select_batch(
-            acq_result["candidates"],
-            batch_size=int(sel_cfg["batch_size"]),
-            frontier_fraction=float(sel_cfg.get("frontier_fraction", 0.85)),
+        # 4-kind mode if any of the new fraction keys are present; otherwise
+        # fall back to the legacy frontier/adversarial split.
+        kind_fraction_keys = ("frontier_fraction", "adversarial_fraction", "exploit_fraction", "cma_fraction")
+        has_kind_fractions = any(
+            k in sel_cfg for k in kind_fraction_keys if k != "frontier_fraction"
         )
+        if has_kind_fractions:
+            kind_fractions = {
+                k.replace("_fraction", ""): float(sel_cfg[k])
+                for k in kind_fraction_keys
+                if k in sel_cfg
+            }
+            selected = select_batch(
+                acq_result["candidates"],
+                batch_size=int(sel_cfg["batch_size"]),
+                kind_fractions=kind_fractions,
+            )
+        else:
+            selected = select_batch(
+                acq_result["candidates"],
+                batch_size=int(sel_cfg["batch_size"]),
+                frontier_fraction=float(sel_cfg.get("frontier_fraction", 0.85)),
+            )
     print(f"Selected {len(selected)} candidates for IX submission")
 
     selected_manifest = paths.iter_manifest(state.iteration)
-    write_selected_manifest(
-        selected,
-        out_path=selected_manifest,
-        iteration=state.iteration,
-        geologies=geologies,
-        extras={"selection": sel_cfg},
-    )
+    if mode == "ensemble":
+        write_selected_manifest_ensemble(
+            selected,
+            out_path=selected_manifest,
+            iteration=state.iteration,
+            geologies=geologies,
+            extras={"selection": sel_cfg},
+        )
+    else:
+        write_selected_manifest(
+            selected,
+            out_path=selected_manifest,
+            iteration=state.iteration,
+            geologies=geologies,
+            extras={"selection": sel_cfg},
+        )
 
     # ----- Step 4: stage IX array via Julia -----
     stage_result = stage_iteration(

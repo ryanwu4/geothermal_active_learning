@@ -47,6 +47,15 @@ class CandidateMetric:
     # Floored APE: abs(pred-real) / max(abs(real), denom_floor). The denom floor
     # prevents geo-8-style "MAPE blows up because true revenue is small" artifacts.
     abs_pct_error_floored: float = float("nan")
+    # Ensemble-mode seed/terminal tracking. None on per-geology rows. The
+    # acquisition writes the predicted half; ingest populates the real half by
+    # looking up the prior iter's per_candidate_emv for the seed snapshot.
+    seed_source_snapshot_id: str | None = None
+    seed_source_iteration: int | None = None
+    seed_predicted_emv: float | None = None
+    terminal_predicted_emv: float | None = None
+    seed_real_emv: float | None = None
+    terminal_real_emv: float | None = None
 
 
 @dataclass
@@ -81,6 +90,12 @@ class IngestMetrics:
     n_failed_per_status: int = 0
     n_succeeded_but_missing_h5: int = 0
     n_missing_silently: int = 0
+    # Ensemble-mode aggregates (None on per-geology iterations).
+    per_candidate_emv: dict[str, float] | None = None
+    best_emv_in_batch: float | None = None
+    best_emv_so_far: float | None = None
+    exploit_best_emv: float | None = None
+    exploit_best_per_geology: dict[str, float] | None = None
 
 
 def _link_ix_outputs_to_archive(ix_output_dir: Path, archive_dir: Path) -> list[Path]:
@@ -192,6 +207,8 @@ def ingest_iteration(
     next_compiled_h5: Path,
     log_path: Path | None = None,
     prior_best_revenue: float | None = None,
+    prior_best_emv: float | None = None,
+    prior_per_candidate_emv_by_iter: dict[int, dict[str, float]] | None = None,
     workers: int = 4,
 ) -> IngestMetrics:
     """Run the full ingest pipeline for one iteration; return metrics."""
@@ -271,16 +288,33 @@ def ingest_iteration(
         predicted = float(task.get("predicted_discounted_total_revenue", float("nan")))
 
         # Pull `kind` from the snapshot JSON the orchestrator wrote during
-        # acquisition (the task JSON itself doesn't carry it).
+        # acquisition (the task JSON itself doesn't carry it). Ensemble mode
+        # also stores seed metadata inside the snapshot JSON which we surface
+        # onto each CandidateMetric row.
         kind = "frontier"
+        seed_source_snapshot_id: str | None = None
+        seed_source_iteration: int | None = None
+        seed_predicted_emv: float | None = None
+        terminal_predicted_emv: float | None = None
         snap_json = task.get("snapshot_json_path", "")
         if snap_json:
             try:
                 with open(snap_json, "r") as f:
                     payload = json.load(f)
                 kind = payload.get("kind", kind)
-            except Exception:
-                pass
+                seed_source_snapshot_id = payload.get("seed_source_snapshot_id")
+                _ssi = payload.get("seed_source_iteration")
+                seed_source_iteration = int(_ssi) if _ssi is not None else None
+                _spe = payload.get("seed_predicted_emv")
+                seed_predicted_emv = float(_spe) if _spe is not None and np.isfinite(_spe) else None
+                _tpe = payload.get("terminal_predicted_emv", payload.get("predicted_emv"))
+                terminal_predicted_emv = float(_tpe) if _tpe is not None and np.isfinite(_tpe) else None
+            except Exception as e:
+                # In ensemble mode this is the only place seed/terminal metadata
+                # lands on each row; silently swallowing the parse failure means
+                # the seed-vs-terminal scatters lose data with no audit trail.
+                print(f"[ingest] WARN: failed to parse snapshot JSON {snap_json}: {e}",
+                      flush=True)
 
         if real == 0 or not np.isfinite(predicted) or not np.isfinite(real):
             abs_pct = float("nan")
@@ -303,6 +337,10 @@ def ingest_iteration(
             abs_pct_error=float(abs_pct),
             signed_pct_error=float(signed_pct),
             abs_error=float(abs_err),
+            seed_source_snapshot_id=seed_source_snapshot_id,
+            seed_source_iteration=seed_source_iteration,
+            seed_predicted_emv=seed_predicted_emv,
+            terminal_predicted_emv=terminal_predicted_emv,
         ))
 
     completion_rate = (n_completed / n_submitted) if n_submitted > 0 else 0.0
@@ -379,6 +417,76 @@ def ingest_iteration(
     else:
         best_so_far = max(prior_best_revenue, best_in_batch)
 
+    # ----- Ensemble-mode aggregates -----
+    # Group candidate rows by snapshot_id; if a snapshot appears in >1 row (one
+    # per geology), this is an ensemble-mode iteration and we compute its real
+    # EMV as the mean across rows. Per-geology iterations have exactly one row
+    # per snapshot, so this path harmlessly produces a 1-element mean — but we
+    # still want the structure populated for downstream plots.
+    grouped_by_snap: dict[str, list[CandidateMetric]] = {}
+    for c in candidates:
+        if c.snapshot_id:
+            grouped_by_snap.setdefault(c.snapshot_id, []).append(c)
+    per_candidate_emv: dict[str, float] = {}
+    for sid, rows in grouped_by_snap.items():
+        reals = [r.real_revenue for r in rows if np.isfinite(r.real_revenue)]
+        if reals:
+            per_candidate_emv[sid] = float(np.mean(reals))
+
+    # Stamp terminal_real_emv onto every row whose snapshot has a populated EMV.
+    # The terminal EMV is the same value for all K rows of a given snapshot, so
+    # this is a join, not a per-row aggregation.
+    for c in candidates:
+        if c.snapshot_id and c.snapshot_id in per_candidate_emv:
+            c.terminal_real_emv = per_candidate_emv[c.snapshot_id]
+
+    # Look up seed real EMV from prior iters' per_candidate_emv. Only ensemble
+    # candidates carry a seed_source_snapshot_id; per-geology rows have None.
+    if prior_per_candidate_emv_by_iter:
+        for c in candidates:
+            if not c.seed_source_snapshot_id or c.seed_source_iteration is None:
+                continue
+            src_emv_map = prior_per_candidate_emv_by_iter.get(int(c.seed_source_iteration))
+            if not src_emv_map:
+                continue
+            v = src_emv_map.get(str(c.seed_source_snapshot_id))
+            if v is not None and np.isfinite(v):
+                c.seed_real_emv = float(v)
+
+    # Best-EMV-this-batch and running best. Only meaningful when at least one
+    # candidate has a real EMV; on per-geology iterations the same numbers as
+    # best_real_revenue_in_batch fall out, but plot helpers can distinguish via
+    # the absence of `per_candidate_emv` length > 1.
+    is_ensemble_iter = any(len(rows) > 1 for rows in grouped_by_snap.values())
+    best_emv_in_batch: float | None = None
+    best_emv_so_far_val: float | None = None
+    exploit_best_emv: float | None = None
+    exploit_best_per_geology: dict[str, float] | None = None
+    if is_ensemble_iter:
+        emv_values = list(per_candidate_emv.values())
+        if emv_values:
+            best_emv_in_batch = float(max(emv_values))
+        if best_emv_in_batch is None:
+            best_emv_so_far_val = prior_best_emv
+        elif prior_best_emv is None:
+            best_emv_so_far_val = best_emv_in_batch
+        else:
+            best_emv_so_far_val = max(float(prior_best_emv), best_emv_in_batch)
+
+        # Exploit-cohort restriction.
+        exploit_sids = {c.snapshot_id for c in candidates if c.kind == "exploit" and c.snapshot_id}
+        exploit_emvs = [per_candidate_emv[s] for s in exploit_sids if s in per_candidate_emv]
+        if exploit_emvs:
+            exploit_best_emv = float(max(exploit_emvs))
+        exploit_per_geo: dict[str, float] = {}
+        for c in candidates:
+            if c.kind != "exploit" or not np.isfinite(c.real_revenue):
+                continue
+            key = str(c.geology_index)
+            cur = exploit_per_geo.get(key)
+            exploit_per_geo[key] = c.real_revenue if cur is None else max(cur, c.real_revenue)
+        exploit_best_per_geology = exploit_per_geo or None
+
     return IngestMetrics(
         n_submitted=n_submitted,
         n_completed=n_completed,
@@ -403,4 +511,9 @@ def ingest_iteration(
         n_failed_per_status=n_failed_per_status,
         n_succeeded_but_missing_h5=n_succeeded_but_missing_h5,
         n_missing_silently=n_missing_silently,
+        per_candidate_emv=(per_candidate_emv if is_ensemble_iter else None),
+        best_emv_in_batch=best_emv_in_batch,
+        best_emv_so_far=best_emv_so_far_val,
+        exploit_best_emv=exploit_best_emv,
+        exploit_best_per_geology=exploit_best_per_geology,
     )

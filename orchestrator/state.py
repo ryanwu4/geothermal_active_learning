@@ -57,6 +57,18 @@ class IterationRecord:
     # at least: count, mape, signed_bias, max_real_revenue. Optional — older
     # iterations may have None.
     per_geology: dict[str, dict[str, object]] | None = None
+    # Ensemble-mode EMV rollups. Populated only when acquisition.mode == "ensemble".
+    # `per_candidate_emv` is keyed by snapshot_id; it carries the real mean
+    # revenue across the K geology IX runs of each candidate. The next iter's
+    # elite reader ranks by this to pick exploit seeds.
+    best_emv_in_batch: float | None = None
+    best_emv_so_far: float | None = None
+    per_candidate_emv: dict[str, float] | None = None
+    # Exploit-cohort restriction of the above — best real EMV among only the
+    # exploit candidates of this iter, plus the per-geology best from exploits.
+    # Used to compare elite-seeded Adam against its starting pool.
+    exploit_best_emv: float | None = None
+    exploit_best_per_geology: dict[str, float] | None = None
 
 
 @dataclass
@@ -84,8 +96,20 @@ class RunState:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "RunState":
-        history = [IterationRecord(**h) for h in payload.get("history", [])]
-        kwargs = {k: v for k, v in payload.items() if k != "history"}
+        # Filter to known fields on both records so a state.json written by a
+        # newer version (with extra fields) still loads cleanly under the old
+        # schema. Unknown keys are silently dropped — the caller is expected to
+        # be running an older code path that doesn't need them.
+        iter_fields = set(IterationRecord.__dataclass_fields__.keys())
+        history = [
+            IterationRecord(**{k: v for k, v in h.items() if k in iter_fields})
+            for h in payload.get("history", [])
+        ]
+        run_fields = set(cls.__dataclass_fields__.keys())
+        kwargs = {
+            k: v for k, v in payload.items()
+            if k != "history" and k in run_fields
+        }
         return cls(history=history, **kwargs)
 
     @classmethod
@@ -128,6 +152,14 @@ class RunState:
             if rec.best_real_revenue is None:
                 continue
             best = rec.best_real_revenue if best is None else max(best, rec.best_real_revenue)
+        return best
+
+    def best_emv_so_far_value(self) -> float | None:
+        best = None
+        for rec in self.history:
+            if rec.best_emv_in_batch is None:
+                continue
+            best = rec.best_emv_in_batch if best is None else max(best, rec.best_emv_in_batch)
         return best
 
 
