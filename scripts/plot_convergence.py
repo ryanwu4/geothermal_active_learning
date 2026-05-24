@@ -666,19 +666,23 @@ def plot_best_revenue_with_geo_updates(
             per_geo_iter[key] = rvf
 
     # Per geology: running max across iters, plus EVERY iter at which the
-    # per-geo running max stepped up (a new best-so-far). Each step-up is a
-    # discovery event and contributes to the bar count for that iter.
+    # per-geo running max stepped up (a new best-so-far). The *first* observed
+    # iter establishes the baseline, not a discovery — without this guard the
+    # bar at iter 0 always equals len(geos) by construction, swamping any real
+    # discovery signal in later iters.
     geo_lines: dict[int, tuple[list[int], list[float]]] = {}
     step_up_iters: list[int] = []
     for geo in geos:
         xs: list[int] = []
         ys: list[float] = []
-        running = -np.inf
+        running: float | None = None
         for it in iters:
             v = per_geo_iter.get((geo, it))
             if v is None:
                 continue
-            if v > running:
+            if running is None:
+                running = v  # baseline; not a step-up
+            elif v > running:
                 running = v
                 step_up_iters.append(it)
             xs.append(it)
@@ -859,16 +863,33 @@ def plot_predicted_vs_real_scatter(rows: list[dict], out_dir: Path) -> None:
     """Predicted vs real revenue across all iterations, colored by iter."""
     if not rows:
         return
+
+    def _finite_pair(r):
+        p, q = r.get("predicted_revenue"), r.get("real_revenue")
+        if p is None or q is None:
+            return None
+        try:
+            pf, qf = float(p), float(q)
+        except (TypeError, ValueError):
+            return None
+        return (pf, qf) if np.isfinite(pf) and np.isfinite(qf) else None
+
     iters = sorted({r["iteration"] for r in rows})
     cmap = plt.get_cmap("plasma")
 
     fig, ax = plt.subplots(figsize=(8, 8), facecolor=MANIM_BG)
     _style_ax(ax)
 
+    all_pred: list[float] = []
+    all_real: list[float] = []
     for it in iters:
-        sub = [r for r in rows if r["iteration"] == it]
-        pred = np.array([r["predicted_revenue"] for r in sub])
-        real = np.array([r["real_revenue"] for r in sub])
+        pairs = [pq for pq in (_finite_pair(r) for r in rows if r["iteration"] == it) if pq is not None]
+        if not pairs:
+            continue
+        pred = np.array([p for p, _ in pairs])
+        real = np.array([q for _, q in pairs])
+        all_pred.extend(pred.tolist())
+        all_real.extend(real.tolist())
         if len(iters) > 1:
             color = cmap((it - iters[0]) / max(1, iters[-1] - iters[0]))
         else:
@@ -877,10 +898,14 @@ def plot_predicted_vs_real_scatter(rows: list[dict], out_dir: Path) -> None:
                    edgecolors="white", linewidth=0.4,
                    label=f"iter {it}" if it in (iters[0], iters[-1]) or len(iters) <= 4 else None)
 
-    all_pred = np.array([r["predicted_revenue"] for r in rows])
-    all_real = np.array([r["real_revenue"] for r in rows])
-    lo = float(min(all_pred.min(), all_real.min()))
-    hi = float(max(all_pred.max(), all_real.max()))
+    if not all_pred:
+        ax.text(0.5, 0.5, "No finite (pred, real) pairs yet",
+                ha="center", va="center", color=MANIM_GREY, transform=ax.transAxes)
+        ax.set_axis_off()
+        _save(fig, out_dir / "scatter_pred_vs_real.png")
+        return
+    lo = float(min(min(all_pred), min(all_real)))
+    hi = float(max(max(all_pred), max(all_real)))
     ax.plot([lo, hi], [lo, hi], color=MANIM_WHITE, lw=1, ls="--", label="y = x")
 
     ax.set_xlabel("Intersect-true revenue")
@@ -925,8 +950,28 @@ def plot_real_revenue_distribution(rows: list[dict], out_dir: Path) -> None:
     """Box+strip plot of real revenue per iteration: track frontier movement."""
     if not rows:
         return
+
+    def _finite_real(r):
+        v = r.get("real_revenue")
+        if v is None:
+            return None
+        try:
+            vf = float(v)
+        except (TypeError, ValueError):
+            return None
+        return vf if np.isfinite(vf) else None
+
     iters = sorted({r["iteration"] for r in rows})
-    data = [[r["real_revenue"] for r in rows if r["iteration"] == it] for it in iters]
+    data: list[list[float]] = []
+    plotted_iters: list[int] = []
+    for it in iters:
+        vals = [v for v in (_finite_real(r) for r in rows if r["iteration"] == it) if v is not None]
+        if vals:
+            data.append(vals)
+            plotted_iters.append(it)
+    if not data:
+        return
+    iters = plotted_iters
 
     fig, ax = plt.subplots(figsize=(max(8, len(iters) * 0.6), 5), facecolor=MANIM_BG)
     _style_ax(ax)
@@ -1147,20 +1192,35 @@ def _all_holdout_rows(run_root: Path, history: list[dict]) -> list[dict]:
     return rows
 
 
+# Revenue values in this project are denominated in USD; a "real" candidate's
+# discounted revenue is at minimum tens of millions. A floor of $1M for the
+# MAPE denominator excludes degenerate near-zero ground-truths (which would
+# otherwise dominate the average) without filtering out genuinely small valid
+# revenues. Fixed (not data-dependent) so the metric is comparable across iters.
+_MAPE_DENOM_FLOOR_USD = 1.0e6
+
+
 def _mape_clipped_p99(abs_err: np.ndarray, y_true: np.ndarray) -> float:
-    yt = np.abs(y_true)
+    """Clipped MAPE in percent.
+
+    - Denominator floor: $1M (constant), so each iter's MAPE is a comparable
+      number rather than a function of that iter's distribution.
+    - Cap: 100% per-row (cap *the ratio*, not the post-mean number). A bad
+      single row contributes at most 100% before averaging. We deliberately
+      avoid a percentile-of-the-current-distribution cap because that is
+      self-referential (for small N the p99 ≈ max, so no clipping happens).
+    """
+    yt = np.abs(np.asarray(y_true, dtype=np.float64))
+    ae = np.asarray(abs_err, dtype=np.float64)
     if yt.size == 0:
         return float("nan")
-    mask = yt > 0.01 * np.mean(yt)
-    if not np.any(mask):
-        return float("nan")
-    raw = abs_err[mask] / np.maximum(yt[mask], 1e-12) * 100.0
-    cap = np.percentile(raw, 99)
-    return float(np.mean(np.clip(raw, a_min=None, a_max=cap)))
+    denom = np.maximum(yt, _MAPE_DENOM_FLOOR_USD)
+    raw = ae / denom * 100.0
+    return float(np.mean(np.minimum(raw, 100.0)))
 
 
 def plot_holdout_mape_over_iters(holdout_rows: list[dict], out_dir: Path) -> None:
-    """Aggregate train/val/test MAPE (clipped @ p99) per iter, FULL dataset.
+    """Aggregate train/val/test MAPE (per-row capped at 100%) per iter, FULL dataset.
 
     Complements the acquired-only ``calibration_over_iterations``: this is the
     apples-to-apples comparison to the surrogate's benchmark MAPE.
@@ -1175,7 +1235,7 @@ def plot_holdout_mape_over_iters(holdout_rows: list[dict], out_dir: Path) -> Non
     for split, color in split_colors.items():
         ys = []
         xs = []
-        last_n = 0
+        ns: list[int] = []
         for it in iters:
             sub = [r for r in holdout_rows
                    if r["iteration"] == it and r["split"] == split]
@@ -1185,14 +1245,18 @@ def plot_holdout_mape_over_iters(holdout_rows: list[dict], out_dir: Path) -> Non
             yt = np.array([r["y_true"] for r in sub])
             ys.append(_mape_clipped_p99(ae, yt))
             xs.append(it)
-            last_n = len(sub)
+            ns.append(len(sub))
         if xs:
+            # Train set grows across iters, so a single "n≈X" misleads.
+            # Show the range when it varies, the exact n when stable.
+            n_lo, n_hi = min(ns), max(ns)
+            n_str = f"n={n_lo}" if n_lo == n_hi else f"n={n_lo}–{n_hi}"
             ax.plot(xs, ys, color=color, marker="o", lw=2,
-                    label=f"{split} (n≈{last_n})")
+                    label=f"{split} ({n_str})")
     ax.axhline(4.03, color=MANIM_RED, ls="--", lw=1,
                label="FINDINGS benchmark geo-8 test MAPE (4.03%)")
     ax.set_xlabel("AL iteration")
-    ax.set_ylabel("Holdout MAPE clipped @ p99 (%)")
+    ax.set_ylabel("Holdout MAPE (per-row capped at 100%) (%)")
     ax.set_title("Holdout MAPE over iterations (FULL dataset, train.py splits)")
     ax.set_xticks(iters)
     ax.legend(loc="best")
@@ -1232,7 +1296,7 @@ def plot_holdout_per_geology_heatmap(holdout_rows: list[dict], out_dir: Path) ->
     ax.set_yticks(range(len(geos)))
     ax.set_yticklabels([f"geo {g}" for g in geos])
     ax.set_xlabel("AL iteration")
-    ax.set_title("Per-geology TEST MAPE (full dataset, clipped @ p99)")
+    ax.set_title("Per-geology TEST MAPE (full dataset, per-row capped at 100%)")
     cbar = fig.colorbar(im, ax=ax)
     cbar.ax.tick_params(colors=MANIM_WHITE)
     cbar.set_label("MAPE (%)", color=MANIM_WHITE)

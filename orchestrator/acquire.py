@@ -1979,8 +1979,14 @@ def _run_acquisition_ensemble(
         m_replica.eval()
         device_objs.append(d)
         models_per_dev.append(m_replica)
-        target_scales_per_dev.append(target_scale.to(d))
-        target_means_per_dev.append(target_mean.to(d))
+        # Route through CPU rather than direct GPU->GPU copy: on PCIe-only
+        # multi-GPU boxes (no NVLink) tensor.to(other_cuda) silently fills with
+        # zeros under some driver/PyTorch combos even when can_device_access_peer
+        # reports True. The model replica path above is safe because
+        # load_from_checkpoint(map_location=d) loads from disk (CPU->GPU); only
+        # these scaler tensors live on the master GPU and need cross-device move.
+        target_scales_per_dev.append(target_scale.cpu().to(d))
+        target_means_per_dev.append(target_mean.cpu().to(d))
     n_dev = len(device_objs)
 
     # ----- Sanity-check replicas match master at startup -----
@@ -2003,6 +2009,23 @@ def _run_acquisition_ensemble(
                         f"has parameter-sum {replica_params:.6g} != master {master_params:.6g} "
                         f"(after load_from_checkpoint to {device_objs[i]}). This indicates a "
                         f"broken replication and will produce NaN predictions."
+                    )
+                # Catch the GPU->GPU peer-copy bug (broken on this box's PCIe
+                # multi-GPU + driver/PyTorch combo): target_scale.to(other_cuda)
+                # silently returns a zero tensor even though
+                # can_device_access_peer reports True. The replica path now
+                # routes scaler tensors through CPU, but a regression here
+                # would silently corrupt every prediction on the replica.
+                rm = float(target_means_per_dev[i].detach().abs().sum().cpu())
+                rs = float(target_scales_per_dev[i].detach().abs().sum().cpu())
+                mm = float(target_mean.detach().abs().sum().cpu())
+                ms = float(target_scale.detach().abs().sum().cpu())
+                if not (abs(rm - mm) < max(1e-3, 1e-5 * abs(mm)) and abs(rs - ms) < max(1e-3, 1e-5 * abs(ms))):
+                    raise RuntimeError(
+                        f"Ensemble acquisition: scaler tensors on {device_objs[i]} "
+                        f"(mean abs-sum {rm:.6g}, scale abs-sum {rs:.6g}) differ from "
+                        f"master (mean {mm:.6g}, scale {ms:.6g}). This is the GPU->GPU "
+                        f"peer-copy silently-zeros bug; route the .to(d) through CPU."
                     )
         if torch.cuda.is_available():
             for d in device_objs:
