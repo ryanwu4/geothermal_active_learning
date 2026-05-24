@@ -2176,292 +2176,340 @@ def _run_acquisition_ensemble(
     timings["n_exploit"] = int(n_exploit)
     timings["n_frontier"] = int(n_frontier)
 
-    # ----- Build K static-graph batches (one per geology), each size M -----
-    # Each batch is placed on a device chosen round-robin across cfg.devices,
-    # so n_dev GPUs each own roughly K/n_dev geologies. The threaded Adam loop
-    # below dispatches per-device forwards in parallel, accumulating gradients
-    # back onto the master coords tensor.
+    # =========================================================================
+    # MULTI-DEVICE DESIGN: candidate partition (not geology partition).
+    #
+    # Background — why candidate-partition. We previously tried splitting
+    # the K geologies across N GPUs (each GPU owns ~K/N batches, the Adam
+    # loop sums gradients across devices via per-step coords replicas, the
+    # no-grad forwards interleave cuda:0 and cuda:1 from the main thread).
+    # That design consistently failed: the no-grad terminal forward
+    # produced NaN predictions for every cuda:N>0 geology, on the order of
+    # 75% of candidates, after the Adam loop ran. We verified via MVP
+    # repros that:
+    #   - Single device (cuda:0 only): all candidates pass.
+    #   - Multi-device with geology partition: cuda:N>0 geologies NaN.
+    #   - Multi-device with candidate partition (each GPU runs an
+    #     independent single-device acquisition on its M/N share of
+    #     candidates, with its own full set of K batches): all candidates
+    #     pass, ~1.6× wallclock speedup over single-device.
+    #
+    # The root cause of the geology-split failure was not fully isolated
+    # but appears to be an interaction between (a) PyG's `Batch.to(d)`
+    # NOT moving the custom `PhysicsContext` attribute (data.py:52, plain
+    # Python class with no `.to()`), (b) the model's `volumes_dict[ch]
+    # .to(device, non_blocking=True)` lazy device transfer per forward,
+    # and (c) PyTorch's caching allocator stream-event tracking across
+    # threads with mixed per-thread default streams. Candidate partition
+    # sidesteps all three: every batch lives on exactly one device for
+    # its entire lifetime, and each device's forwards happen only in that
+    # device's own thread/context.
+    #
+    # Memory: each GPU has K=15 batches (vs K/N in geology-split), but each
+    # batch is sized M/N candidates instead of M, so total per-GPU storage
+    # is comparable. The activation memory per forward is also lower
+    # (M/N candidates × edges instead of M × edges in the geology-split
+    # case), making the gradient-accumulation regime more comfortable.
+    # =========================================================================
+
+    # ----- Partition the M candidates across the N devices -----
+    M_per_dev: list[int] = []
+    base = M // n_dev
+    rem = M - base * n_dev
+    for i in range(n_dev):
+        M_per_dev.append(base + (1 if i < rem else 0))
+    # Build a master->device mapping so the global m index can recover its
+    # device + local index after the threaded acquisition.
+    slice_starts: list[int] = []
+    offset = 0
+    for i in range(n_dev):
+        slice_starts.append(offset)
+        offset += M_per_dev[i]
+    assert offset == M
+
+    print(
+        f"[acquire-ensemble] candidate partition: M={M} across {n_dev} devices "
+        f"-> per-device M = {M_per_dev}",
+        flush=True,
+    )
+
+    # ----- Build per-device contexts: each device gets its own K batches -----
+    # Each device's batches are size M_local (its slice of candidates).
+    # Geology physics is the same across devices (CPU tensors, shared); only
+    # the per-candidate well configurations differ.
     t0 = time.perf_counter()
-    batches: list[Any] = []
-    batch_owner_dev: list[int] = []  # parallel to `batches`
-    for k_idx, (g, d) in enumerate(zip(geologies, geology_loaded)):
-        static_graphs = _build_static_batch_for_starts(
-            cfgs, Path(g.geology_h5_file), d["physics_dict"], d["full_shape"],
-            d["z_cutoff"], d["nx"], d["ny"],
-            cfg.revenue_target, ctx.scaler,
-            ctx.extract_well_data, ctx.build_wells_table, ctx.extract_vertical_profiles,
-            ctx.build_single_hetero_data, d["temp0_full"],
-            node_encoder=ctx.node_encoder, enrich_global_attr=ctx.enrich_global_attr,
-        )
-        dev_idx = k_idx % n_dev
-        batches.append(Batch.from_data_list(static_graphs).to(device_objs[dev_idx]))
-        batch_owner_dev.append(dev_idx)
-    # Per-device batch lists for the threaded forward+backward loop.
-    batches_per_dev: list[list[Any]] = [[] for _ in range(n_dev)]
-    for bd, dev_idx in zip(batches, batch_owner_dev):
-        batches_per_dev[dev_idx].append(bd)
+    per_dev_batches: list[list[Any]] = [[] for _ in range(n_dev)]
+    per_dev_cfgs: list[list[list[dict]]] = []
+    for i in range(n_dev):
+        s = slice_starts[i]
+        e = s + M_per_dev[i]
+        per_dev_cfgs.append(cfgs[s:e])
+
+    for i in range(n_dev):
+        if device_objs[i].type == "cuda":
+            torch.cuda.set_device(device_objs[i])
+        slice_cfgs = per_dev_cfgs[i]
+        if len(slice_cfgs) == 0:
+            continue
+        for g, d in zip(geologies, geology_loaded):
+            static_graphs = _build_static_batch_for_starts(
+                slice_cfgs, Path(g.geology_h5_file), d["physics_dict"], d["full_shape"],
+                d["z_cutoff"], d["nx"], d["ny"],
+                cfg.revenue_target, ctx.scaler,
+                ctx.extract_well_data, ctx.build_wells_table, ctx.extract_vertical_profiles,
+                ctx.build_single_hetero_data, d["temp0_full"],
+                node_encoder=ctx.node_encoder, enrich_global_attr=ctx.enrich_global_attr,
+            )
+            per_dev_batches[i].append(Batch.from_data_list(static_graphs).to(device_objs[i]))
     timings["graph_build_s"] = time.perf_counter() - t0
     timings["n_devices"] = float(n_dev)
     for i in range(n_dev):
-        timings[f"n_batches_dev{i}"] = float(len(batches_per_dev[i]))
+        timings[f"M_dev{i}"] = float(M_per_dev[i])
 
-    starts = [
-        [[w["x"], w["y"], float(w["depth"])] for w in c] for c in cfgs
-    ]
-    coords = torch.tensor(starts, dtype=torch.float32, device=device)
-    coords.requires_grad = True
-    optimizer = optim.Adam([coords], lr=cfg.learning_rate)
-    last_valid_coords = coords.detach().clone()
-
-    def _predict_one_geo(c: torch.Tensor, bd, dev_idx: int) -> torch.Tensor:
-        """Forward M coords through one geology batch on its owning device.
-
-        ``c`` must already live on the same device as ``bd`` / the model
-        replica. Returns an ``(M,)`` tensor of unscaled predictions on that
-        device.
-        """
-        bd["well"].pos_xyz = c.view(-1, 3)
-        pred_scaled = models_per_dev[dev_idx](bd).view(M)
-        return pred_scaled * target_scales_per_dev[dev_idx] + target_means_per_dev[dev_idx]
-
-    def _predict_all_geos_no_grad(c_master: torch.Tensor) -> np.ndarray:
-        """Forward all K geology batches without autograd; for logging only.
-
-        Returns an ``(M, K)`` numpy array of unscaled predictions. Each forward
-        runs on its owning device with no autograd graph kept, so peak memory
-        stays at one geology's forward across the whole sweep — even with
-        many K and multiple GPUs.
-
-        Forwards are launched in a single pass (async on each device's default
-        stream), then collected in a second pass via ``.cpu().numpy()``. This
-        keeps multi-device kernel queues running concurrently — otherwise the
-        per-iteration ``.cpu()`` syncs would serialize across devices and
-        defeat the parallelism.
-
-        CRITICAL: the per-device coords replicas below are created via
-        ``.to(d)`` which queues an async ``cudaMemcpyPeerAsync`` on the source
-        device's stream. Without an explicit sync, the immediately-following
-        forward on device d can read the replica's memory BEFORE the copy
-        has landed — silently producing NaN predictions for every non-master
-        geology. (PyTorch's caching allocator is supposed to insert this
-        synchronization automatically, but cross-device + main-thread paths
-        are a known fragile corner; in practice the consumer sees garbage.)
-        The Adam loop avoids this race because its replica-creation sync
-        lives in the spawning code path; this no-grad path needs its own.
-        """
-        preds_per_k: list[torch.Tensor | None] = [None] * K
-        cols: list[np.ndarray] = [None] * K  # type: ignore[list-item]
-        with torch.no_grad():
-            # Pre-stage coords on each device once.
-            coords_per_dev = [c_master.detach().to(d) for d in device_objs]
-            # Force every cross-device replica copy to land before any forward
-            # kernel reads it. Cheap (coords is 720 floats per device).
-            for d in device_objs:
-                if d.type == "cuda":
-                    torch.cuda.synchronize(d)
-            # Pass 1: launch all forwards (each on its owner device's stream).
-            for k_idx, bd in enumerate(batches):
-                dev_idx = batch_owner_dev[k_idx]
-                preds_per_k[k_idx] = _predict_one_geo(
-                    coords_per_dev[dev_idx], bd, dev_idx
-                ).detach()
-            # Pass 2: collect (each ``.cpu().numpy()`` syncs only its own device).
-            for k_idx, p in enumerate(preds_per_k):
-                assert p is not None
-                cols[k_idx] = p.cpu().numpy()
-        return np.stack(cols, axis=1)  # (M, K)
-
-    # Pre-step seed forward to capture seed_predicted_emv per candidate.
-    t0 = time.perf_counter()
-    preds_seed = _predict_all_geos_no_grad(coords)  # (M, K)
-    seed_predicted_emv = preds_seed.mean(axis=1).astype(float)
-    timings["seed_forward_s"] = time.perf_counter() - t0
-
-    # ----- Adam loop (k_safe steps, mean-over-K loss) -----
-    # Two memory + parallelism tricks combined:
-    #   (1) Gradient accumulation across geologies. Each Adam step accumulates
-    #       K per-geology backward passes instead of one giant backward over
-    #       the mean-over-K loss. The math is identical
-    #       (d/dx[(1/K) Σ_k f_k(x)] = (1/K) Σ_k df_k/dx), but each forward
-    #       graph is released as soon as its own backward fires — so peak GPU
-    #       memory per device is bounded by a single per-geology forward, not
-    #       K simultaneous ones. Without this, the activations for all K
-    #       forwards have to coexist until one giant backward fires, which
-    #       OOMs as K and the physics-slab CNN footprint grow.
-    #   (2) Multi-device sharding. Each of the cfg.devices GPUs owns a subset
-    #       of the K geology batches and runs its share of forward+backward
-    #       in parallel via Python threads (PyTorch's autograd is thread-safe,
-    #       and CUDA ops release the GIL — separate streams on different
-    #       devices run concurrently). Per-device coords replicas accumulate
-    #       gradients locally; we sum them back onto the master coords.grad
-    #       at the end of each Adam step.
     K_float = float(K)
 
-    def _accumulate_device_grad(
-        dev_idx: int,
-        coords_replica: torch.Tensor,
-        out_errors: list,
-    ) -> None:
-        """Run all of dev_idx's geology batches through forward+backward.
+    def _predict_one_geo(c: torch.Tensor, bd, dev_idx: int, M_local: int) -> torch.Tensor:
+        """Forward M_local coords through one geology batch on its owning device.
 
-        Gradients accumulate into ``coords_replica.grad`` (a leaf tensor on the
-        device). Exceptions are surfaced via ``out_errors[dev_idx]`` so the
-        main thread can re-raise after joining.
+        ``c`` must already live on the same device as ``bd`` / the model
+        replica. Returns an ``(M_local,)`` tensor of unscaled predictions
+        on that device.
         """
-        try:
-            # Pin this thread to the worker's CUDA device. Some PyTorch internals
-            # (caching allocator, NCCL, etc.) look at the THREAD-LOCAL current
-            # device; if it's left pointing at cuda:0 from the main thread, ops
-            # nominally on cuda:1 can hit subtle stream-ordering pathologies.
-            d = device_objs[dev_idx]
-            if d.type == "cuda":
-                torch.cuda.set_device(d)
-            for bd in batches_per_dev[dev_idx]:
-                preds_k = _predict_one_geo(coords_replica, bd, dev_idx)
+        bd["well"].pos_xyz = c.view(-1, 3)
+        pred_scaled = models_per_dev[dev_idx](bd).view(M_local)
+        return pred_scaled * target_scales_per_dev[dev_idx] + target_means_per_dev[dev_idx]
+
+    def _run_one_device_slice(dev_idx: int) -> dict[str, Any]:
+        """Run the FULL acquisition (seed fwd, Adam loop, post-Adam projection,
+        terminal fwd) for this device's slice of M_local candidates.
+
+        Returns a dict with arrays/lists indexed 0..M_local-1 within the slice.
+        The caller stitches per-device results back together at the global
+        m=0..M-1 indexing for snapshot emission.
+
+        Runs entirely on ``device_objs[dev_idx]`` — no cross-device tensors,
+        no cross-device kernels. This is the key property that distinguishes
+        candidate partition from the previous (broken) geology-split design.
+        """
+        d = device_objs[dev_idx]
+        if d.type == "cuda":
+            torch.cuda.set_device(d)
+        M_local = M_per_dev[dev_idx]
+        slice_batches = per_dev_batches[dev_idx]
+        slice_cfgs = per_dev_cfgs[dev_idx]
+        slice_off = slice_starts[dev_idx]
+
+        if M_local == 0:
+            return {
+                "M_local": 0,
+                "final_coords": np.zeros((0, num_wells, 3), dtype=np.float32),
+                "preds_seed": np.zeros((0, K), dtype=np.float32),
+                "preds_final": np.zeros((0, K), dtype=np.float32),
+                "n_moved": 0,
+                "step_diag": [],
+            }
+
+        # Build coords for this slice on this device.
+        starts_local = [
+            [[w["x"], w["y"], float(w["depth"])] for w in c] for c in slice_cfgs
+        ]
+        coords_local = torch.tensor(starts_local, dtype=torch.float32, device=d)
+        coords_local.requires_grad = True
+        optimizer_local = optim.Adam([coords_local], lr=cfg.learning_rate)
+        last_valid_local = coords_local.detach().clone()
+
+        def _all_geos_no_grad(c_in: torch.Tensor) -> np.ndarray:
+            cols = [None] * K
+            with torch.no_grad():
+                for k_idx, bd in enumerate(slice_batches):
+                    p = _predict_one_geo(c_in, bd, dev_idx, M_local).detach()
+                    cols[k_idx] = p.cpu().numpy()
+            return np.stack(cols, axis=1)  # (M_local, K)
+
+        # Seed forward.
+        preds_seed_local = _all_geos_no_grad(coords_local)
+
+        # Adam loop with gradient accumulation across geologies.
+        step_diag: list[dict] = []
+        for step in range(1, int(cfg.k_safe) + 1):
+            optimizer_local.zero_grad(set_to_none=True)
+            for bd in slice_batches:
+                preds_k = _predict_one_geo(coords_local, bd, dev_idx, M_local)
                 loss_k = -(preds_k.sum() / K_float)
                 loss_k.backward()
-                # Forward graph for this geology is released here.
-            # Block until this device's queue drains so the main thread can
-            # safely move the gradient back to the master device.
-            if d.type == "cuda":
-                torch.cuda.synchronize(d)
-        except BaseException as e:  # pragma: no cover - propagated to main
-            out_errors[dev_idx] = e
 
-    t0 = time.perf_counter()
-    for step in range(1, int(cfg.k_safe) + 1):
-        optimizer.zero_grad(set_to_none=True)
+            with torch.no_grad():
+                grads = coords_local.grad
+                grad_was_nan = not torch.isfinite(grads).all().item()
+                if grad_was_nan:
+                    torch.nan_to_num_(grads, nan=0.0, posinf=0.0, neginf=0.0)
+                    st = optimizer_local.state.get(coords_local, {})
+                    for key in ("exp_avg", "exp_avg_sq"):
+                        if key in st and not torch.isfinite(st[key]).all():
+                            torch.nan_to_num_(st[key], nan=0.0, posinf=0.0, neginf=0.0)
+                for d_idx, max_val in enumerate([nx - 1, ny - 1, z_max - 1]):
+                    mask_lo = (coords_local[:, :, d_idx] <= 1e-4) & (grads[:, :, d_idx] > 0)
+                    mask_hi = (coords_local[:, :, d_idx] >= max_val - 1e-4) & (grads[:, :, d_idx] < 0)
+                    mask = mask_lo | mask_hi
+                    if mask.any():
+                        grads[..., d_idx][mask] = 0.0
+                        st = optimizer_local.state.get(coords_local, {})
+                        if "exp_avg" in st:
+                            st["exp_avg"][..., d_idx][mask] = 0.0
+                        if "exp_avg_sq" in st:
+                            st["exp_avg_sq"][..., d_idx][mask] = 0.0
+            optimizer_local.step()
+            with torch.no_grad():
+                if not torch.isfinite(coords_local).all():
+                    bad = ~torch.isfinite(coords_local)
+                    coords_local[bad] = last_valid_local[bad]
+                    st = optimizer_local.state.get(coords_local, {})
+                    for key in ("exp_avg", "exp_avg_sq"):
+                        if key in st:
+                            st[key][bad] = 0.0
+                            if not torch.isfinite(st[key]).all():
+                                torch.nan_to_num_(st[key], nan=0.0, posinf=0.0, neginf=0.0)
+                coords_local[:, :, 0].clamp_(0, nx - 1)
+                coords_local[:, :, 1].clamp_(0, ny - 1)
+                coords_local[:, :, 2].clamp_(0, z_max - 1)
+                last_valid_local.copy_(coords_local)
 
-        # Fast path: single device → run inline (no threading overhead).
-        if n_dev == 1:
-            _accumulate_device_grad(0, coords, [None])
-        else:
-            # Build a fresh per-device coords replica each step so gradients
-            # start at zero and never alias the master's autograd graph.
-            replicas: list[torch.Tensor] = []
-            for i in range(n_dev):
-                if i == 0:
-                    # Master device: use coords itself, but reset its grad so
-                    # the per-device sum is well-defined below.
-                    coords.grad = None
-                    replicas.append(coords)
-                else:
-                    replicas.append(
-                        coords.detach().to(device_objs[i]).requires_grad_(True)
-                    )
-            # Force every cross-device replica copy to complete BEFORE worker
-            # threads start reading the replicas. Without this, a worker on
-            # cuda:1 can race the cudaMemcpyPeerAsync queued by `.to(cuda:1)`
-            # and read garbage values — silently producing NaN predictions.
-            if device.type == "cuda":
-                for i in range(n_dev):
-                    if device_objs[i].type == "cuda":
-                        torch.cuda.synchronize(device_objs[i])
+            # Per-device step diagnostic (rare).
+            if step == 1 or step == int(cfg.k_safe) or step % max(1, int(cfg.log_every_n_steps)) == 0:
+                with torch.no_grad():
+                    grad_norm = float(coords_local.grad.abs().max().item()) if coords_local.grad is not None else float("nan")
+                    coord_finite = bool(torch.isfinite(coords_local).all().item())
+                step_diag.append({
+                    "step": step, "dev_idx": dev_idx,
+                    "max_grad": grad_norm, "coords_finite": coord_finite,
+                    "grad_was_nan": grad_was_nan,
+                })
 
-            errors: list[BaseException | None] = [None] * n_dev
-            threads: list[threading.Thread] = []
-            for i in range(n_dev):
-                t = threading.Thread(
-                    target=_accumulate_device_grad,
-                    args=(i, replicas[i], errors),
-                    name=f"acquire-ensemble-dev{i}",
-                )
-                t.start()
-                threads.append(t)
-            for t in threads:
-                t.join()
-            for err in errors:
-                if err is not None:
-                    raise err
-
-            # Sum per-device gradients onto master coords.grad. Device 0's
-            # contribution is already in coords.grad (its replica IS coords).
-            if coords.grad is None:
-                coords.grad = torch.zeros_like(coords)
-            for i in range(1, n_dev):
-                if replicas[i].grad is None:
-                    continue
-                coords.grad.add_(replicas[i].grad.to(device))
-            # Ensure every cross-device copy queued above has landed on the
-            # master device's stream before the optimizer / projection touches
-            # coords.grad. Each worker thread synchronized its own source
-            # device, but PyTorch may queue P2P copies on a side stream — we
-            # need the master stream to wait too. Cheap (gradient is tiny).
-            if device.type == "cuda":
-                torch.cuda.synchronize(device)
-
+        # Post-Adam validity projection: move any wells that drifted into
+        # dead-rock for any geology back to valid cells. No-op for wells
+        # already in valid rock.
+        n_moved = 0
         with torch.no_grad():
-            grads = coords.grad
-            grad_was_nan = not torch.isfinite(grads).all().item()
-            if grad_was_nan:
-                torch.nan_to_num_(grads, nan=0.0, posinf=0.0, neginf=0.0)
-                # If grads were NaN/Inf this step, Adam's running moments could
-                # also have been poisoned earlier (or will be when accumulating
-                # the sanitized-to-zero value). Proactively scrub the entire
-                # optimizer state, not just the boundary-masked slice. Without
-                # this, a single NaN gradient propagates into exp_avg/exp_avg_sq
-                # and every subsequent optimizer.step produces NaN coords.
-                st = optimizer.state.get(coords, {})
-                for key in ("exp_avg", "exp_avg_sq"):
-                    if key in st and not torch.isfinite(st[key]).all():
-                        torch.nan_to_num_(st[key], nan=0.0, posinf=0.0, neginf=0.0)
-            for d, max_val in enumerate([nx - 1, ny - 1, z_max - 1]):
-                mask_lo = (coords[:, :, d] <= 1e-4) & (grads[:, :, d] > 0)
-                mask_hi = (coords[:, :, d] >= max_val - 1e-4) & (grads[:, :, d] < 0)
-                mask = mask_lo | mask_hi
-                if mask.any():
-                    grads[..., d][mask] = 0.0
-                    st = optimizer.state.get(coords, {})
-                    if "exp_avg" in st:
-                        st["exp_avg"][..., d][mask] = 0.0
-                    # Also zero exp_avg_sq at the boundary slice — leaving a
-                    # stale variance there keeps the Adam denominator skewed
-                    # for ~10 steps after the coord pins to the wall.
-                    if "exp_avg_sq" in st:
-                        st["exp_avg_sq"][..., d][mask] = 0.0
-        optimizer.step()
-        with torch.no_grad():
-            if not torch.isfinite(coords).all():
-                bad = ~torch.isfinite(coords)
-                coords[bad] = last_valid_coords[bad]
-                st = optimizer.state.get(coords, {})
-                # Zero Adam moments AT the recovered positions (huge-but-finite
-                # moments pass isfinite() but would catapult the recovered
-                # coord back across the domain on the next step), then
-                # sanitize any wholly-NaN moments tensor-wide for safety.
+            coords_np_local = coords_local.detach().cpu().numpy()
+            for m_local in range(M_local):
+                cand_xyz = coords_np_local[m_local].copy()
+                projected = _project_to_valid(cand_xyz.copy())
+                if not np.allclose(projected, cand_xyz, atol=1e-3):
+                    n_moved += 1
+                    coords_np_local[m_local] = projected
+            if n_moved > 0:
+                coords_local.data.copy_(torch.from_numpy(coords_np_local).to(d))
+                st = optimizer_local.state.get(coords_local, {})
                 for key in ("exp_avg", "exp_avg_sq"):
                     if key in st:
-                        st[key][bad] = 0.0
-                        if not torch.isfinite(st[key]).all():
-                            torch.nan_to_num_(st[key], nan=0.0, posinf=0.0, neginf=0.0)
-            coords[:, :, 0].clamp_(0, nx - 1)
-            coords[:, :, 1].clamp_(0, ny - 1)
-            coords[:, :, 2].clamp_(0, z_max - 1)
-            last_valid_coords.copy_(coords)
+                        torch.nan_to_num_(st[key], nan=0.0, posinf=0.0, neginf=0.0)
 
-        # Periodic Adam-loop diagnostics: if loss is silently going to NaN
-        # mid-run, this is where you'll see it.
-        if step == 1 or step == int(cfg.k_safe) or step % max(1, int(cfg.log_every_n_steps)) == 0:
-            with torch.no_grad():
-                grad_norm = float(coords.grad.abs().max().item()) if coords.grad is not None else float("nan")
-                coord_finite = bool(torch.isfinite(coords).all().item())
-            print(
-                f"[acquire-ensemble] step={step}/{cfg.k_safe} "
-                f"max|grad|={grad_norm:.4g} coords_finite={coord_finite} "
-                f"grad_sanitized_this_step={grad_was_nan}",
-                flush=True,
-            )
+        # Terminal forward.
+        preds_final_local = _all_geos_no_grad(coords_local)
+
+        if d.type == "cuda":
+            torch.cuda.synchronize(d)
+
+        return {
+            "M_local": M_local,
+            "final_coords": coords_local.detach().cpu().numpy(),
+            "preds_seed": preds_seed_local,
+            "preds_final": preds_final_local,
+            "n_moved": n_moved,
+            "step_diag": step_diag,
+        }
+
+    # ----- Run per-device slices in parallel -----
+    # Each device runs its own complete acquisition. No cross-device sync
+    # during the loop; only the final result stitching happens on the main
+    # thread after all device-threads join.
+    t0 = time.perf_counter()
+    per_dev_results: list[dict[str, Any] | None] = [None] * n_dev
+    per_dev_errors: list[BaseException | None] = [None] * n_dev
+
+    def _worker(dev_idx: int) -> None:
+        try:
+            per_dev_results[dev_idx] = _run_one_device_slice(dev_idx)
+        except BaseException as e:  # pragma: no cover
+            per_dev_errors[dev_idx] = e
+
+    if n_dev == 1:
+        _worker(0)
+    else:
+        threads = [
+            threading.Thread(target=_worker, args=(i,), name=f"acquire-ensemble-slice-dev{i}")
+            for i in range(n_dev)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    for err in per_dev_errors:
+        if err is not None:
+            raise err
+
     timings["adam_loop_s"] = time.perf_counter() - t0
 
-    # ----- Terminal forward + snapshot emit -----
-    t0 = time.perf_counter()
-    preds_final = _predict_all_geos_no_grad(coords)  # (M, K)
+    # Print step diagnostics in deterministic dev_idx-then-step order.
+    for r in per_dev_results:
+        if r is None:
+            continue
+        for diag in r["step_diag"]:
+            print(
+                f"[acquire-ensemble] dev{diag['dev_idx']} step={diag['step']}/{cfg.k_safe} "
+                f"max|grad|={diag['max_grad']:.4g} coords_finite={diag['coords_finite']} "
+                f"grad_sanitized_this_step={diag['grad_was_nan']}",
+                flush=True,
+            )
+    total_moved = sum((r["n_moved"] if r is not None else 0) for r in per_dev_results)
+    print(
+        f"[acquire-ensemble] post-Adam validity projection: moved {total_moved}/{M} "
+        f"candidates back to valid rock",
+        flush=True,
+    )
+
+    # ----- Stitch per-device results back into global (M, ...) arrays -----
+    final_coords_np = np.concatenate(
+        [r["final_coords"] for r in per_dev_results if r is not None and r["M_local"] > 0],
+        axis=0,
+    )  # (M, num_wells, 3)
+    preds_seed = np.concatenate(
+        [r["preds_seed"] for r in per_dev_results if r is not None and r["M_local"] > 0],
+        axis=0,
+    )  # (M, K)
+    preds_final = np.concatenate(
+        [r["preds_final"] for r in per_dev_results if r is not None and r["M_local"] > 0],
+        axis=0,
+    )  # (M, K)
+    seed_predicted_emv = preds_seed.mean(axis=1).astype(float)
     terminal_predicted_emv = preds_final.mean(axis=1).astype(float)
 
+    # Diagnostic: how many candidates ended up non-finite, by their owning device.
+    if n_dev > 1:
+        bad_by_dev: dict[int, list[int]] = {}
+        for m in range(M):
+            if not np.isfinite(preds_final[m]).all():
+                # Which device owned this candidate?
+                for i in range(n_dev):
+                    if slice_starts[i] <= m < slice_starts[i] + M_per_dev[i]:
+                        bad_by_dev.setdefault(i, []).append(m)
+                        break
+        if bad_by_dev:
+            parts = []
+            for dev_idx, m_list in sorted(bad_by_dev.items()):
+                parts.append(f"{device_objs[dev_idx]}:{m_list}")
+            print(
+                f"[acquire-ensemble] post-Adam terminal: non-finite preds by device: "
+                f"{'; '.join(parts)}",
+                flush=True,
+            )
+
+    # ----- Snapshot emit (uses global-indexed final_coords_np and preds_final) -----
+    t0 = time.perf_counter()
     snapshots: list[dict[str, Any]] = []
     candidates: list[Candidate] = []
     for m in range(M):
-        cxyz = coords[m].detach().cpu().numpy()
+        cxyz = final_coords_np[m]
         coords_ok = bool(np.isfinite(cxyz).all())
         preds_ok = bool(np.isfinite(preds_final[m]).all())
         if not coords_ok or not preds_ok:
