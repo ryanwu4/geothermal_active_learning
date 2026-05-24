@@ -188,7 +188,7 @@ def plot_best_revenue(history: list[dict], rows: list[dict], out_dir: Path) -> N
 
     ax.set_xlabel("AL iteration")
     ax.set_ylabel("Discounted revenue")
-    ax.set_title("Best Intersect-true revenue across iterations (orange ◇ = per-kind mean)")
+    ax.set_title("Best real revenue per iter (per (snapshot, geology) rows; orange ◇ = per-kind mean)")
     if iters:
         ax.set_xticks(iters)
     ax.legend(loc="lower right")
@@ -239,7 +239,7 @@ def plot_kind_revenue_summary(rows: list[dict], out_dir: Path) -> None:
 
     ax.set_xlabel("AL iteration")
     ax.set_ylabel("Best real revenue so far (per kind)")
-    ax.set_title("Per-kind best-so-far Intersect-true revenue")
+    ax.set_title("Per-kind best-so-far real revenue (max over (snapshot, geology) rows)")
     if iters:
         ax.set_xticks(iters)
     ax.legend(loc="lower right")
@@ -910,7 +910,7 @@ def plot_predicted_vs_real_scatter(rows: list[dict], out_dir: Path) -> None:
 
     ax.set_xlabel("Intersect-true revenue")
     ax.set_ylabel("Surrogate-predicted revenue")
-    ax.set_title("Predicted vs real, colored by AL iteration")
+    ax.set_title("Predicted vs real per (snapshot, geology) row, colored by AL iteration")
     ax.legend(loc="best")
     _save(fig, out_dir / "scatter_pred_vs_real.png")
 
@@ -991,8 +991,8 @@ def plot_real_revenue_distribution(rows: list[dict], out_dir: Path) -> None:
         ax.scatter(x, vals, s=15, color=MANIM_GREEN, alpha=0.6, edgecolors="none")
 
     ax.set_xlabel("AL iteration")
-    ax.set_ylabel("Intersect-true revenue (per submitted candidate)")
-    ax.set_title("Distribution of batch revenues across iterations")
+    ax.set_ylabel("Real revenue (per (snapshot, geology) row)")
+    ax.set_title("Distribution of real revenue per (snapshot, geology) row, across iterations")
     _save(fig, out_dir / "real_revenue_distribution.png")
 
 
@@ -1029,7 +1029,7 @@ def plot_topk_mean_gap(rows: list[dict], out_dir: Path) -> None:
     ax.axhline(0, color=MANIM_GREY, lw=1, ls="--")
     ax.set_xlabel("AL iteration")
     ax.set_ylabel("Revenue gap")
-    ax.set_title("Top-1 vs batch center: convergence diagnostic")
+    ax.set_title("Top-1 vs mean of per-(snapshot, geology) real revenues, per iter")
     ax.legend(loc="best")
     _save(fig, out_dir / "topk_mean_gap.png")
 
@@ -1083,9 +1083,175 @@ def plot_pred_real_kde_shift(rows: list[dict], out_dir: Path, n_recent: int = 5)
                     label=f"iter {it} pred")
     ax.set_xlabel("Discounted revenue")
     ax.set_ylabel("Density")
-    ax.set_title(f"Predicted (--) vs real (—) revenue KDEs, last {n} iters")
+    ax.set_title(f"Predicted (--) vs real (—) per-geology revenue KDEs, last {n} iters")
     ax.legend(loc="best", ncol=2)
     _save(fig, out_dir / "pred_real_kde_shift.png")
+
+
+def plot_pred_real_kde_shift_ensemble(rows: list[dict], out_dir: Path,
+                                       n_recent: int = 5) -> None:
+    """ENSEMBLE-LEVEL KDE: one point per snapshot per iter.
+
+    ``plot_pred_real_kde_shift`` uses per-geology rows (M_snapshots × K_geos
+    points per iter); this one collapses to one point per snapshot using
+    ``terminal_predicted_emv`` vs mean-over-K ``real_revenue`` (the EMV that
+    selection/Adam actually optimize against). Skips with a placeholder if no
+    ensemble rows are present (per-geology runs).
+    """
+    out_path = out_dir / "pred_real_kde_shift_ensemble.png"
+    if not _is_ensemble_run(rows):
+        fig, ax = plt.subplots(figsize=(8, 4), facecolor=MANIM_BG)
+        _style_ax(ax)
+        ax.text(0.5, 0.5, "No ensemble-mode iterations — skipping ensemble KDE",
+                ha="center", va="center", color=MANIM_GREY)
+        ax.set_axis_off()
+        _save(fig, out_path)
+        return
+    try:
+        from scipy.stats import gaussian_kde
+    except Exception as e:
+        print(f"  skipping pred_real_kde_shift_ensemble — scipy unavailable: {e}")
+        return
+
+    snap_rows = _ensemble_snapshot_rows(rows)
+    if not snap_rows:
+        return
+    iters = sorted({r["iteration"] for r in snap_rows})
+    recent = iters[-n_recent:]
+    if not recent:
+        return
+
+    # Build x grid from the union of finite values.
+    all_vals: list[float] = []
+    for r in snap_rows:
+        if r["iteration"] not in recent:
+            continue
+        for k in ("terminal_predicted_emv", "terminal_real_emv"):
+            v = r.get(k)
+            if v is None:
+                continue
+            try:
+                vf = float(v)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(vf):
+                all_vals.append(vf)
+    if len(all_vals) < 2:
+        return
+    lo, hi = float(np.min(all_vals)), float(np.max(all_vals))
+    pad = 0.05 * max(1e-9, hi - lo)
+    xs = np.linspace(lo - pad, hi + pad, 400)
+
+    cmap = plt.get_cmap("Blues")
+    n = len(recent)
+    fig, ax = plt.subplots(figsize=(10, 5.5), facecolor=MANIM_BG)
+    _style_ax(ax)
+    for i, it in enumerate(recent):
+        frac = 0.35 + 0.65 * (i / max(1, n - 1))
+        color = cmap(frac)
+        real_vals = [float(r["terminal_real_emv"]) for r in snap_rows
+                     if r["iteration"] == it
+                     and r["terminal_real_emv"] is not None
+                     and np.isfinite(float(r["terminal_real_emv"]))]
+        pred_vals = [float(r["terminal_predicted_emv"]) for r in snap_rows
+                     if r["iteration"] == it
+                     and r["terminal_predicted_emv"] is not None
+                     and np.isfinite(float(r["terminal_predicted_emv"]))]
+        if len(real_vals) >= 2 and len(set(real_vals)) > 1:
+            ax.plot(xs, gaussian_kde(real_vals)(xs), color=color, lw=2,
+                    label=f"iter {it} real (n={len(real_vals)})")
+        if len(pred_vals) >= 2 and len(set(pred_vals)) > 1:
+            ax.plot(xs, gaussian_kde(pred_vals)(xs), color=color, lw=2, ls="--",
+                    label=f"iter {it} pred (n={len(pred_vals)})")
+    ax.set_xlabel("Ensemble EMV (mean discounted revenue over K geologies)")
+    ax.set_ylabel("Density")
+    ax.set_title(f"Predicted (--) vs real (—) ENSEMBLE EMV KDEs, last {n} iters")
+    ax.legend(loc="best", ncol=2)
+    _save(fig, out_path)
+
+
+def plot_predicted_vs_real_scatter_ensemble(rows: list[dict], out_dir: Path) -> None:
+    """ENSEMBLE-LEVEL pred-vs-real: one point per snapshot.
+
+    ``plot_predicted_vs_real_scatter`` plots one point per (snapshot, geology);
+    this collapses to one point per snapshot (``terminal_predicted_emv`` on the
+    y-axis, mean-over-K ``real_revenue`` on the x-axis). Tells you whether the
+    surrogate's EMV — the quantity selection/Adam actually maximize — tracks
+    the simulator's average. Skips with a placeholder for per-geology runs.
+    """
+    out_path = out_dir / "scatter_pred_vs_real_ensemble.png"
+    if not _is_ensemble_run(rows):
+        fig, ax = plt.subplots(figsize=(8, 4), facecolor=MANIM_BG)
+        _style_ax(ax)
+        ax.text(0.5, 0.5, "No ensemble-mode iterations — skipping ensemble scatter",
+                ha="center", va="center", color=MANIM_GREY)
+        ax.set_axis_off()
+        _save(fig, out_path)
+        return
+
+    snap_rows = _ensemble_snapshot_rows(rows)
+    pairs: list[tuple[int, str, float, float]] = []
+    for r in snap_rows:
+        if r["terminal_real_emv"] is None:
+            continue
+        try:
+            x = float(r["terminal_real_emv"])
+            y = float(r["terminal_predicted_emv"])
+        except (TypeError, ValueError):
+            continue
+        if not (np.isfinite(x) and np.isfinite(y)):
+            continue
+        pairs.append((int(r["iteration"]), str(r.get("kind", "?")), x, y))
+
+    fig, ax = plt.subplots(figsize=(8, 8), facecolor=MANIM_BG)
+    _style_ax(ax)
+    if not pairs:
+        ax.text(0.5, 0.5, "No finite ensemble snapshots with real EMV yet",
+                ha="center", va="center", color=MANIM_GREY,
+                transform=ax.transAxes)
+        ax.set_axis_off()
+        _save(fig, out_path)
+        return
+
+    iters = sorted({p[0] for p in pairs})
+    cmap = plt.get_cmap("plasma")
+    # Distinguish exploit vs frontier (vs cma/adversarial) by marker shape so
+    # iter-color stays available for the colormap.
+    kind_marker = {"exploit": "o", "frontier": "^", "cma": "D", "adversarial": "s"}
+    seen_iter_labels: set[int] = set()
+    seen_kind_labels: set[str] = set()
+    for it, kind, x, y in pairs:
+        if len(iters) > 1:
+            color = cmap((it - iters[0]) / max(1, iters[-1] - iters[0]))
+        else:
+            color = MANIM_BLUE
+        marker = kind_marker.get(kind, "o")
+        # One legend entry per iter (color) and per kind (marker).
+        iter_label = f"iter {it}" if it not in seen_iter_labels and (
+            it in (iters[0], iters[-1]) or len(iters) <= 4) else None
+        kind_label = (f"kind: {kind}" if kind not in seen_kind_labels else None)
+        if iter_label:
+            seen_iter_labels.add(it)
+        if kind_label:
+            seen_kind_labels.add(kind)
+        ax.scatter([x], [y], s=55, color=color, alpha=0.85, marker=marker,
+                   edgecolors="white", linewidth=0.4,
+                   label=iter_label or kind_label)
+
+    xs = [p[2] for p in pairs]
+    ys = [p[3] for p in pairs]
+    lo = float(min(min(xs), min(ys)))
+    hi = float(max(max(xs), max(ys)))
+    ax.plot([lo, hi], [lo, hi], color=MANIM_WHITE, lw=1, ls="--", label="y = x")
+
+    ax.set_xlabel("Real EMV (IX mean over K geologies)")
+    ax.set_ylabel("Predicted EMV (surrogate terminal)")
+    ax.set_title(f"Ensemble pred vs real EMV — {len(pairs)} snapshots over {len(iters)} iters")
+    handles, labels = ax.get_legend_handles_labels()
+    # Drop duplicate labels (matplotlib doesn't dedupe by default).
+    by_label = dict(zip(labels, handles))
+    ax.legend(by_label.values(), by_label.keys(), loc="best", fontsize=9)
+    _save(fig, out_path)
 
 
 # -----------------------------------------------------------------------------
@@ -1338,7 +1504,7 @@ def plot_holdout_pred_vs_real_scatter(holdout_rows: list[dict], out_dir: Path) -
     ax.plot([lo, hi], [lo, hi], color=MANIM_WHITE, lw=1, ls="--", label="y = x")
     ax.set_xlabel("Actual revenue (M$)")
     ax.set_ylabel("Predicted revenue (M$)")
-    ax.set_title(f"Holdout pred vs real, iter {latest} (geo-8 highlighted with red edge)")
+    ax.set_title(f"Holdout pred vs real per test case, iter {latest} (geo-8 highlighted with red edge)")
     ax.legend(loc="upper left", fontsize=10)
     _save(fig, out_dir / "holdout_pred_vs_real_scatter.png")
 
@@ -1693,11 +1859,17 @@ def _per_iter_emv_by_kind(rows: list[dict]) -> dict[int, dict[str, list[float]]]
 
 
 def plot_emv_distribution(history: list[dict], rows: list[dict], out_dir: Path) -> None:
-    """Per-iteration violin of per-candidate real EMV, split by kind."""
+    """ENSEMBLE-ONLY: per-iteration violin of per-snapshot real EMV, split by kind."""
+    if not _is_ensemble_run(rows):
+        fig, ax = plt.subplots(figsize=(8, 4))
+        _style_ax(ax)
+        ax.text(0.5, 0.5, "No ensemble-mode iterations — skipping per-snapshot EMV distribution",
+                ha="center", va="center", color=MANIM_GREY)
+        ax.set_axis_off()
+        _save(fig, out_dir / "emv_distribution.png")
+        return
     grouped = _per_iter_emv_by_kind(rows)
     if not grouped:
-        # No ensemble iterations yet; render a placeholder so the dashboard
-        # doesn't silently miss the plot.
         fig, ax = plt.subplots(figsize=(8, 4))
         _style_ax(ax)
         ax.text(0.5, 0.5, "No ensemble-mode iterations yet", ha="center", va="center", color=MANIM_GREY)
@@ -1749,7 +1921,7 @@ def plot_emv_distribution(history: list[dict], rows: list[dict], out_dir: Path) 
     ax.set_xticks(iters_sorted)
     ax.set_xlabel("AL iteration")
     ax.set_ylabel("Real EMV (mean discounted revenue across ensemble)")
-    ax.set_title("Per-candidate real EMV distribution, by kind")
+    ax.set_title("Per-snapshot real EMV distribution by kind (mean over K geologies)")
     ax.legend(loc="upper left", ncol=2)
     _save(fig, out_dir / "emv_distribution.png")
 
@@ -1777,6 +1949,69 @@ def plot_best_emv_so_far(history: list[dict], out_dir: Path) -> None:
     ax.set_ylabel("Real EMV")
     ax.set_title("Best ensemble EMV (running)")
     _save(fig, out_dir / "best_emv_so_far.png")
+
+
+def _is_ensemble_run(rows: list[dict]) -> bool:
+    """An ensemble row carries a finite ``terminal_predicted_emv``; per-geology
+    rows leave it as None. Used to gate ensemble-only plots."""
+    for r in rows:
+        v = r.get("terminal_predicted_emv")
+        if v is None:
+            continue
+        try:
+            if np.isfinite(float(v)):
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def _ensemble_snapshot_rows(rows: list[dict]) -> list[dict]:
+    """Collapse multi-geo rows of EVERY ensemble candidate (any kind) into one
+    row per (iter, snapshot_id). Mirrors ``_exploit_seed_rows`` but doesn't
+    filter to exploit-only.
+
+    Returns dicts with: iteration, kind, snapshot_id, terminal_predicted_emv,
+    terminal_real_emv (= mean over K real_revenues for that snapshot).
+    """
+    by_iter_snap: dict[tuple[int, str], list[dict]] = {}
+    for r in rows:
+        sid = r.get("snapshot_id")
+        if not sid:
+            continue
+        by_iter_snap.setdefault((int(r["iteration"]), str(sid)), []).append(r)
+
+    out: list[dict] = []
+    for (it, sid), rs in by_iter_snap.items():
+        first = rs[0]
+        term_pred = first.get("terminal_predicted_emv")
+        try:
+            tp = float(term_pred) if term_pred is not None else float("nan")
+        except (TypeError, ValueError):
+            tp = float("nan")
+        if not np.isfinite(tp):
+            continue  # not an ensemble snapshot
+        reals = []
+        for r in rs:
+            rv = r.get("real_revenue")
+            if rv is None:
+                continue
+            try:
+                rvf = float(rv)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(rvf):
+                reals.append(rvf)
+        term_real = float(np.mean(reals)) if reals else None
+        out.append({
+            "iteration": it,
+            "kind": first.get("kind", "?"),
+            "snapshot_id": sid,
+            "terminal_predicted_emv": tp,
+            "terminal_real_emv": term_real,
+            "n_geos": len(reals),
+        })
+    return out
 
 
 def _exploit_seed_rows(rows: list[dict]) -> list[dict]:
@@ -1869,7 +2104,16 @@ def _scatter_seed_vs_terminal(
 
 
 def plot_exploit_seed_vs_terminal_predicted(rows: list[dict], out_dir: Path) -> None:
-    """Per-seed scatter: predicted EMV at step 0 vs at step k_safe."""
+    """ENSEMBLE-ONLY per-seed scatter: predicted EMV at step 0 vs at step k_safe."""
+    out_path = out_dir / "exploit_seed_vs_terminal_predicted.png"
+    if not _is_ensemble_run(rows):
+        fig, ax = plt.subplots(figsize=(8, 4))
+        _style_ax(ax)
+        ax.text(0.5, 0.5, "No ensemble-mode iterations — skipping seed-vs-terminal predicted",
+                ha="center", va="center", color=MANIM_GREY)
+        ax.set_axis_off()
+        _save(fig, out_path)
+        return
     pts: list[tuple[int, float, float]] = []
     for r in _exploit_seed_rows(rows):
         s = r["seed_predicted_emv"]
@@ -1880,14 +2124,23 @@ def plot_exploit_seed_vs_terminal_predicted(rows: list[dict], out_dir: Path) -> 
     _scatter_seed_vs_terminal(
         pts,
         out_dir / "exploit_seed_vs_terminal_predicted.png",
-        title="Exploit: predicted EMV at seed vs after Adam",
+        title="Exploit: predicted EMV at seed vs after Adam (one point per snapshot)",
         xlabel="Seed predicted EMV (step 0)",
         ylabel="Terminal predicted EMV (step k_safe)",
     )
 
 
 def plot_exploit_seed_vs_terminal_real(rows: list[dict], out_dir: Path) -> None:
-    """Per-seed scatter: real EMV of the prior elite seed vs IX-evaluated terminal EMV."""
+    """ENSEMBLE-ONLY per-seed scatter: real EMV of the prior elite seed vs IX-evaluated terminal EMV."""
+    out_path = out_dir / "exploit_seed_vs_terminal_real.png"
+    if not _is_ensemble_run(rows):
+        fig, ax = plt.subplots(figsize=(8, 4))
+        _style_ax(ax)
+        ax.text(0.5, 0.5, "No ensemble-mode iterations — skipping seed-vs-terminal real",
+                ha="center", va="center", color=MANIM_GREY)
+        ax.set_axis_off()
+        _save(fig, out_path)
+        return
     pts: list[tuple[int, float, float]] = []
     for r in _exploit_seed_rows(rows):
         s = r["seed_real_emv"]
@@ -1898,7 +2151,7 @@ def plot_exploit_seed_vs_terminal_real(rows: list[dict], out_dir: Path) -> None:
     _scatter_seed_vs_terminal(
         pts,
         out_dir / "exploit_seed_vs_terminal_real.png",
-        title="Exploit: real EMV of seed vs IX-evaluated terminal",
+        title="Exploit: seed real EMV vs IX-evaluated terminal EMV (one point per snapshot)",
         xlabel="Seed real EMV (prior iter)",
         ylabel="Terminal real EMV (this iter, mean over K geos)",
     )
@@ -2057,6 +2310,10 @@ def main() -> int:
     plot_real_revenue_distribution(rows, out_dir)
     plot_topk_mean_gap(rows, out_dir)
     plot_pred_real_kde_shift(rows, out_dir)
+    # Ensemble-level companion plots — collapse K rows per snapshot to one EMV
+    # point. Guarded for per-geology runs (produce a "skipping" placeholder).
+    plot_pred_real_kde_shift_ensemble(rows, out_dir)
+    plot_predicted_vs_real_scatter_ensemble(rows, out_dir)
     holdout_rows = _all_holdout_rows(args.run_root, history)
     plot_holdout_mape_over_iters(holdout_rows, out_dir)
     plot_holdout_per_geology_heatmap(holdout_rows, out_dir)
