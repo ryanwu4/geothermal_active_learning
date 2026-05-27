@@ -22,7 +22,7 @@
     "ssh_control_path": "~/.ssh/cm-rwu4@login.sherlock.stanford.edu:22",
     "remote_repo_root": "/home/users/rwu4/geothermal_active_learning",
     "local_workspace": "/home/rwu4/omv_geothermal/geothermal_active_learning/local_workspace_baseline_smoke",
-    "local_geologies_config": "/home/rwu4/omv_geothermal/geothermal_active_learning/configs/geologies_smoke.json",
+    "local_geologies_config": "/home/rwu4/omv_geothermal/geothermal_active_learning/configs/geologies_smoke_local.json",
     "poll_interval_sec": 60,
     "wandb_mode": "online"
   },

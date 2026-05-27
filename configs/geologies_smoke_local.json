@@ -1,0 +1,17 @@
+{
+  "comment": "Bend-local mirror of geologies_smoke.json. Same two scenarios (74 and 76) but pointed at the bend al_local_data path. Used by the local hybrid driver (run_al_local.py / run_baseline_global.py) when compute.local_geologies_config points here. Filenames must match geologies_smoke.json exactly so _build_geology_remappings can build the bend→Sherlock prefix swap.",
+  "geologies": [
+    {
+      "geology_index": 0,
+      "scenario": 74,
+      "filename": "v2.5_0005.h5",
+      "geology_h5_file": "/home/rwu4/omv_geothermal/al_local_data/geology_h5s/v2.5_0005.h5"
+    },
+    {
+      "geology_index": 1,
+      "scenario": 76,
+      "filename": "v2.5_0001.h5",
+      "geology_h5_file": "/home/rwu4/omv_geothermal/al_local_data/geology_h5s/v2.5_0001.h5"
+    }
+  ]
+}

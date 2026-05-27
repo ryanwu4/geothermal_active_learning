@@ -628,10 +628,17 @@ def main() -> int:
             well_configs_dir.mkdir(parents=True, exist_ok=True)
             snapshots_json_dir.mkdir(parents=True, exist_ok=True)
 
+            # NB: ``run_token`` must vary across population members within a
+            # single (iteration, scenario). The Julia stager builds its IX
+            # output filename as ``v2.5_{prefix}_{scenario}_run{run_id:04d}_iter{iter:04d}.h5``
+            # — snapshot_id is not part of it — so two snapshots sharing
+            # ``(run_id, iteration, scenario)`` collide and the stager aborts.
+            # AL ensemble mode sidesteps this by having one snapshot per kind
+            # per iter; we instead encode the pop index into run_token.
             snapshot_records: list[dict] = []
             for p in range(popsize):
                 rec = _emit_baseline_snapshot(
-                    run_token=0,
+                    run_token=p,
                     generation=iteration,
                     pop_idx=p,
                     coords_xyz=coords[p],
