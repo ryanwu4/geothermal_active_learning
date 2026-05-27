@@ -1,0 +1,69 @@
+{
+  "run_id_prefix": "baseline",
+  "target": "baseline_ensemble_mean_discounted_revenue",
+
+  "wandb": {
+    "project": "geothermal_active_learning",
+    "entity": "ryanwu4",
+    "tags": ["baseline", "ablation", "no_surrogate", "cmaes_direct_ix"]
+  },
+
+  "paths": {
+    "scratch_root": "/scratch/users/rwu4/baseline_runs",
+    "surrogate_repo": "/home/users/rwu4/Geothermal_Graph_Surrogate",
+    "julia_repo": "/home/users/rwu4/GeologicalSimulationWrapper.jl",
+    "julia_config": "configs/sherlock_ryan.json",
+    "geologies_config": "configs/geologies_full.json",
+    "norm_config_path": "/scratch/users/rwu4/al_runs/norm_config.json"
+  },
+
+  "compute": {
+    "ssh_host": "sherlock",
+    "ssh_control_path": "~/.ssh/cm-rwu4@login.sherlock.stanford.edu:22",
+    "remote_repo_root": "/home/users/rwu4/geothermal_active_learning",
+    "local_workspace": "/home/rwu4/omv_geothermal/geothermal_active_learning/local_workspace_baseline",
+    "local_geologies_config": "/home/rwu4/omv_geothermal/geothermal_active_learning/configs/geologies_full_local.json",
+    "poll_interval_sec": 600,
+    "notify_email": "ryanwu2002@gmail.com",
+    "notify_msmtp_account": "gmail",
+    "wandb_mode": "online"
+  },
+
+  "optimizer": {
+    "type": "cmaes",
+    "popsize": 16,
+    "sigma_init": 5.0,
+    "edge_buffer": 10,
+    "seed": 42,
+    "fixed_depth": 50
+  },
+
+  "intersect": {
+    "max_concurrent": 50,
+    "time_per_run": "00:40:00",
+    "cpus_per_task": 2,
+    "mem_per_task": "8GB",
+    "np": 2
+  },
+
+  "stopping": {
+    "max_iterations": 30,
+    "plateau_window": 10,
+    "plateau_threshold_relative": 0.005
+  },
+
+  "wells": [
+    {"depth": 50, "type": "injector"},
+    {"depth": 50, "type": "producer"},
+    {"depth": 50, "type": "injector"},
+    {"depth": 50, "type": "producer"},
+    {"depth": 50, "type": "injector"},
+    {"depth": 50, "type": "producer"},
+    {"depth": 50, "type": "injector"},
+    {"depth": 50, "type": "producer"},
+    {"depth": 50, "type": "injector"},
+    {"depth": 50, "type": "producer"},
+    {"depth": 50, "type": "injector"},
+    {"depth": 50, "type": "producer"}
+  ]
+}

@@ -1,0 +1,24 @@
+#!/usr/bin/bash
+#SBATCH --job-name={{JOB_NAME}}
+#SBATCH --output={{LOG_OUT}}
+#SBATCH --error={{LOG_ERR}}
+#SBATCH --mem=16GB
+#SBATCH -c 4
+#SBATCH -t 1:00:00
+
+set -euo pipefail
+
+ml python/3.12.1 uv hdf5/1.14.4 openblas/0.3.20
+export UV_PYTHON=$(which python3)
+source ~/geothermal-pomdp/bin/activate
+
+export WANDB_MODE=offline
+export WANDB_DIR={{RUN_ROOT}}/wandb
+
+python {{REPO_ROOT}}/scripts/phase_ingest_baseline.py \
+    --run-root {{RUN_ROOT}} \
+    --iteration {{ITER}} \
+    --array-tasks-json {{ARRAY_TASKS_JSON}} \
+    --ix-output-dir {{IX_OUTPUT_DIR}} \
+    --manifest {{MANIFEST_PATH}} \
+    --fitness-out {{FITNESS_OUT}}
