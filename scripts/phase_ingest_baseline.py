@@ -213,7 +213,12 @@ def main() -> int:
     print(f"[ingest-baseline] wrote fitness JSON → {args.fitness_out} "
           f"({len(candidates_payload)} candidates, best_in_batch={best_in_batch})")
 
-    # Update state.
+    # Update state. We advance ``state.iteration`` here (mirroring
+    # ``phase_ingest.py:266-267``) so the local driver doesn't need a separate
+    # increment step — that previously left a resume race window where the
+    # driver crashed between local tell() and remote state push, leaving
+    # optimizer.generation ahead of state.iteration. The driver now just
+    # pulls a fresh, advanced state.
     elapsed_min = (time.time() - started) / 60.0
     rec = state.get_iter(args.iteration) or IterationRecord(iteration=args.iteration)
     rec.submitted = n_submitted
@@ -223,9 +228,11 @@ def main() -> int:
     rec.best_emv_so_far = best_so_far
     rec.wallclock_ingest_min = elapsed_min
     state.upsert_iter(rec)
+    state.iteration = args.iteration + 1
     state.save(paths.state_file)
     print(f"[ingest-baseline] iter={args.iteration} completed={n_completed}/{n_submitted} "
-          f"best_in_batch={best_in_batch} best_so_far={best_so_far} ({elapsed_min:.2f} min)")
+          f"best_in_batch={best_in_batch} best_so_far={best_so_far} ({elapsed_min:.2f} min); "
+          f"advanced state.iteration → {state.iteration}")
     return 0
 
 

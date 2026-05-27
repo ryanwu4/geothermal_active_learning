@@ -237,8 +237,66 @@ def _push_optimizer_state(remote: RemoteSession, remote_run_root: str, ws: Path)
 # ----------------------------------------------------------------------
 
 
+def _decode_h5_scalar(v):
+    """Decode an h5py scalar return into a plain Python type (bytes → str, np → py)."""
+    if isinstance(v, bytes):
+        return v.decode("utf-8")
+    if isinstance(v, np.bytes_):
+        return v.astype(str)
+    if isinstance(v, np.ndarray):
+        if v.shape == ():
+            return _decode_h5_scalar(v.item())
+        if v.size == 1:
+            return _decode_h5_scalar(v.reshape(-1)[0])
+        return [_decode_h5_scalar(x) for x in v.tolist()]
+    if isinstance(v, np.generic):
+        return v.item()
+    return v
+
+
+def _read_geology_metadata(h5_path: Path) -> dict:
+    """Read Metadata/{RepNum, ScenarioName, SampleNum} from a geology H5.
+
+    Mirrors geothermal/active_learning_utils.py:read_geology_metadata so we
+    don't need a runtime dep on the surrogate repo on the bend side. Missing
+    keys come back as empty strings — Julia's CSV writer accepts those but
+    chokes on ``None``/``nothing``.
+
+    The derived ``geology_config_id`` follows the same convention as
+    ``active_learning_utils.py:41`` — RepNum if present, else ScenarioName.
+    """
+    import h5py
+    out: dict = {"rep_num": "", "scenario_name": "", "sample_num": "",
+                 "geology_config_id": ""}
+    with h5py.File(h5_path, "r") as f:
+        meta_group = None
+        if "Metadata" in f:
+            meta_group = f["Metadata"]
+        elif "metadata" in f:
+            meta_group = f["metadata"]
+        if meta_group is None:
+            return out
+        for src_key, dst_key in (("RepNum", "rep_num"),
+                                 ("ScenarioName", "scenario_name"),
+                                 ("SampleNum", "sample_num")):
+            if src_key in meta_group:
+                v = _decode_h5_scalar(meta_group[src_key][()])
+                out[dst_key] = v if v is not None else ""
+    rep_num = out["rep_num"]
+    if rep_num not in (None, "", b""):
+        out["geology_config_id"] = rep_num
+    elif out["scenario_name"] not in (None, "", b""):
+        out["geology_config_id"] = out["scenario_name"]
+    return out
+
+
 def _load_geologies_resolved(cfg: dict) -> tuple[list[dict], np.ndarray, int, int]:
     """Load the local geology list, validate H5 files, and compute shared bounds.
+
+    Each returned entry is augmented with H5-metadata fields:
+    ``rep_num``, ``scenario_name``, ``sample_num`` (empty string if absent).
+    These feed into the manifest so the Julia stager's CSV writer sees plain
+    strings/ints instead of ``None``/``nothing``.
 
     Returns (geology_entries, valid_xy_indices, nx, ny).
     """
@@ -252,6 +310,24 @@ def _load_geologies_resolved(cfg: dict) -> tuple[list[dict], np.ndarray, int, in
         )
     h5_paths = [Path(e["geology_h5_file"]) for e in entries]
     valid_xy = intersect_valid_xy_indices(h5_paths)
+
+    # Augment each entry with H5 metadata for the manifest writer. AL's
+    # ensemble path uses RepNum from the H5 as ``geology_config_id`` (see
+    # active_learning_utils.py:41) — preferring it here keeps the IX output
+    # scenario token aligned with AL even when the local JSON's "scenario"
+    # field happens to disagree with the H5's recorded RepNum.
+    for e, p in zip(entries, h5_paths):
+        meta = _read_geology_metadata(p)
+        e["geology_scenario_name"] = e.get("geology_scenario_name") or meta["scenario_name"]
+        e["geology_sample_num"] = e.get("geology_sample_num") if e.get("geology_sample_num") is not None else meta["sample_num"]
+        # Prefer H5 RepNum; fall back to the local JSON's ``scenario`` int.
+        h5_config_id = meta["geology_config_id"]
+        if h5_config_id not in (None, "", b""):
+            e["geology_config_id"] = h5_config_id
+        else:
+            e["geology_config_id"] = e.get("scenario") or e.get("geology_config_id")
+        if not e.get("geology_name"):
+            e["geology_name"] = Path(e["geology_h5_file"]).stem
 
     # nx, ny from the first geology's temperature grid.
     import h5py
@@ -347,15 +423,22 @@ def _emit_baseline_snapshot(
     }
     json_path.write_text(json.dumps(snap_payload, indent=2))
 
+    def _safe(v, default=""):
+        # Julia CSV.write refuses to render Python None (Julia ``nothing``).
+        # Coerce any unset / None to a printable empty string. Ints / floats
+        # pass through unchanged so the Julia stager's as_int / Float64 casts
+        # still work.
+        return default if v is None else v
+
     well_config_paths_by_geology = []
     for g in geology_entries:
         well_config_paths_by_geology.append({
             "geology_index": int(g["geology_index"]),
-            "geology_name": g.get("geology_name") or Path(g["geology_h5_file"]).stem,
+            "geology_name": _safe(g.get("geology_name"), Path(g["geology_h5_file"]).stem),
             "geology_file": str(Path(g["geology_h5_file"]).resolve()),
-            "geology_config_id": g.get("scenario") or g.get("geology_config_id"),
-            "geology_scenario_name": g.get("geology_scenario_name", ""),
-            "geology_sample_num": g.get("geology_sample_num"),
+            "geology_config_id": g.get("geology_config_id") if g.get("geology_config_id") not in (None, "") else g.get("scenario"),
+            "geology_scenario_name": _safe(g.get("geology_scenario_name"), ""),
+            "geology_sample_num": _safe(g.get("geology_sample_num"), ""),
             "well_config_path": str(jl_path),
             "predicted_discounted_total_revenue": float("nan"),
         })
@@ -369,11 +452,11 @@ def _emit_baseline_snapshot(
         "json_path": str(json_path),
         "well_config_path": str(jl_path),
         "well_config_paths_by_geology": well_config_paths_by_geology,
-        # NaN-safe: keep these fields present so the Julia stager (which casts
-        # to Float64) doesn't choke. NaN → Julia parses, then writes NaN into
-        # tasks JSON. Downstream baseline ingest ignores these fields.
-        "predicted_discounted_total_revenue": 0.0,
-        "predicted_emv": 0.0,
+        # NaN, not 0.0 — the baseline has no surrogate prediction, and writing
+        # a literal zero is a lie that could pollute downstream plots that
+        # treat predicted_* as a real number. Julia parses NaN floats fine.
+        "predicted_discounted_total_revenue": float("nan"),
+        "predicted_emv": float("nan"),
     }
 
 
@@ -576,6 +659,24 @@ def main() -> int:
             valid_xy=valid_xy, nx=nx, ny=ny, remote=remote,
             remote_run_root=remote_run_root,
         )
+
+        # Invariant: optimizer.generation must equal state.iteration on
+        # entering the loop. Any mismatch means a previous run crashed
+        # between save_state and the next iter's ingest finish (or the
+        # other way), and silently continuing would corrupt either the
+        # CMA covariance (re-feeding the same fitness) or the IX run
+        # sequence (skipping a generation). Refuse and let the user
+        # inspect the run dir manually.
+        _initial_state = _pull_state(remote, remote_run_root, ws)
+        if optimizer.generation != _initial_state.iteration:
+            raise RuntimeError(
+                f"State/optimizer mismatch on resume: "
+                f"state.iteration={_initial_state.iteration}, "
+                f"optimizer.generation={optimizer.generation}. "
+                f"A previous run likely crashed mid-handoff. Inspect "
+                f"{remote_run_root}/state.json and {remote_run_root}/optimizer_state.pkl "
+                f"on Sherlock and decide which to align to the other before resuming."
+            )
 
         while True:
             if _check_done(remote, remote_run_root):
@@ -787,6 +888,11 @@ def main() -> int:
             optimizer.save_state(_optimizer_state_local(ws))
             _push_optimizer_state(remote, remote_run_root, ws)
             last_step = f"tell(): generation now {optimizer.generation}"
+            # NB: there is a short window between save_state above and the
+            # next iteration's pull where a crash could leave
+            # optimizer.generation == iteration+1 on bend but
+            # state.iteration == iteration+1 on Sherlock (ingest advanced it).
+            # The startup invariant check below catches mismatches on resume.
 
             # wandb log
             if wandb_handle is not None and wandb_handle.is_active:
@@ -802,11 +908,11 @@ def main() -> int:
                     "wallclock_ask_min": ask_min,
                 }, step=iteration)
 
-            # ---- 8. Advance state.iteration on Sherlock ----
-            fresh = _pull_state(remote, remote_run_root, ws)  # ingest updated it
-            fresh.iteration += 1
-            _push_state(remote, remote_run_root, fresh, ws)
-            last_step = f"advanced state to iter {fresh.iteration}"
+            # ---- 8. Refresh state from Sherlock for the next iter loop ----
+            # The Sherlock-side ingest already advanced state.iteration; we
+            # just pull so the next ``while True`` head sees the new value.
+            _pull_state(remote, remote_run_root, ws)
+            last_step = f"refreshed state after ingest of iter {iteration}"
 
     except SshUnavailable as e:
         _write_needs_auth(
