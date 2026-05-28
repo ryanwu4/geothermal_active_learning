@@ -691,6 +691,8 @@ def _acquire_and_select_locally(
         mode=mode,
         n_exploit=int(acq_cfg.get("n_exploit", 0)),
         n_frontier=int(acq_cfg.get("n_frontier", 0)),
+        depth_min=int(acq_cfg.get("depth_min", 5)),
+        depth_max=int(acq_cfg.get("depth_max", 70)),
     )
     started = time.time()
     out_dir = ws / "acquire" / f"iter_{iter_idx:04d}"
@@ -699,7 +701,10 @@ def _acquire_and_select_locally(
     elapsed_min = (time.time() - started) / 60.0
     print(f"[local-driver] acquired {len(acq_result['candidates'])} candidates in {elapsed_min:.2f} min")
 
-    if mode == "ensemble":
+    if mode in ("ensemble", "cma_surrogate"):
+        # cma_surrogate emits ensemble-shaped candidates (one config scored
+        # across all geologies, K IX tasks each), so it shares the ensemble
+        # selection + manifest path verbatim.
         from orchestrator.select import select_batch_ensemble
         from orchestrator.acquire import write_selected_manifest_ensemble
         cap = int(sel_cfg.get("batch_size", 0)) or None

@@ -186,6 +186,11 @@ class CMAESOptimizer:
     sigma_init: float
     seed: int
     valid_xy_indices: np.ndarray = field(repr=False)
+    # Optional explicit initial mean (length num_wells*3, flattened per-well
+    # x,y,z). When None, the LHS-stratified per-well mean below is used. The
+    # surrogate-driven acquisition (acquire.py:_run_acquisition_cma_surrogate)
+    # passes this to anchor the search on the current real-revenue incumbent.
+    mean_init: np.ndarray | None = field(default=None, repr=False)
 
     # Runtime state (populated by __post_init__ / restored by pickle).
     _es: object = field(default=None, repr=False)
@@ -221,24 +226,33 @@ class CMAESOptimizer:
         # so σ can't shrink past the discrete unit and collapse the search.
         steps = np.ones(self.num_wells * 3, dtype=np.float64)
 
-        # LHS-stratified initial mean per well, replacing the prior stacked
-        # box-center initialization. Stacking all wells at the centroid forced
-        # CMA-ES to discover well-to-well separation from scratch over the
-        # first several generations; an LHS-spread mean encodes that prior
-        # for free. Each well's (x, y, z) lands at a different Latin-square
-        # stratum so the search starts with realistic spacing.
-        try:
-            from scipy.stats import qmc  # type: ignore
-            sampler = qmc.LatinHypercube(d=3, seed=int(self.seed & 0xFFFFFFFF))
-            unit = sampler.random(self.num_wells)  # (num_wells, 3) in [0, 1]
-        except ImportError:
-            rng_init = np.random.default_rng(int(self.seed & 0xFFFFFFFF))
-            unit = rng_init.random((self.num_wells, 3))
-        mean_per_well = np.empty((self.num_wells, 3), dtype=np.float64)
-        mean_per_well[:, 0] = x_lo + unit[:, 0] * (x_hi - x_lo)
-        mean_per_well[:, 1] = y_lo + unit[:, 1] * (y_hi - y_lo)
-        mean_per_well[:, 2] = z_lo + unit[:, 2] * (z_hi - z_lo)
-        mean_init = mean_per_well.reshape(-1)
+        # Initial mean. If an explicit ``mean_init`` was supplied, use it
+        # (clipped into bounds); otherwise fall back to the LHS-stratified
+        # per-well mean. Stacking all wells at the centroid forced CMA-ES to
+        # discover well-to-well separation from scratch over the first several
+        # generations; an LHS-spread mean encodes that prior for free. Each
+        # well's (x, y, z) lands at a different Latin-square stratum so the
+        # search starts with realistic spacing.
+        if self.mean_init is not None:
+            mean_init = np.asarray(self.mean_init, dtype=np.float64).reshape(-1)
+            if mean_init.shape[0] != self.num_wells * 3:
+                raise ValueError(
+                    f"mean_init has length {mean_init.shape[0]}; expected "
+                    f"{self.num_wells * 3} (num_wells*3)."
+                )
+        else:
+            try:
+                from scipy.stats import qmc  # type: ignore
+                sampler = qmc.LatinHypercube(d=3, seed=int(self.seed & 0xFFFFFFFF))
+                unit = sampler.random(self.num_wells)  # (num_wells, 3) in [0, 1]
+            except ImportError:
+                rng_init = np.random.default_rng(int(self.seed & 0xFFFFFFFF))
+                unit = rng_init.random((self.num_wells, 3))
+            mean_per_well = np.empty((self.num_wells, 3), dtype=np.float64)
+            mean_per_well[:, 0] = x_lo + unit[:, 0] * (x_hi - x_lo)
+            mean_per_well[:, 1] = y_lo + unit[:, 1] * (y_hi - y_lo)
+            mean_per_well[:, 2] = z_lo + unit[:, 2] * (z_hi - z_lo)
+            mean_init = mean_per_well.reshape(-1)
         mean_init = np.clip(mean_init, bounds[:, 0] + 1e-3, bounds[:, 1] - 1e-3)
 
         self._es = CMAwM(
@@ -498,6 +512,7 @@ def build_optimizer(
     valid_xy_indices: np.ndarray,
     depth_bounds: tuple[int, int],
     sigma_init: float = 5.0,
+    mean_init: np.ndarray | None = None,
 ) -> BaselineOptimizer:
     """Construct an optimizer by string name. Search dim = 3 × num_wells."""
     kind = kind.lower()
@@ -506,6 +521,7 @@ def build_optimizer(
             num_wells=num_wells, nx=nx, ny=ny, edge_buffer=edge_buffer,
             depth_bounds=depth_bounds, popsize=popsize,
             sigma_init=sigma_init, seed=seed, valid_xy_indices=valid_xy_indices,
+            mean_init=mean_init,
         )
     if kind in ("random", "lhs"):
         return RandomOptimizer(

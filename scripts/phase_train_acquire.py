@@ -243,6 +243,8 @@ def main() -> int:
         mode=mode,
         n_exploit=int(acq_cfg.get("n_exploit", 0)),
         n_frontier=int(acq_cfg.get("n_frontier", 0)),
+        depth_min=int(acq_cfg.get("depth_min", 5)),
+        depth_max=int(acq_cfg.get("depth_max", 70)),
     )
     acq_started = time.time()
     acq_result = run_acquisition(
@@ -252,9 +254,10 @@ def main() -> int:
     print(f"Acquired {len(acq_result['candidates'])} raw candidates in {acq_elapsed_min:.2f} min")
 
     # ----- Step 3: select batch -----
-    if mode == "ensemble":
+    if mode in ("ensemble", "cma_surrogate"):
         # Each candidate already represents a full ensemble configuration; rank
         # by predicted EMV. The selection cap is optional in ensemble mode.
+        # cma_surrogate emits ensemble-shaped candidates and reuses this path.
         cap = int(sel_cfg.get("batch_size", 0)) or None
         selected = select_batch_ensemble(acq_result["candidates"], batch_size=cap)
     else:
@@ -284,7 +287,7 @@ def main() -> int:
     print(f"Selected {len(selected)} candidates for IX submission")
 
     selected_manifest = paths.iter_manifest(state.iteration)
-    if mode == "ensemble":
+    if mode in ("ensemble", "cma_surrogate"):
         write_selected_manifest_ensemble(
             selected,
             out_path=selected_manifest,

@@ -67,6 +67,35 @@ def test_acquisition_config_accepts_4kind_overrides() -> None:
     assert len(cfg.prior_metrics) == 1
 
 
+def test_acquisition_config_depth_defaults() -> None:
+    cfg = _minimal_cfg()
+    # Depth bounds default to the IX-baseline window; mode defaults to per_geology.
+    assert cfg.depth_min == 5
+    assert cfg.depth_max == 70
+    assert cfg.mode == "per_geology"
+
+
+def test_acquisition_config_accepts_cma_surrogate_overrides() -> None:
+    cfg = _minimal_cfg(
+        mode="cma_surrogate",
+        depth_min=10,
+        depth_max=55,
+        cma_popsize=32,
+        cma_generations=60,
+        cma_sigma_init=12.0,
+        n_exploit=16,
+        n_frontier=4,
+    )
+    assert cfg.mode == "cma_surrogate"
+    assert cfg.depth_min == 10
+    assert cfg.depth_max == 55
+    assert cfg.cma_popsize == 32
+    assert cfg.cma_generations == 60
+    assert cfg.cma_sigma_init == 12.0
+    assert cfg.n_exploit == 16
+    assert cfg.n_frontier == 4
+
+
 def test_start_kind_to_safe_kind_map() -> None:
     assert _START_KIND_TO_SAFE_KIND == {
         "lhs": "frontier",

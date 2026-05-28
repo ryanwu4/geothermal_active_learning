@@ -97,6 +97,13 @@ class AcquisitionConfig:
     n_exploit: int = 0     # ensemble: Adam-from-elite-seed starts (kind="exploit")
     n_frontier: int = 0    # ensemble: Adam-from-LHS starts (kind="frontier")
 
+    # Depth (well-length) bounds for the "cma_surrogate" mode, which optimizes
+    # per-well (x, y, z). Ignored by the Adam paths (they pin depth per WellSpec).
+    # z_hi is additionally capped at the reservoir grid extent (z_max-1) at
+    # runtime so emitted depths stay inside every geology's active grid.
+    depth_min: int = 5
+    depth_max: int = 70
+
 
 # Canonical ordering for snapshots in the aggregate manifest so parallel runs
 # produce byte-identical output to serial runs.
@@ -1292,6 +1299,10 @@ def run_acquisition(
       - ``out_dir/snapshots_json/<snapshot_id>.json`` per snapshot
       - ``out_dir/manifest.json`` aggregate
     """
+    if getattr(cfg, "mode", "per_geology") == "cma_surrogate":
+        return _run_acquisition_cma_surrogate(
+            cfg, out_dir=out_dir, iteration=iteration, run_id_prefix=run_id_prefix,
+        )
     if getattr(cfg, "mode", "per_geology") == "ensemble":
         return _run_acquisition_ensemble(
             cfg, out_dir=out_dir, iteration=iteration, run_id_prefix=run_id_prefix,
@@ -1912,6 +1923,438 @@ def write_selected_manifest_ensemble(
     with open(out_path, "w") as f:
         json.dump(manifest, f, indent=2)
     return out_path
+
+
+def _dedup_indices_by_xy(
+    coords_list: list[np.ndarray],
+    order: np.ndarray,
+    num_wells: int,
+    k: int,
+    min_xy_dist: float,
+) -> list[int]:
+    """Greedily pick up to ``k`` indices from ``coords_list`` (walked in
+    ``order``), skipping any candidate whose well (x, y) layout is within
+    ``min_xy_dist`` (L2 over the flattened per-well xy vector) of an already
+    picked one.
+
+    Depth (z) is deliberately EXCLUDED from the distance: two configs that
+    differ only in depth are the same well *placement*, and mixing z-layer units
+    with xy-cell units in one L2 lets depth noise mask near-duplicate layouts.
+    If fewer than ``k`` distinct layouts survive, backfills from ``order``
+    (ignoring the filter) so the shortlist is never silently short.
+    """
+    picked: list[int] = []
+    picked_xy: list[np.ndarray] = []
+    for idx in order:
+        if len(picked) >= k:
+            break
+        i = int(idx)
+        xy = np.asarray(coords_list[i])[:, :2].reshape(-1)
+        if picked_xy:
+            d = np.linalg.norm(np.stack(picked_xy) - xy[None, :], axis=1)
+            if float(d.min()) < min_xy_dist:
+                continue
+        picked.append(i)
+        picked_xy.append(xy)
+    if len(picked) < k:
+        chosen = set(picked)
+        for idx in order:
+            if len(picked) >= k:
+                break
+            i = int(idx)
+            if i in chosen:
+                continue
+            picked.append(i)
+            chosen.add(i)
+    return picked
+
+
+def _run_acquisition_cma_surrogate(
+    cfg: AcquisitionConfig,
+    *,
+    out_dir: Path,
+    iteration: int,
+    run_id_prefix: str = "al",
+) -> dict[str, Any]:
+    """CMA-ES-over-surrogate acquisition (ensemble flavor).
+
+    Runs CMA-ES locally over the surrogate to pick the batch of well
+    configurations to query INTERSECT for — a gradient-free alternative to the
+    Adam ensemble path that does not chase the surrogate's (anti-aligned, see
+    analysis/diag1_adam_destruction) local gradient. Each candidate is one full
+    well configuration scored as the mean predicted revenue across ALL K
+    geologies, so it ships K IX tasks, exactly like ``_run_acquisition_ensemble``.
+    Output shape is identical to that path; Julia staging keys off
+    ``well_config_paths_by_geology``, not the manifest mode, so downstream is
+    unchanged.
+
+    Decision vector is per-well (x, y, z); depth z is searched for parity with
+    the IX baseline. Unlike the Adam paths — which are forced to build the graph
+    once and only overwrite ``pos_xyz`` (backprop needs a differentiable path) —
+    this gradient-free search REBUILDS an accurate graph for every queried
+    candidate, so the node-level features, perforation depth and KNN topology
+    track the actual well positions. Node embeddings dominate the surrogate's
+    accuracy, so keeping them correct at every query is worth the ~2x cost over
+    a static-``pos_xyz``-overwrite proxy. Because every query is accurate, search
+    ranking, selection and the reported ``predicted_emv`` are all the same
+    number — there is no separate re-rank stage. (The surrogate's depth response
+    is still weak — it was trained over a narrow band — so z is explored more
+    than truly optimized; that's fine, it yields depth-varying IX labels.)
+
+    The search engine is reused from the IX baseline
+    (``baseline_optimizer.build_optimizer``), driven with a local surrogate
+    fitness closure instead of real IX runs. Single-device, forward-only: this
+    skips the multi-GPU replica machinery (and its peer-copy hazard) the Adam
+    ensemble path needs — though per-query rebuild makes geology-parallelism
+    across GPUs the obvious next speedup if iteration wall-clock matters.
+    """
+    from .baseline_optimizer import build_optimizer, project_to_valid_cells
+    from .select import _farthest_point_select
+
+    out_dir = Path(out_dir)
+    well_configs_dir = out_dir / "well_configs"
+    snapshots_json_dir = out_dir / "snapshots_json"
+    well_configs_dir.mkdir(parents=True, exist_ok=True)
+    snapshots_json_dir.mkdir(parents=True, exist_ok=True)
+
+    device_strs = list(cfg.devices) if cfg.devices else [cfg.device]
+    started = time.time()
+    timings: dict[str, float] = {}
+
+    t_ctx = time.perf_counter()
+    ctx = _build_worker_context(cfg, iteration, device_strs[0])
+    timings["worker_ctx_load_s"] = time.perf_counter() - t_ctx
+    device = ctx.device
+    model = ctx.model
+    target_mean = ctx.target_mean
+    target_scale = ctx.target_scale
+    is_injector_list = ctx.is_injector_list
+    num_wells = ctx.num_wells
+
+    geologies = list(cfg.geologies)
+    K = len(geologies)
+    if K == 0:
+        raise RuntimeError("cma_surrogate acquisition requires at least one geology.")
+
+    # ----- Load every geology's static physics tensors + metadata -----
+    t0 = time.perf_counter()
+    geology_metas: dict[int, dict] = {}
+    geology_loaded: list[dict[str, Any]] = []
+    for g in geologies:
+        gp = Path(g.geology_h5_file)
+        with h5py.File(gp, "r") as src:
+            geology_metas[g.geology_index] = _read_geology_metadata_safe(
+                ctx.read_geology_metadata, src, g.geology_name or gp.stem
+            )
+        geology_loaded.append(_load_geology(
+            gp, ctx.norm_config,
+            ctx.PROPERTIES, ctx.PERM_PROPS, ctx.get_valid_mask, ctx.find_z_cutoff,
+        ))
+    timings["geo_load_s"] = time.perf_counter() - t0
+
+    nx = min(d["nx"] for d in geology_loaded)
+    ny = min(d["ny"] for d in geology_loaded)
+    z_max = min(d["z_max"] for d in geology_loaded)
+    x_lo, x_hi = float(cfg.edge_buffer), float(nx - 1 - cfg.edge_buffer)
+    y_lo, y_hi = float(cfg.edge_buffer), float(ny - 1 - cfg.edge_buffer)
+
+    # Columns valid (live rock + inside edge buffer) across ALL geologies.
+    ix_lo, ix_hi = int(np.ceil(x_lo)), int(np.floor(x_hi))
+    iy_lo, iy_hi = int(np.ceil(y_lo)), int(np.floor(y_hi))
+    has_valid_z_all = None
+    for d in geology_loaded:
+        hv = np.any(d["temp0_full"][:z_max] > -900, axis=0)
+        has_valid_z_all = hv if has_valid_z_all is None else (has_valid_z_all & hv)
+    edge_window = np.zeros_like(has_valid_z_all, dtype=bool)
+    edge_window[ix_lo:ix_hi + 1, iy_lo:iy_hi + 1] = True
+    valid_xy = has_valid_z_all & edge_window
+    valid_xy_indices = np.argwhere(valid_xy)
+    if valid_xy_indices.shape[0] < num_wells:
+        raise RuntimeError(
+            f"cma_surrogate: only {valid_xy_indices.shape[0]} (x,y) columns are "
+            f"valid across all {K} geologies inside edge buffer {cfg.edge_buffer}; "
+            f"need >= {num_wells}."
+        )
+
+    # Depth bounds: cap z_hi at the reservoir grid extent so emitted/forwarded
+    # depths stay inside every geology's active grid.
+    z_hi_eff = int(min(int(cfg.depth_max), int(z_max) - 1))
+    z_lo_eff = int(min(int(cfg.depth_min), z_hi_eff - 1))
+    if z_hi_eff <= z_lo_eff:
+        raise RuntimeError(
+            f"cma_surrogate: degenerate depth bounds (z_lo={z_lo_eff}, z_hi={z_hi_eff}) "
+            f"from depth_min={cfg.depth_min}, depth_max={cfg.depth_max}, z_max={z_max}."
+        )
+
+    rng = np.random.default_rng(_per_geology_seed(ctx.base_seed, 0))
+
+    # ----- Build ACCURATE per-candidate graphs for one (x,y,z) batch: one
+    # static-graph batch per geology. Called fresh for every CMA query so the
+    # node-level features, perforation depth and KNN topology track the actual
+    # well positions (the dominant accuracy driver), not just pos_xyz. -----
+    def _build_batches(cfgs: list[list[dict]]) -> list[Any]:
+        batches = []
+        for g, d in zip(geologies, geology_loaded):
+            static_graphs = _build_static_batch_for_starts(
+                cfgs, Path(g.geology_h5_file), d["physics_dict"], d["full_shape"],
+                d["z_cutoff"], d["nx"], d["ny"],
+                cfg.revenue_target, ctx.scaler,
+                ctx.extract_well_data, ctx.build_wells_table, ctx.extract_vertical_profiles,
+                ctx.build_single_hetero_data, d["temp0_full"],
+                node_encoder=ctx.node_encoder, enrich_global_attr=ctx.enrich_global_attr,
+            )
+            batches.append(Batch.from_data_list(static_graphs).to(device))
+        return batches
+
+    def _predict_all_geos(coords_xyz_np: np.ndarray, batches: list[Any]) -> np.ndarray:
+        """Return (M, K) unscaled predictions; M must match the batch slot count.
+
+        The surrogate-grid z is clamped to [0, z_max-1] for the forward (the
+        emitted/queried depth keeps its full CMA value up to z_hi_eff)."""
+        M_local = coords_xyz_np.shape[0]
+        c = coords_xyz_np.astype(np.float32).copy()
+        c[:, :, 0] = np.clip(c[:, :, 0], 0, nx - 1)
+        c[:, :, 1] = np.clip(c[:, :, 1], 0, ny - 1)
+        c[:, :, 2] = np.clip(c[:, :, 2], 0, z_max - 1)
+        c_t = torch.from_numpy(c).to(device)
+        cols: list[np.ndarray] = []
+        with torch.no_grad():
+            for bd in batches:
+                bd["well"].pos_xyz = c_t.view(-1, 3)
+                pred_scaled = model(bd).view(M_local)
+                preds = (pred_scaled * target_scale + target_mean).detach().cpu().numpy()
+                cols.append(preds)
+        return np.stack(cols, axis=1)  # (M, K)
+
+    # ----- CMA-ES over the surrogate, rebuilding an ACCURATE graph for EVERY
+    # queried candidate. Per-query rebuild (vs the static pos_xyz overwrite the
+    # Adam path is forced into) keeps the node-level embeddings correct — they
+    # dominate the surrogate's accuracy — at ~2x the per-eval cost. Since every
+    # query is accurate, search ranking == selection == reported prediction; no
+    # separate re-rank stage is needed. -----
+    popsize = int(cfg.cma_popsize)
+    n_exploit = int(cfg.n_exploit)
+    n_frontier = int(cfg.n_frontier)
+    if n_exploit + n_frontier == 0:
+        raise RuntimeError("cma_surrogate: n_exploit + n_frontier must be > 0.")
+
+    def _coords_to_cfgs(coords_arr: np.ndarray) -> list[list[dict]]:
+        return [
+            [
+                {"x": float(c[w, 0]), "y": float(c[w, 1]),
+                 "depth": int(min(int(round(float(c[w, 2]))), z_max - 1)),
+                 "type": cfg.wells[w].type}
+                for w in range(num_wells)
+            ]
+            for c in coords_arr
+        ]
+
+    def _predict_rebuilt(coords_arr: np.ndarray) -> np.ndarray:
+        """Build accurate per-candidate graphs for these coords and return the
+        (M, K) unscaled per-geology predictions."""
+        return _predict_all_geos(coords_arr, _build_batches(_coords_to_cfgs(coords_arr)))
+
+    # ----- Optional: seed CMA mean from the best real-revenue incumbent --------
+    mean_init = None
+    seed_incumbent_id: str | None = None
+    seed_incumbent_iter: int | None = None
+    if iteration >= 1 and cfg.prior_metrics:
+        elite_triples = _load_elite_seeds_ensemble(
+            prior_metrics=list(cfg.prior_metrics or []), k=1, rng=rng,
+        )
+        # Guard: only seed if the incumbent has the same well count as this run.
+        if elite_triples and np.asarray(elite_triples[0][0]).shape[0] == num_wells:
+            base, seed_incumbent_id, seed_incumbent_iter = elite_triples[0]
+            base = np.asarray(base, dtype=np.float64).copy()  # (num_wells, 3)
+            # Anchor xy on the incumbent (projected onto a valid cell so the
+            # anchor isn't silently resampled away at ask() time); start z at
+            # mid-range so depth is broadly explored rather than pinned.
+            base[:, :2] = project_to_valid_cells(
+                base[None, :, :2].astype(np.float32), valid_xy_indices,
+                num_wells, rng, nx=nx, ny=ny,
+            )[0].astype(np.float64)
+            base[:, 2] = 0.5 * (z_lo_eff + z_hi_eff)
+            mean_init = base.reshape(-1)
+
+    opt = build_optimizer(
+        "cmaes",
+        num_wells=num_wells, nx=nx, ny=ny, edge_buffer=int(cfg.edge_buffer),
+        popsize=popsize, seed=int(cfg.seed) + int(iteration),
+        valid_xy_indices=valid_xy_indices,
+        depth_bounds=(z_lo_eff, z_hi_eff),
+        sigma_init=float(cfg.cma_sigma_init),
+        mean_init=mean_init,
+    )
+
+    # Pool keeps each finite candidate's coords AND its accurate per-geology
+    # prediction row, so the emit step reuses them with no recompute.
+    pool_coords: list[np.ndarray] = []   # each (num_wells, 3)
+    pool_preds: list[np.ndarray] = []    # each (K,) accurate per-geology row
+    pool_emv: list[float] = []
+    t0 = time.perf_counter()
+    for _gen in range(int(cfg.cma_generations)):
+        coords = opt.ask()  # (popsize, num_wells, 3), projected to valid cells
+        preds = _predict_rebuilt(coords)  # (popsize, K) — ACCURATE graphs
+        with np.errstate(invalid="ignore"):  # all-NaN row -> NaN, filtered below
+            emv = np.nanmean(preds, axis=1)  # (popsize,)
+        opt.tell(coords, emv)
+        for i in range(popsize):
+            if np.isfinite(emv[i]) and np.isfinite(preds[i]).all():
+                pool_coords.append(coords[i].astype(np.float32).copy())
+                pool_preds.append(preds[i].astype(np.float32).copy())
+                pool_emv.append(float(emv[i]))
+    timings["cma_loop_s"] = time.perf_counter() - t0
+    timings["cma_generations"] = float(cfg.cma_generations)
+    timings["cma_popsize"] = float(popsize)
+    timings["graph_builds"] = float(int(cfg.cma_generations) * popsize * K)
+    timings["pool_size"] = float(len(pool_coords))
+    if not pool_coords:
+        raise RuntimeError(
+            "cma_surrogate: CMA-ES produced no finite-fitness candidates — the "
+            "surrogate returned non-finite predictions for every sample."
+        )
+
+    # ----- Exploit picks: top accurate-EMV, de-duplicated by xy layout --------
+    order = np.argsort(-np.asarray(pool_emv))
+    exploit_idx = _dedup_indices_by_xy(pool_coords, order, num_wells, n_exploit, min_xy_dist=4.0)
+    if len(exploit_idx) < n_exploit:
+        print(
+            f"[acquire-cma] WARNING: only {len(exploit_idx)} exploit candidates available "
+            f"(requested {n_exploit}); pool too small (pool={len(pool_coords)}, "
+            f"generations={cfg.cma_generations}, popsize={popsize}).",
+            flush=True,
+        )
+
+    # ----- Frontier picks: LHS + FPS on xy, scored on accurate rebuilt graphs --
+    frontier_coords: list[np.ndarray] = []
+    frontier_preds: list[np.ndarray] = []
+    if n_frontier > 0:
+        pool_n = max(8, 4 * n_frontier)
+        sampler = qmc.LatinHypercube(d=2 * num_wells, seed=int(rng.integers(0, 2**31 - 1)))
+        unit = sampler.random(pool_n)
+        lhs = np.zeros((pool_n, num_wells, 3), dtype=np.float32)
+        for w in range(num_wells):
+            lhs[:, w, 0] = x_lo + unit[:, 2 * w] * (x_hi - x_lo)
+            lhs[:, w, 1] = y_lo + unit[:, 2 * w + 1] * (y_hi - y_lo)
+        # Snap z to integer layers so the rebuilt graph's depth (int(round(z)))
+        # and the pos_xyz z fed to the forward agree — CMA-loop coords are
+        # already integer-z (CMAwM snaps them), so this keeps frontier consistent.
+        lhs[:, :, 2] = np.round(rng.uniform(z_lo_eff, z_hi_eff, size=(pool_n, num_wells)))
+        lhs[:, :, :2] = project_to_valid_cells(
+            lhs[:, :, :2], valid_xy_indices, num_wells, rng, nx=nx, ny=ny,
+        )
+        # FPS on xy only — z scatter shouldn't inflate "spread" (z-layer units
+        # aren't comparable to xy-cell units, and the surrogate is near-flat in z).
+        xy_feats = lhs[:, :, :2].reshape(pool_n, -1)
+        sel_idx = _farthest_point_select(xy_feats, min(n_frontier, pool_n), seed_idx=0)
+        sel_coords = np.stack([lhs[i] for i in sel_idx], axis=0)
+        t0 = time.perf_counter()
+        sel_preds = _predict_rebuilt(sel_coords)  # (n_frontier, K) — ACCURATE
+        timings["frontier_forward_s"] = time.perf_counter() - t0
+        for j in range(sel_coords.shape[0]):
+            frontier_coords.append(sel_coords[j].astype(np.float32))
+            frontier_preds.append(sel_preds[j].astype(np.float32))
+
+    # ----- Assemble emit list (exploit first, then frontier), reusing the
+    # accurate per-geology predictions computed during the search/frontier. -----
+    emit_entries: list[tuple[np.ndarray, str, np.ndarray]] = []
+    for i in exploit_idx:
+        emit_entries.append((pool_coords[i], "exploit", pool_preds[i]))
+    for c, p in zip(frontier_coords, frontier_preds):
+        if np.isfinite(p).all():
+            emit_entries.append((c, "frontier", p))
+    if not emit_entries:
+        raise RuntimeError("cma_surrogate: no finite candidates to emit.")
+
+    # ----- Emit snapshots + candidates -----
+    snapshots: list[dict[str, Any]] = []
+    candidates: list[Candidate] = []
+    t0 = time.perf_counter()
+    for m, (cxyz, kind, pred_row) in enumerate(emit_entries):
+        if not np.isfinite(pred_row).all() or not np.isfinite(cxyz).all():
+            print(f"[acquire-cma] skip non-finite candidate m={m} kind={kind}", flush=True)
+            continue
+        predictions_by_geology = []
+        for k_idx, g in enumerate(geologies):
+            meta = geology_metas.get(g.geology_index, {})
+            predictions_by_geology.append({
+                "geology_index": g.geology_index,
+                "geology_name": g.geology_name or Path(g.geology_h5_file).stem,
+                "geology_file": str(Path(g.geology_h5_file).resolve()),
+                "geology_config_id": meta.get("geology_config_id"),
+                "geology_scenario_name": meta.get("scenario_name"),
+                "geology_sample_num": meta.get("sample_num"),
+                "discounted_total_revenue": float(pred_row[k_idx]),
+                "total_energy_production": float("nan"),
+            })
+        predicted_emv = float(np.mean(pred_row))
+        is_exploit = (kind == "exploit")
+        snap = _emit_snapshot_ensemble(
+            run_id=m,
+            iteration_step=int(cfg.cma_generations),
+            kind=kind,
+            coords_xyz=cxyz,
+            is_injector_list=is_injector_list,
+            predictions_by_geology=predictions_by_geology,
+            predicted_emv=predicted_emv,
+            seed_source_snapshot_id=(seed_incumbent_id if is_exploit else None),
+            seed_source_iteration=(seed_incumbent_iter if is_exploit else None),
+            seed_predicted_emv=None,
+            geologies=geologies,
+            geology_metas=geology_metas,
+            well_configs_dir=well_configs_dir,
+            snapshots_json_dir=snapshots_json_dir,
+            to_julia_wells_text=ctx.to_julia_wells_text,
+        )
+        snapshots.append(snap)
+        candidates.append(_snapshot_to_candidate_ensemble(snap, cxyz, is_injector_list))
+    timings["snapshot_io_s"] = time.perf_counter() - t0
+
+    # ----- Profiling CSV (single row) -----
+    profiling_dir = out_dir / "profiling"
+    profiling_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = profiling_dir / f"gpu_timings_iter_{iteration:04d}.csv"
+    csv_row = {"device": device_strs[0], "geology_index": "ALL", **timings}
+    col_order = ["device", "geology_index"] + [
+        k for k in sorted(csv_row.keys()) if k not in ("device", "geology_index")
+    ]
+    with open(csv_path, "w") as f:
+        f.write(",".join(col_order) + "\n")
+        f.write(",".join(str(csv_row.get(k, "")) for k in col_order) + "\n")
+
+    manifest = {
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "iteration": iteration,
+        "run_id_prefix": run_id_prefix,
+        # This acquire-stage manifest is informational only (the IX manifest is
+        # (re)written by write_selected_manifest_ensemble, which stamps
+        # "ensemble"). Tag it honestly so cma vs Adam-ensemble iterations are
+        # distinguishable from the persisted acquire artifact.
+        "mode": "cma_surrogate",
+        "acquisition_optimizer": "cma_surrogate",
+        "cma_popsize": int(cfg.cma_popsize),
+        "cma_generations": int(cfg.cma_generations),
+        "cma_sigma_init": float(cfg.cma_sigma_init),
+        "depth_bounds": [int(z_lo_eff), int(z_hi_eff)],
+        "n_exploit": cfg.n_exploit,
+        "n_frontier": cfg.n_frontier,
+        "geology_metadata": [
+            {
+                "geology_index": g.geology_index,
+                "geology_name": g.geology_name or Path(g.geology_h5_file).stem,
+                "geology_file": str(Path(g.geology_h5_file).resolve()),
+            }
+            for g in geologies
+        ],
+        "snapshot_count": len(snapshots),
+        "snapshots": snapshots,
+        "wallclock_seconds": time.time() - started,
+    }
+    manifest_path = out_dir / "manifest.json"
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+
+    return {"manifest": manifest, "manifest_path": str(manifest_path), "candidates": candidates}
 
 
 def _run_acquisition_ensemble(
