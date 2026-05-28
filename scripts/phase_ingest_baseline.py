@@ -213,6 +213,73 @@ def main() -> int:
     print(f"[ingest-baseline] wrote fitness JSON → {args.fitness_out} "
           f"({len(candidates_payload)} candidates, best_in_batch={best_in_batch})")
 
+    # ----------------------------------------------------------------------
+    # Also emit per_candidate_metrics.json in the AL plot suite's schema,
+    # one row per (snapshot, geology). predicted_revenue / MAPE fields are
+    # NaN (no surrogate), so the surrogate-only plots will gracefully skip
+    # via their isfinite guards. The revenue / EMV / well-position /
+    # wallclock plots only consume real_revenue + coords_xyz + history and
+    # render fine off this data.
+    # ----------------------------------------------------------------------
+    per_candidate_rows: list[dict] = []
+    per_candidate_emv: dict[str, float] = {}
+    for snap, cand in zip(snapshots, candidates_payload):
+        sid = str(snap.get("snapshot_id", ""))
+        # Capture EMV (ensemble mean) for the iteration record's
+        # per_candidate_emv map — AL plots key off this for some panels.
+        emv = cand.get("ensemble_mean_revenue")
+        if emv is not None and np.isfinite(emv):
+            per_candidate_emv[sid] = float(emv)
+        # Build one row per geology IX run.
+        for t in tasks_by_snap.get(sid, []):
+            geo_idx = int(t.get("geology_index", -1))
+            case_id = Path(str(t.get("output_file_name", ""))).stem
+            geo_key = str(geo_idx)
+            real_rev = cand["per_geology_revenue"].get(geo_key)
+            # Use None (JSON null) for surrogate-derived fields — the AL plot
+            # suite filters with ``is not None`` but does NOT filter NaN, so
+            # writing NaN would contaminate KDE x-grids and crash plots like
+            # ``plot_pred_real_kde_shift``. None makes those plots silently
+            # skip while leaving real_revenue intact for the rest.
+            row = {
+                "snapshot_id": sid,
+                "case_id": case_id,
+                "output_file_name": t.get("output_file_name", ""),
+                "geology_index": geo_idx,
+                "geology_config_id": t.get("scenario") or t.get("config_id"),
+                "kind": "baseline",
+                "predicted_revenue": None,
+                "real_revenue": float(real_rev) if real_rev is not None else None,
+                "abs_pct_error": None,
+                "signed_pct_error": None,
+                "abs_error": None,
+                "abs_pct_error_floored": None,
+                "seed_source_snapshot_id": None,
+                "seed_source_iteration": None,
+                "seed_predicted_emv": None,
+                "terminal_predicted_emv": None,
+                "seed_real_emv": None,
+                "terminal_real_emv": cand.get("ensemble_mean_revenue"),
+            }
+            per_candidate_rows.append(row)
+
+    per_cand_payload = {
+        "iteration": args.iteration,
+        "n_submitted": n_submitted,
+        "n_completed": n_completed,
+        "candidates": per_candidate_rows,
+        "per_candidate_emv": per_candidate_emv,
+        "best_emv_in_batch": best_in_batch,
+        # No exploit kind in the baseline — leave AL's exploit-specific keys
+        # absent so plot_exploit_* skip cleanly.
+    }
+    per_cand_path = paths.iter_dir(args.iteration) / "per_candidate_metrics.json"
+    per_cand_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(per_cand_path, "w") as f:
+        json.dump(per_cand_payload, f, indent=2)
+    print(f"[ingest-baseline] wrote per_candidate_metrics → {per_cand_path} "
+          f"({len(per_candidate_rows)} rows)")
+
     # Update state. We advance ``state.iteration`` here (mirroring
     # ``phase_ingest.py:266-267``) so the local driver doesn't need a separate
     # increment step — that previously left a resume race window where the
@@ -227,6 +294,7 @@ def main() -> int:
     rec.best_emv_in_batch = best_in_batch
     rec.best_emv_so_far = best_so_far
     rec.wallclock_ingest_min = elapsed_min
+    rec.per_candidate_emv = per_candidate_emv or None
     state.upsert_iter(rec)
     state.iteration = args.iteration + 1
     state.save(paths.state_file)

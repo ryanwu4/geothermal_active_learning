@@ -219,6 +219,62 @@ def _check_done(remote: RemoteSession, remote_run_root: str) -> bool:
     return remote.run(["test", "-f", f"{remote_run_root}/done.json"], check=False).returncode == 0
 
 
+def _pull_per_candidate_metrics(
+    remote: RemoteSession, remote_run_root: str, iteration: int, ws: Path,
+) -> bool:
+    """Mirror Sherlock's per_candidate_metrics.json for one iter to bend.
+
+    The local plot suite (``plot_convergence.py``) reads
+    ``<ws>/iter_NNNN/per_candidate_metrics.json``; mirror it so the
+    revenue / well-position / wallclock plots can render off the
+    baseline ingest's output. Surrogate-dependent plots (MAPE,
+    pred-vs-real scatter, calibration, holdout) will silently skip
+    because predicted_revenue is NaN in the baseline schema.
+    """
+    remote_path = f"{remote_run_root}/iter_{iteration:04d}/per_candidate_metrics.json"
+    if remote.run(["test", "-f", remote_path], check=False).returncode != 0:
+        return False
+    local = ws / f"iter_{iteration:04d}" / "per_candidate_metrics.json"
+    local.parent.mkdir(parents=True, exist_ok=True)
+    remote.pull(remote_path, local)
+    return True
+
+
+def _render_plots(ws: Path) -> None:
+    """Invoke plot_convergence.py against the local workspace.
+
+    Runs in a subprocess so a plot-side import (matplotlib backend, font
+    cache, etc.) can't contaminate the driver. Plotting is diagnostic; a
+    plot failure should never crash the AL loop.
+    """
+    state_path = _state_mirror_path(ws)
+    if not state_path.exists():
+        return
+    try:
+        with open(state_path) as f:
+            payload = json.load(f)
+    except Exception:
+        return
+    if not payload.get("history"):
+        return
+    out_dir = ws / "plots"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    plot_script = REPO_ROOT / "scripts" / "plot_convergence.py"
+    cmd = [sys.executable, str(plot_script), str(ws), "--out-dir", str(out_dir)]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, check=False,
+            env={**os.environ, "MPLBACKEND": "Agg"},
+        )
+        if result.returncode != 0:
+            print(f"[baseline-driver] plot rendering failed (rc={result.returncode}):\n"
+                  f"{result.stderr[-1500:]}", file=sys.stderr)
+        else:
+            print(f"[baseline-driver] rendered plots → {out_dir}")
+    except Exception as e:
+        print(f"[baseline-driver] plot rendering bailed: {e}", file=sys.stderr)
+
+
 def _pull_optimizer_state(remote: RemoteSession, remote_run_root: str, ws: Path) -> bool:
     """Pull optimizer_state.pkl if it exists on Sherlock. Returns True on success."""
     remote_path = f"{remote_run_root}/optimizer_state.pkl"
@@ -290,7 +346,7 @@ def _read_geology_metadata(h5_path: Path) -> dict:
     return out
 
 
-def _load_geologies_resolved(cfg: dict) -> tuple[list[dict], np.ndarray, int, int]:
+def _load_geologies_resolved(cfg: dict) -> tuple[list[dict], np.ndarray, int, int, int]:
     """Load the local geology list, validate H5 files, and compute shared bounds.
 
     Each returned entry is augmented with H5-metadata fields:
@@ -298,7 +354,10 @@ def _load_geologies_resolved(cfg: dict) -> tuple[list[dict], np.ndarray, int, in
     These feed into the manifest so the Julia stager's CSV writer sees plain
     strings/ints instead of ``None``/``nothing``.
 
-    Returns (geology_entries, valid_xy_indices, nx, ny).
+    Returns (geology_entries, valid_xy_indices, nx, ny, nz_min) — ``nz_min`` is
+    the minimum z-extent across geologies, used as an upper bound on free-depth
+    optimization so we never propose a perforation deeper than the shallowest
+    reservoir grid.
     """
     geology_path = Path(cfg["compute"]["local_geologies_config"]).expanduser().resolve()
     entries = _load_geology_list(geology_path)
@@ -329,14 +388,37 @@ def _load_geologies_resolved(cfg: dict) -> tuple[list[dict], np.ndarray, int, in
         if not e.get("geology_name"):
             e["geology_name"] = Path(e["geology_h5_file"]).stem
 
-    # nx, ny from the first geology's temperature grid.
+    # nx, ny from the first geology's temperature grid; nz_min = the smallest
+    # *active* z-extent across geologies. "Active" here means layers that
+    # contain at least one non-dead-rock cell (Temperature0 > -900). The raw
+    # H5 z-dim is often much larger than the actual reservoir (e.g. 326 vs
+    # ~70 productive layers), so using the raw dim as a depth-bound ceiling
+    # would silently allow nonsense placements like z=200 below the basement.
     import h5py
-    with h5py.File(h5_paths[0], "r") as f:
-        temp0_shape = f["Input/Temperature0"].shape  # (z, x, y)
-    _, nx, ny = temp0_shape
+    active_nz: list[int] = []
+    shapes = []
+    for p in h5_paths:
+        with h5py.File(p, "r") as f:
+            temp0 = f["Input/Temperature0"][:]  # (z, x, y)
+        shapes.append(temp0.shape)
+        per_layer_any = (temp0 > -900).any(axis=(1, 2))  # bool, (z,)
+        if not per_layer_any.any():
+            raise RuntimeError(f"No active layers in geology {p}; cannot bound depth.")
+        # Last active layer index + 1 = active z-extent.
+        active_nz.append(int(np.where(per_layer_any)[0][-1]) + 1)
+    nz_min = min(active_nz)
+    nxs = {s[1] for s in shapes}
+    nys = {s[2] for s in shapes}
+    if len(nxs) != 1 or len(nys) != 1:
+        raise RuntimeError(
+            f"Geology grids disagree on (x, y) extent: nx={nxs}, ny={nys}. "
+            f"Cannot share a single optimizer bound across geologies."
+        )
+    nx, ny = nxs.pop(), nys.pop()
     print(f"[baseline-driver] geologies={len(entries)} nx={nx} ny={ny} "
+          f"active_nz_per_geology={active_nz} (using nz_min={nz_min}) "
           f"valid_intersection_cells={valid_xy.shape[0]}")
-    return entries, valid_xy, int(nx), int(ny)
+    return entries, valid_xy, int(nx), int(ny), int(nz_min)
 
 
 # ----------------------------------------------------------------------
@@ -535,10 +617,28 @@ def _render_and_push_ingest_sbatch(
 # ----------------------------------------------------------------------
 
 
+def _resolve_depth_bounds(opt_cfg: dict, nz_min: int) -> tuple[int, int]:
+    """Resolve (z_lo, z_hi) from config.
+
+    Defaults: ``z_lo=5``, ``z_hi=min(70, nz_min-1)`` — biased toward the
+    productive zone the prior depth campaign surfaced
+    (see ``move_b_depth_results`` memory) while clipping to the shallowest
+    geology grid.
+    """
+    z_lo = int(opt_cfg.get("depth_min", 5))
+    default_hi = min(70, nz_min - 1)
+    z_hi = min(int(opt_cfg.get("depth_max", default_hi)), nz_min - 1)
+    if z_hi <= z_lo:
+        raise ValueError(
+            f"optimizer.depth_max ({z_hi}) must be > depth_min ({z_lo}) and ≤ nz_min-1 ({nz_min - 1})."
+        )
+    return (z_lo, z_hi)
+
+
 def _build_or_load_optimizer(
     *, cfg: dict, ws: Path, geology_entries: list[dict],
-    valid_xy: np.ndarray, nx: int, ny: int, remote: RemoteSession,
-    remote_run_root: str,
+    valid_xy: np.ndarray, nx: int, ny: int, nz_min: int,
+    remote: RemoteSession, remote_run_root: str,
 ) -> BaselineOptimizer:
     """Pull optimizer_state.pkl from Sherlock if it exists, else construct fresh."""
     if _pull_optimizer_state(remote, remote_run_root, ws):
@@ -547,21 +647,21 @@ def _build_or_load_optimizer(
         return load_optimizer(_optimizer_state_local(ws))
 
     opt_cfg = cfg["optimizer"]
-    wells = cfg["wells"]
-    fixed_depth = int(opt_cfg.get("fixed_depth", 50))
-    fixed_depth_per_well = [
-        int(w.get("depth", fixed_depth)) for w in wells
-    ]
-    num_wells = len(wells)
+    num_wells = len(cfg["wells"])
+    depth_bounds = _resolve_depth_bounds(opt_cfg, nz_min)
+    print(f"[baseline-driver] building optimizer "
+          f"(type={opt_cfg.get('type', 'cmaes')}, popsize={opt_cfg['popsize']}, "
+          f"num_wells={num_wells}, z ∈ [{depth_bounds[0]}, {depth_bounds[1]}], "
+          f"nz_min={nz_min})")
     return build_optimizer(
         kind=str(opt_cfg.get("type", "cmaes")),
         num_wells=num_wells,
         nx=nx, ny=ny,
         edge_buffer=int(opt_cfg.get("edge_buffer", 10)),
-        fixed_depth_per_well=fixed_depth_per_well,
         popsize=int(opt_cfg["popsize"]),
         seed=int(opt_cfg.get("seed", 42)),
         valid_xy_indices=valid_xy,
+        depth_bounds=depth_bounds,
         sigma_init=float(opt_cfg.get("sigma_init", 5.0)),
     )
 
@@ -609,7 +709,7 @@ def main() -> int:
     wandb_handle = None
 
     # Geology + bounds resolution (one-shot, all iters share).
-    geology_entries, valid_xy, nx, ny = _load_geologies_resolved(cfg)
+    geology_entries, valid_xy, nx, ny, nz_min = _load_geologies_resolved(cfg)
     is_injector_list = _wells_is_injector(cfg)
 
     last_step = "start"
@@ -656,8 +756,8 @@ def main() -> int:
         # Build optimizer once; persisted across iters via pickle.
         optimizer = _build_or_load_optimizer(
             cfg=cfg, ws=ws, geology_entries=geology_entries,
-            valid_xy=valid_xy, nx=nx, ny=ny, remote=remote,
-            remote_run_root=remote_run_root,
+            valid_xy=valid_xy, nx=nx, ny=ny, nz_min=nz_min,
+            remote=remote, remote_run_root=remote_run_root,
         )
 
         # Invariant: optimizer.generation must equal state.iteration on
@@ -913,6 +1013,21 @@ def main() -> int:
             # just pull so the next ``while True`` head sees the new value.
             _pull_state(remote, remote_run_root, ws)
             last_step = f"refreshed state after ingest of iter {iteration}"
+
+            # Pull per_candidate_metrics.json + render the diagnostic plot
+            # dashboard. Surrogate-dependent panels (MAPE / pred-vs-real
+            # scatter / calibration / holdout) silently skip on the baseline
+            # because predicted_revenue is NaN. Revenue / well-position /
+            # wallclock / EMV plots render off the per-(snapshot, geology)
+            # rows and the iter history.
+            try:
+                if _pull_per_candidate_metrics(remote, remote_run_root, iteration, ws):
+                    _render_plots(ws)
+            except SshUnavailable:
+                raise
+            except Exception as e:
+                print(f"[baseline-driver] post-ingest plot refresh failed: {e}",
+                      file=sys.stderr)
 
     except SshUnavailable as e:
         _write_needs_auth(

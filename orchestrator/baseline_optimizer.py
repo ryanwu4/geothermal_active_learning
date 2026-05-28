@@ -147,22 +147,23 @@ def load_optimizer(path: Path) -> BaselineOptimizer:
 
 @dataclass
 class CMAESOptimizer:
-    """CMA-ES over flat (x, y) per well; depths held fixed per well.
+    """CMA-ES over per-well (x, y, z).
 
-    Internally maintains a ``cmaes.CMA`` instance over a ``2 * num_wells``-dim
-    real-valued space, bounded by ``[edge_buffer, nx-1-edge_buffer]`` × ``[edge_buffer, ny-1-edge_buffer]``
-    per well. ``ask()`` materializes the next population, projects onto valid
-    cells, and returns it as ``(popsize, num_wells, 3)`` with depths appended.
-    ``tell()`` converts max-fitness to min-cost (with NaN→WORST_SENTINEL) and
-    feeds CMA-ES the post-projection coords (so its covariance estimate
-    reflects what was actually evaluated, not what it sampled).
+    Maintains a ``cmaes.CMA`` instance over a ``3 * num_wells``-dim real-valued
+    space, bounded per well by ``[edge_buffer, nx-1-edge_buffer]``,
+    ``[edge_buffer, ny-1-edge_buffer]``, and ``[z_lo, z_hi]``. ``ask()`` projects
+    (x, y) onto ``valid_xy_indices`` with uniqueness enforcement and rounds z to
+    the nearest integer cell clipped to ``[z_lo, z_hi]``. ``tell()`` converts
+    max-fitness to min-cost (NaN→WORST_SENTINEL) and feeds CMA-ES the
+    post-projection coords so the covariance reflects what the simulator
+    actually saw.
     """
 
     num_wells: int
     nx: int
     ny: int
     edge_buffer: int
-    fixed_depth_per_well: list[int]
+    depth_bounds: tuple[int, int]   # (z_lo, z_hi) — required
     popsize: int
     sigma_init: float
     seed: int
@@ -173,10 +174,12 @@ class CMAESOptimizer:
     _generation: int = 0
     _best_fitness: float | None = None
     _best_coords: np.ndarray | None = field(default=None, repr=False)
-    _last_proposal: np.ndarray | None = field(default=None, repr=False)  # (popsize, num_wells, 2) projected
+    _last_proposal: np.ndarray | None = field(default=None, repr=False)  # (popsize, num_wells, 3) projected
     _last_raw_sols: np.ndarray | None = field(default=None, repr=False)  # (popsize, dim) raw CMA-ES samples
 
     def __post_init__(self) -> None:
+        if not (self.depth_bounds[1] > self.depth_bounds[0]):
+            raise ValueError(f"depth_bounds must have z_hi > z_lo; got {self.depth_bounds}")
         if self._es is None:
             self._initialize_es()
 
@@ -188,14 +191,18 @@ class CMAESOptimizer:
                 "CMAESOptimizer requires the `cmaes` package. Install via `pip install cmaes`."
             ) from e
 
-        dim = self.num_wells * 2
+        dim = self.num_wells * 3
         x_lo, x_hi = float(self.edge_buffer), float(self.nx - 1 - self.edge_buffer)
         y_lo, y_hi = float(self.edge_buffer), float(self.ny - 1 - self.edge_buffer)
-        bounds = np.array([[x_lo, x_hi], [y_lo, y_hi]] * self.num_wells, dtype=np.float64)
-
-        cx = 0.5 * (x_lo + x_hi)
-        cy = 0.5 * (y_lo + y_hi)
-        mean_init = np.tile([cx, cy], self.num_wells).astype(np.float64)
+        z_lo, z_hi = float(self.depth_bounds[0]), float(self.depth_bounds[1])
+        bounds = np.array(
+            [[x_lo, x_hi], [y_lo, y_hi], [z_lo, z_hi]] * self.num_wells,
+            dtype=np.float64,
+        )
+        mean_init = np.tile(
+            [0.5 * (x_lo + x_hi), 0.5 * (y_lo + y_hi), 0.5 * (z_lo + z_hi)],
+            self.num_wells,
+        ).astype(np.float64)
         mean_init = np.clip(mean_init, bounds[:, 0] + 1e-3, bounds[:, 1] - 1e-3)
 
         self._es = CMA(
@@ -224,23 +231,27 @@ class CMAESOptimizer:
         if es is None:
             raise RuntimeError("CMA-ES instance not initialized.")
         sols = np.stack([es.ask() for _ in range(self.popsize)], axis=0)  # (popsize, dim)
-        coords_xy = sols.reshape(self.popsize, self.num_wells, 2)
+        coords = sols.reshape(self.popsize, self.num_wells, 3)
 
         # rng for projection — bind to (seed, generation) so a resumed run reproduces.
         rng = np.random.default_rng((int(self.seed) & 0xFFFFFFFF) ^ (self._generation * 7919))
-        projected = project_to_valid_cells(
-            coords_xy, self.valid_xy_indices, self.num_wells, rng,
+        projected_xy = project_to_valid_cells(
+            coords[:, :, :2], self.valid_xy_indices, self.num_wells, rng,
             nx=self.nx, ny=self.ny,
         )
 
-        # Attach fixed depths.
-        z_per_well = np.array(self.fixed_depth_per_well, dtype=np.float32)
+        z_lo, z_hi = self.depth_bounds
+        # Round z to integer cell index, then clip. CMA-ES's box constraint
+        # already keeps z_raw in [z_lo, z_hi] but we re-clip after rounding
+        # to handle the half-integer edge case.
+        z_int = np.clip(
+            np.rint(coords[:, :, 2]).astype(np.int32), int(z_lo), int(z_hi),
+        ).astype(np.float32)
         coords_xyz = np.concatenate(
-            [projected, np.broadcast_to(z_per_well[None, :, None], (self.popsize, self.num_wells, 1))],
-            axis=-1,
+            [projected_xy, z_int[..., None]], axis=-1
         ).astype(np.float32)
 
-        self._last_proposal = projected
+        self._last_proposal = coords_xyz
         self._last_raw_sols = sols
         return coords_xyz
 
@@ -260,9 +271,9 @@ class CMAESOptimizer:
         costs = np.where(finite_mask, -fits, WORST_SENTINEL)
 
         # Use post-projection coords for the CMA update so the covariance
-        # estimate reflects what the simulator actually saw. Flatten to (dim,)
-        # matching what _es.ask() returned (x,y per well).
-        flat_proj = coords[:, :, :2].reshape(self.popsize, -1).astype(np.float64)
+        # estimate reflects what the simulator actually saw. Flatten to
+        # (popsize, 3*num_wells) matching what _es.ask() returned.
+        flat_proj = coords.reshape(self.popsize, -1).astype(np.float64)
         es = self._es
         assert es is not None
         es.tell(list(zip([s for s in flat_proj], costs.tolist())))  # type: ignore[attr-defined]
@@ -294,7 +305,7 @@ class CMAESOptimizer:
 
 @dataclass
 class RandomOptimizer:
-    """LHS-stratified random sampler over the edge-buffered (x, y) window.
+    """LHS-stratified random sampler over the edge-buffered (x, y, z) window.
 
     Stateless except for the running best-so-far. ``tell()`` only updates the
     best; it does not adapt sampling. Uses ``scipy.stats.qmc.LatinHypercube``
@@ -305,7 +316,7 @@ class RandomOptimizer:
     nx: int
     ny: int
     edge_buffer: int
-    fixed_depth_per_well: list[int]
+    depth_bounds: tuple[int, int]   # (z_lo, z_hi) — required
     popsize: int
     seed: int
     valid_xy_indices: np.ndarray = field(repr=False)
@@ -317,6 +328,8 @@ class RandomOptimizer:
     _rng: np.random.Generator | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
+        if not (self.depth_bounds[1] > self.depth_bounds[0]):
+            raise ValueError(f"depth_bounds must have z_hi > z_lo; got {self.depth_bounds}")
         if self._rng is None:
             self._rng = np.random.default_rng(int(self.seed) & 0xFFFFFFFF)
 
@@ -333,37 +346,41 @@ class RandomOptimizer:
         return None if self._best_coords is None else self._best_coords.copy()
 
     def _sample_lhs(self) -> np.ndarray:
-        """LHS over (popsize, 2 * num_wells) in the edge-buffered window."""
-        dim = self.num_wells * 2
+        """LHS over (popsize, num_wells, 3) in the edge-buffered window."""
+        dim = self.num_wells * 3
         try:
             from scipy.stats import qmc  # type: ignore
             sampler = qmc.LatinHypercube(d=dim, seed=int(self._rng.integers(0, 2**31 - 1)))
-            unit = sampler.random(self.popsize)  # (popsize, dim) in [0, 1]
+            unit = sampler.random(self.popsize)
         except ImportError:
             unit = self._rng.random((self.popsize, dim))
 
         x_lo, x_hi = float(self.edge_buffer), float(self.nx - 1 - self.edge_buffer)
         y_lo, y_hi = float(self.edge_buffer), float(self.ny - 1 - self.edge_buffer)
-
-        coords_xy = np.empty((self.popsize, self.num_wells, 2), dtype=np.float32)
+        z_lo, z_hi = float(self.depth_bounds[0]), float(self.depth_bounds[1])
+        coords = np.empty((self.popsize, self.num_wells, 3), dtype=np.float32)
         for w in range(self.num_wells):
-            coords_xy[:, w, 0] = x_lo + unit[:, 2 * w] * (x_hi - x_lo)
-            coords_xy[:, w, 1] = y_lo + unit[:, 2 * w + 1] * (y_hi - y_lo)
-        return coords_xy
+            base = 3 * w
+            coords[:, w, 0] = x_lo + unit[:, base + 0] * (x_hi - x_lo)
+            coords[:, w, 1] = y_lo + unit[:, base + 1] * (y_hi - y_lo)
+            coords[:, w, 2] = z_lo + unit[:, base + 2] * (z_hi - z_lo)
+        return coords
 
     def ask(self) -> np.ndarray:
-        coords_xy = self._sample_lhs()
+        coords = self._sample_lhs()
         rng_proj = np.random.default_rng((int(self.seed) & 0xFFFFFFFF) ^ (self._generation * 1009))
-        projected = project_to_valid_cells(
-            coords_xy, self.valid_xy_indices, self.num_wells, rng_proj,
+        projected_xy = project_to_valid_cells(
+            coords[:, :, :2], self.valid_xy_indices, self.num_wells, rng_proj,
             nx=self.nx, ny=self.ny,
         )
-        z_per_well = np.array(self.fixed_depth_per_well, dtype=np.float32)
-        coords_xyz = np.concatenate(
-            [projected, np.broadcast_to(z_per_well[None, :, None], (self.popsize, self.num_wells, 1))],
-            axis=-1,
+        z_lo, z_hi = self.depth_bounds
+        z_int = np.clip(
+            np.rint(coords[:, :, 2]).astype(np.int32), int(z_lo), int(z_hi),
         ).astype(np.float32)
-        self._last_proposal = projected
+        coords_xyz = np.concatenate(
+            [projected_xy, z_int[..., None]], axis=-1
+        ).astype(np.float32)
+        self._last_proposal = coords_xyz
         return coords_xyz
 
     def tell(self, coords: np.ndarray, fitnesses: np.ndarray) -> None:
@@ -400,24 +417,24 @@ def build_optimizer(
     nx: int,
     ny: int,
     edge_buffer: int,
-    fixed_depth_per_well: list[int],
     popsize: int,
     seed: int,
     valid_xy_indices: np.ndarray,
+    depth_bounds: tuple[int, int],
     sigma_init: float = 5.0,
 ) -> BaselineOptimizer:
-    """Construct an optimizer by string name."""
+    """Construct an optimizer by string name. Search dim = 3 × num_wells."""
     kind = kind.lower()
     if kind == "cmaes":
         return CMAESOptimizer(
             num_wells=num_wells, nx=nx, ny=ny, edge_buffer=edge_buffer,
-            fixed_depth_per_well=fixed_depth_per_well, popsize=popsize,
+            depth_bounds=depth_bounds, popsize=popsize,
             sigma_init=sigma_init, seed=seed, valid_xy_indices=valid_xy_indices,
         )
     if kind in ("random", "lhs"):
         return RandomOptimizer(
             num_wells=num_wells, nx=nx, ny=ny, edge_buffer=edge_buffer,
-            fixed_depth_per_well=fixed_depth_per_well, popsize=popsize,
+            depth_bounds=depth_bounds, popsize=popsize,
             seed=seed, valid_xy_indices=valid_xy_indices,
         )
     raise ValueError(f"Unknown optimizer kind {kind!r}. Choices: cmaes, random/lhs.")

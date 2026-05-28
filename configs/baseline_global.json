@@ -35,7 +35,8 @@
     "sigma_init": 5.0,
     "edge_buffer": 10,
     "seed": 42,
-    "fixed_depth": 50
+    "depth_min": 5,
+    "depth_max": 70
   },
 
   "intersect": {
