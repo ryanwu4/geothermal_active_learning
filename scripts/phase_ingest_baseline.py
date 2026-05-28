@@ -257,7 +257,15 @@ def main() -> int:
                 "seed_source_snapshot_id": None,
                 "seed_source_iteration": None,
                 "seed_predicted_emv": None,
-                "terminal_predicted_emv": None,
+                # No surrogate prediction exists in the baseline, so we set
+                # ``terminal_predicted_emv`` equal to the real ensemble mean.
+                # This is a schema-only convention: ``_is_ensemble_run`` in
+                # plot_convergence.py uses this field as its "we have ensemble
+                # data" signal (it gates emv_distribution.png and friends).
+                # Plots that genuinely compare pred-vs-real (pred_real_kde_shift_ensemble,
+                # scatter_pred_vs_real_ensemble) will collapse to y=x — accurate
+                # for a no-surrogate baseline, not misleading.
+                "terminal_predicted_emv": cand.get("ensemble_mean_revenue"),
                 "seed_real_emv": None,
                 "terminal_real_emv": cand.get("ensemble_mean_revenue"),
             }

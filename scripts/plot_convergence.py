@@ -47,12 +47,20 @@ KIND_COLORS = {
     "adversarial": MANIM_RED,
     "exploit": MANIM_GREEN,
     "cma": MANIM_PURPLE,
+    # No-surrogate baseline ablation kind. AL runs never emit this label, so
+    # adding it here is a no-op for the AL plots; for baseline runs it lets
+    # the per-kind violin / scatter / win-rate / heatmap plots find rows.
+    "baseline": MANIM_ORANGE,
 }
 KIND_OFFSETS = {
     "frontier": -0.30,
     "adversarial": -0.10,
     "exploit": +0.10,
     "cma": +0.30,
+    # Center the baseline kind — in pure-baseline runs it's the only series,
+    # so the dodge offset doesn't matter; in mixed runs (none today, but
+    # leaving the door open) it sits between exploit and cma.
+    "baseline": 0.0,
 }
 
 

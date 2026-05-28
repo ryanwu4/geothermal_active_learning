@@ -132,11 +132,18 @@ class BaselineOptimizer(Protocol):
 
 
 def load_optimizer(path: Path) -> BaselineOptimizer:
-    """Generic loader — returns whichever optimizer subclass was pickled."""
+    """Generic loader — returns whichever optimizer subclass was pickled.
+
+    Calls ``reseed_rng_for_resume()`` on the loaded instance if available
+    (CMA-ES needs this because pycma strips ``_rng`` from pickle state).
+    """
     with open(path, "rb") as f:
         obj = pickle.load(f)
     if not isinstance(obj, BaselineOptimizer):
         raise TypeError(f"Loaded object from {path} is not a BaselineOptimizer ({type(obj)}).")
+    reseed = getattr(obj, "reseed_rng_for_resume", None)
+    if callable(reseed):
+        reseed()
     return obj
 
 
@@ -147,16 +154,27 @@ def load_optimizer(path: Path) -> BaselineOptimizer:
 
 @dataclass
 class CMAESOptimizer:
-    """CMA-ES over per-well (x, y, z).
+    """CMA-ES-with-margin over per-well (x, y, z), all-integer cells.
 
-    Maintains a ``cmaes.CMA`` instance over a ``3 * num_wells``-dim real-valued
-    space, bounded per well by ``[edge_buffer, nx-1-edge_buffer]``,
-    ``[edge_buffer, ny-1-edge_buffer]``, and ``[z_lo, z_hi]``. ``ask()`` projects
-    (x, y) onto ``valid_xy_indices`` with uniqueness enforcement and rounds z to
-    the nearest integer cell clipped to ``[z_lo, z_hi]``. ``tell()`` converts
-    max-fitness to min-cost (NaN→WORST_SENTINEL) and feeds CMA-ES the
-    post-projection coords so the covariance reflects what the simulator
-    actually saw.
+    Wraps ``cmaes.CMAwM`` (CMA-ES with margin, Hamano et al. 2022) — the
+    margin variant lower-bounds the marginal probability of each integer
+    step so σ can't collapse below the discrete unit and starve the search
+    of signal. Steps = 1 on every dim because well placements are cell
+    indices.
+
+    Two important contract details:
+
+    1. ``CMAwM.ask()`` returns ``(x_encoded, x_raw)``: ``x_encoded`` has each
+       dim snapped to its discrete step and is what we hand to IX;
+       ``x_raw`` is the underlying continuous sample CMA-ES drew from
+       N(m, σ²C). We keep ``x_raw`` and feed it to ``tell()`` (NOT the
+       projected coords). Mirrors the correct pattern at
+       ``orchestrator/acquire.py:_cma_seed_starts:620`` and avoids
+       corrupting the covariance update with projection-induced shifts.
+    2. ``project_to_valid_cells`` still runs on the encoded coords to honor
+       the dead-rock mask and per-candidate well uniqueness; the resulting
+       (x, y) may differ slightly from the encoded value. We accept that
+       small distortion because dead rock is < 5 % of the valid grid.
     """
 
     num_wells: int
@@ -174,8 +192,8 @@ class CMAESOptimizer:
     _generation: int = 0
     _best_fitness: float | None = None
     _best_coords: np.ndarray | None = field(default=None, repr=False)
-    _last_proposal: np.ndarray | None = field(default=None, repr=False)  # (popsize, num_wells, 3) projected
-    _last_raw_sols: np.ndarray | None = field(default=None, repr=False)  # (popsize, dim) raw CMA-ES samples
+    _last_proposal: np.ndarray | None = field(default=None, repr=False)  # (popsize, num_wells, 3) post-projection coords for IX
+    _last_raw_sols: np.ndarray | None = field(default=None, repr=False)  # (popsize, dim) raw (continuous) CMA-ES samples for tell()
 
     def __post_init__(self) -> None:
         if not (self.depth_bounds[1] > self.depth_bounds[0]):
@@ -185,13 +203,12 @@ class CMAESOptimizer:
 
     def _initialize_es(self) -> None:
         try:
-            from cmaes import CMA  # type: ignore
+            from cmaes import CMAwM  # type: ignore
         except ImportError as e:
             raise RuntimeError(
                 "CMAESOptimizer requires the `cmaes` package. Install via `pip install cmaes`."
             ) from e
 
-        dim = self.num_wells * 3
         x_lo, x_hi = float(self.edge_buffer), float(self.nx - 1 - self.edge_buffer)
         y_lo, y_hi = float(self.edge_buffer), float(self.ny - 1 - self.edge_buffer)
         z_lo, z_hi = float(self.depth_bounds[0]), float(self.depth_bounds[1])
@@ -199,16 +216,36 @@ class CMAESOptimizer:
             [[x_lo, x_hi], [y_lo, y_hi], [z_lo, z_hi]] * self.num_wells,
             dtype=np.float64,
         )
-        mean_init = np.tile(
-            [0.5 * (x_lo + x_hi), 0.5 * (y_lo + y_hi), 0.5 * (z_lo + z_hi)],
-            self.num_wells,
-        ).astype(np.float64)
+        # All 36 dims are integer cell indices → step = 1 everywhere. CMAwM
+        # uses this to maintain a margin on each dim's marginal probability
+        # so σ can't shrink past the discrete unit and collapse the search.
+        steps = np.ones(self.num_wells * 3, dtype=np.float64)
+
+        # LHS-stratified initial mean per well, replacing the prior stacked
+        # box-center initialization. Stacking all wells at the centroid forced
+        # CMA-ES to discover well-to-well separation from scratch over the
+        # first several generations; an LHS-spread mean encodes that prior
+        # for free. Each well's (x, y, z) lands at a different Latin-square
+        # stratum so the search starts with realistic spacing.
+        try:
+            from scipy.stats import qmc  # type: ignore
+            sampler = qmc.LatinHypercube(d=3, seed=int(self.seed & 0xFFFFFFFF))
+            unit = sampler.random(self.num_wells)  # (num_wells, 3) in [0, 1]
+        except ImportError:
+            rng_init = np.random.default_rng(int(self.seed & 0xFFFFFFFF))
+            unit = rng_init.random((self.num_wells, 3))
+        mean_per_well = np.empty((self.num_wells, 3), dtype=np.float64)
+        mean_per_well[:, 0] = x_lo + unit[:, 0] * (x_hi - x_lo)
+        mean_per_well[:, 1] = y_lo + unit[:, 1] * (y_hi - y_lo)
+        mean_per_well[:, 2] = z_lo + unit[:, 2] * (z_hi - z_lo)
+        mean_init = mean_per_well.reshape(-1)
         mean_init = np.clip(mean_init, bounds[:, 0] + 1e-3, bounds[:, 1] - 1e-3)
 
-        self._es = CMA(
+        self._es = CMAwM(
             mean=mean_init,
             sigma=float(self.sigma_init),
             bounds=bounds,
+            steps=steps,
             seed=int(self.seed & 0xFFFFFFFF),
             population_size=int(self.popsize),
         )
@@ -226,37 +263,52 @@ class CMAESOptimizer:
         return None if self._best_coords is None else self._best_coords.copy()
 
     def ask(self) -> np.ndarray:
-        """Sample popsize candidates, project to valid cells, return (popsize, num_wells, 3)."""
+        """Sample popsize candidates, project (x, y) to valid cells, return (popsize, num_wells, 3)."""
         es = self._es
         if es is None:
             raise RuntimeError("CMA-ES instance not initialized.")
-        sols = np.stack([es.ask() for _ in range(self.popsize)], axis=0)  # (popsize, dim)
-        coords = sols.reshape(self.popsize, self.num_wells, 3)
+        # CMAwM.ask() returns (x_encoded, x_raw): encoded is the discrete
+        # cell-snapped sample, raw is the underlying continuous Gaussian draw.
+        # We send encoded to IX and stash raw to feed back to tell() — the
+        # raw vector is what CMA-ES's covariance update math assumes it sees.
+        encoded_list = []
+        raw_list = []
+        for _ in range(self.popsize):
+            x_enc, x_raw = es.ask()  # type: ignore[misc]
+            encoded_list.append(x_enc)
+            raw_list.append(x_raw)
+        encoded = np.stack(encoded_list, axis=0)         # (popsize, dim)
+        raw = np.stack(raw_list, axis=0)                 # (popsize, dim)
+        coords_enc = encoded.reshape(self.popsize, self.num_wells, 3)
 
         # rng for projection — bind to (seed, generation) so a resumed run reproduces.
         rng = np.random.default_rng((int(self.seed) & 0xFFFFFFFF) ^ (self._generation * 7919))
         projected_xy = project_to_valid_cells(
-            coords[:, :, :2], self.valid_xy_indices, self.num_wells, rng,
+            coords_enc[:, :, :2], self.valid_xy_indices, self.num_wells, rng,
             nx=self.nx, ny=self.ny,
         )
 
         z_lo, z_hi = self.depth_bounds
-        # Round z to integer cell index, then clip. CMA-ES's box constraint
-        # already keeps z_raw in [z_lo, z_hi] but we re-clip after rounding
-        # to handle the half-integer edge case.
+        # CMAwM already snapped z to integer steps, but defensively clip here
+        # so we never emit z outside [z_lo, z_hi].
         z_int = np.clip(
-            np.rint(coords[:, :, 2]).astype(np.int32), int(z_lo), int(z_hi),
+            coords_enc[:, :, 2].astype(np.int32), int(z_lo), int(z_hi),
         ).astype(np.float32)
         coords_xyz = np.concatenate(
             [projected_xy, z_int[..., None]], axis=-1
         ).astype(np.float32)
 
         self._last_proposal = coords_xyz
-        self._last_raw_sols = sols
+        self._last_raw_sols = raw
         return coords_xyz
 
     def tell(self, coords: np.ndarray, fitnesses: np.ndarray) -> None:
-        """Feed back fitnesses for the most recently proposed population."""
+        """Feed back fitnesses for the most recently proposed population.
+
+        The ``coords`` argument is accepted only for shape validation — the
+        covariance update uses the raw continuous samples stashed during
+        ``ask()`` (the projected ``coords`` would corrupt the update).
+        """
         if self._last_proposal is None or self._last_raw_sols is None:
             raise RuntimeError("tell() called before ask() — nothing to update.")
         if coords.shape[0] != self.popsize:
@@ -267,16 +319,17 @@ class CMAESOptimizer:
         fits = np.asarray(fitnesses, dtype=np.float64)
         finite_mask = np.isfinite(fits)
         # Max-fitness → min-cost; failed evals get WORST_SENTINEL so they're
-        # ranked last without injecting NaN into the covariance update.
+        # rank-last. The driver should already have refused to call us if the
+        # entire batch is non-finite (see I4 guard in run_baseline_global.py).
         costs = np.where(finite_mask, -fits, WORST_SENTINEL)
 
-        # Use post-projection coords for the CMA update so the covariance
-        # estimate reflects what the simulator actually saw. Flatten to
-        # (popsize, 3*num_wells) matching what _es.ask() returned.
-        flat_proj = coords.reshape(self.popsize, -1).astype(np.float64)
+        # Feed the RAW continuous samples back, not the projected ones —
+        # CMA-ES's mean/covariance update assumes x_k ~ N(m, σ²C). Mirrors
+        # the AL ensemble path at orchestrator/acquire.py:_cma_seed_starts:620.
+        raw = self._last_raw_sols.astype(np.float64)
         es = self._es
         assert es is not None
-        es.tell(list(zip([s for s in flat_proj], costs.tolist())))  # type: ignore[attr-defined]
+        es.tell(list(zip([s for s in raw], costs.tolist())))  # type: ignore[attr-defined]
 
         # Update best-so-far over finite evaluations.
         for i in range(self.popsize):
@@ -296,6 +349,29 @@ class CMAESOptimizer:
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "wb") as f:
             pickle.dump(self, f)
+
+    def reseed_rng_for_resume(self) -> None:
+        """Re-derive the CMA-ES internal RNG deterministically from
+        ``(seed, generation)`` after a pickle round-trip.
+
+        The cmaes library deliberately drops ``_rng`` during pickle
+        (``cmaes/_cma.py:209-224``), so a freshly-loaded instance reseeds
+        from OS entropy — meaning the post-resume sample sequence diverges
+        from the no-crash counterfactual. We fix that here by reseeding
+        with a function of ``(self.seed, self._generation)`` so resumes are
+        bit-reproducible.
+        """
+        seed_for_gen = int((self.seed & 0xFFFFFFFF) ^ (self._generation * 7919)) & 0xFFFFFFFF
+        es = self._es
+        if es is None:
+            return
+        if hasattr(es, "reseed_rng"):
+            es.reseed_rng(seed_for_gen)  # type: ignore[attr-defined]
+        # CMAwM wraps an inner CMA; reseed it too in case the library's
+        # ``CMAwM.reseed_rng`` only touches the outer RNG.
+        inner = getattr(es, "_cma", None)
+        if inner is not None and hasattr(inner, "reseed_rng"):
+            inner.reseed_rng(seed_for_gen)
 
 
 # ----------------------------------------------------------------------

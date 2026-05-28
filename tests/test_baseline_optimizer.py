@@ -317,6 +317,79 @@ def test_random_ask_only_uses_valid_cells():
             seen.add(cell)
 
 
+def test_cmaes_uses_cmawm_for_mixed_integer():
+    """C3: optimizer should wrap pycma's CMAwM (margin variant) for integer dims."""
+    pytest.importorskip("cmaes")
+    rng = np.random.default_rng(0)
+    valid = _make_valid_xy(rng)
+    opt = build_optimizer(
+        "cmaes",
+        num_wells=2, nx=NX, ny=NY, edge_buffer=2,
+        popsize=4, seed=42, valid_xy_indices=valid,
+        depth_bounds=(5, 25),
+    )
+    assert type(opt._es).__name__ == "CMAwM", (
+        f"expected CMAwM wrapper, got {type(opt._es).__name__}"
+    )
+
+
+def test_cmaes_tell_uses_raw_samples_not_projected():
+    """C1: tell() should feed the raw continuous samples to CMA-ES, not the
+    projection-snapped coords. The raw samples may fall outside the integer
+    cell grid; the projected coords are integers — different distributions.
+    """
+    pytest.importorskip("cmaes")
+    rng = np.random.default_rng(0)
+    valid = _make_valid_xy(rng)
+    opt = build_optimizer(
+        "cmaes",
+        num_wells=3, nx=NX, ny=NY, edge_buffer=2,
+        popsize=8, seed=42, valid_xy_indices=valid,
+        depth_bounds=(5, 25),
+    )
+    coords = opt.ask()
+    raw = opt._last_raw_sols
+    assert raw is not None
+    # Sanity: raw and projected coords are not identical (raw is continuous).
+    assert raw.shape == (8, 9)
+    coords_flat = coords.reshape(8, 9)
+    # At least one cell should differ between raw and projected — raw is
+    # continuous, projected is integer-clipped and dead-rock-snapped.
+    assert not np.allclose(raw, coords_flat), \
+        "raw_sols should differ from projected coords (continuous vs discrete+projected)"
+
+
+def test_cmaes_resume_reseeds_rng_deterministically():
+    """I6: pickle round-trip should restore a deterministic RNG state
+    derived from (seed, generation), not OS entropy."""
+    pytest.importorskip("cmaes")
+    rng = np.random.default_rng(0)
+    valid = _make_valid_xy(rng)
+    opt = build_optimizer(
+        "cmaes",
+        num_wells=2, nx=NX, ny=NY, edge_buffer=2,
+        popsize=4, seed=42, valid_xy_indices=valid,
+        depth_bounds=(5, 25),
+    )
+    # Advance one generation so we have a non-zero state.
+    c = opt.ask()
+    opt.tell(c, _evaluate_population(c))
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "opt.pkl"
+        opt.save_state(p)
+        # Two separate loads should produce the same ask() result — proves
+        # reseed_rng_for_resume is making the RNG deterministic given the
+        # pickled state (otherwise OS entropy would diverge them).
+        a = load_optimizer(p)
+        b = load_optimizer(p)
+        ca = a.ask()
+        cb = b.ask()
+        assert np.array_equal(ca, cb), \
+            "two loads of the same pickle should produce identical ask() samples"
+
+
 def test_depth_bounds_validation():
     rng = np.random.default_rng(0)
     valid = _make_valid_xy(rng)

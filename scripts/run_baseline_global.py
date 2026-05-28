@@ -984,6 +984,35 @@ def main() -> int:
             print(f"[baseline-driver] tell(): {n_finite}/{popsize} finite fitnesses, "
                   f"max={np.nanmax(fitnesses) if n_finite else 'nan'}")
 
+            # I4: all-NaN batch guard. If every candidate's IX evaluation
+            # failed, ``fitnesses`` is all NaN and a tell() would corrupt
+            # the CMA-ES covariance/sigma (every entry rank-tied at
+            # WORST_SENTINEL). This is virtually always an infrastructure
+            # problem on Sherlock (full SLURM array failure, IX licensing,
+            # corrupt manifest) rather than a fitness landscape feature, so
+            # we bail loudly rather than silently mis-train. State on
+            # Sherlock has already advanced (ingest's iteration++ ran), so
+            # the user investigates and resumes with --run-id <id>; the
+            # startup invariant will then catch the state vs optimizer
+            # mismatch and report it explicitly.
+            if n_finite == 0:
+                if wandb_handle is not None and wandb_handle.is_active:
+                    wandb_handle.log({
+                        "iteration": iteration,
+                        "all_nan_batch": True,
+                        "n_failed_tasks": stage.tasks_count,
+                    }, step=iteration)
+                    wandb_handle.finish()
+                raise RuntimeError(
+                    f"All {popsize} candidates returned non-finite ensemble revenue "
+                    f"for iter {iteration} — refusing to call optimizer.tell() with "
+                    f"all-WORST_SENTINEL fitness (that would corrupt CMA-ES sigma).\n"
+                    f"  Inspect: {remote_run_root}/iter_{iteration:04d}/fitness.json on Sherlock\n"
+                    f"  SLURM logs: {remote_run_root}/logs/ingest_baseline_iter_{iteration:04d}.err\n"
+                    f"  IX array logs under the per-iter stage dir.\n"
+                    f"Resume with: --run-id {run_id} after fixing the underlying failure."
+                )
+
             optimizer.tell(coords, fitnesses)
             optimizer.save_state(_optimizer_state_local(ws))
             _push_optimizer_state(remote, remote_run_root, ws)
