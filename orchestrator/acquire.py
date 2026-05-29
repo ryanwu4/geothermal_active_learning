@@ -2171,23 +2171,61 @@ def _run_acquisition_cma_surrogate(
     # static-graph batch per geology. Called fresh for every CMA query so the
     # node-level features, perforation depth and KNN topology track the actual
     # well positions (the dominant accuracy driver), not just pos_xyz. -----
-    def _build_batches(cfgs: list[list[dict]]) -> list[Any]:
-        batches = []
+    def _build_static_graphs_one_geo(cfgs: list[list[dict]], g, d) -> list[Any]:
+        return _build_static_batch_for_starts(
+            cfgs, Path(g.geology_h5_file), d["physics_dict"], d["full_shape"],
+            d["z_cutoff"], d["nx"], d["ny"],
+            cfg.revenue_target, ctx.scaler,
+            ctx.extract_well_data, ctx.build_wells_table, ctx.extract_vertical_profiles,
+            ctx.build_single_hetero_data, d["temp0_full"],
+            node_encoder=ctx.node_encoder, enrich_global_attr=ctx.enrich_global_attr,
+            # Fix #1: physics volumes onto the GPU once per geology (the model's
+            # per-graph volume.to(device) then no-ops). Fix #2: reuse the grids
+            # preloaded above instead of re-reading the H5 per candidate.
+            device=device, preloaded_grids=d.get("well_grids"),
+        )
+
+    # Count candidate-evals dropped because a well snapped onto a dead-rock column
+    # at its CMA-chosen (possibly shallow) depth: valid_xy only guarantees live
+    # rock somewhere in [0, z_max), but extract_well_data needs live rock in the
+    # well's perforation interval [0, depth) and drops the well otherwise (→ wrong
+    # well count → _build_static_batch_for_starts raises). Now that depth is
+    # optimized, this can happen; such candidates are scored NaN (CMA ranks them
+    # worst), NOT crashed on — the failed-eval contract used by the AL pipeline
+    # and validated in analysis/cma_trajectory_long.
+    drop_stats = {"n_dropped": 0, "n_gens_with_drops": 0}
+
+    def _build_batches_with_mask(cfgs: list[list[dict]]) -> tuple[list[Any], np.ndarray]:
+        """Build per-geology batches over candidates that build in ALL geologies,
+        returning (batches_over_valid_subset, valid_mask). FAST PATH (common
+        case): one batched build per geology, identical to before. Only if a
+        batched build raises do we per-candidate probe THAT geology to find and
+        mask the offender(s)."""
+        M_local = len(cfgs)
+        ok = np.ones(M_local, dtype=bool)
+        per_geo_graphs: list[list[Any] | None] = []
         for g, d in zip(geologies, geology_loaded):
-            static_graphs = _build_static_batch_for_starts(
-                cfgs, Path(g.geology_h5_file), d["physics_dict"], d["full_shape"],
-                d["z_cutoff"], d["nx"], d["ny"],
-                cfg.revenue_target, ctx.scaler,
-                ctx.extract_well_data, ctx.build_wells_table, ctx.extract_vertical_profiles,
-                ctx.build_single_hetero_data, d["temp0_full"],
-                node_encoder=ctx.node_encoder, enrich_global_attr=ctx.enrich_global_attr,
-                # Fix #1: physics volumes onto the GPU once per geology (the
-                # model's per-graph volume.to(device) then no-ops). Fix #2: reuse
-                # the grids preloaded above instead of re-reading the H5 per cand.
-                device=device, preloaded_grids=d.get("well_grids"),
-            )
+            try:
+                per_geo_graphs.append(_build_static_graphs_one_geo(cfgs, g, d))
+            except RuntimeError:
+                per_geo_graphs.append(None)  # rebuild over the valid subset below
+                for i in range(M_local):
+                    if not ok[i]:
+                        continue
+                    try:
+                        _build_static_graphs_one_geo([cfgs[i]], g, d)
+                    except RuntimeError:
+                        ok[i] = False
+        valid_idx = np.where(ok)[0]
+        cfgs_valid = [cfgs[i] for i in valid_idx]
+        batches = []
+        for (g, d), graphs in zip(zip(geologies, geology_loaded), per_geo_graphs):
+            if graphs is not None and ok.all():
+                static_graphs = graphs  # reuse the full-population build (fast path)
+            else:
+                static_graphs = _build_static_graphs_one_geo(cfgs_valid, g, d)
             batches.append(Batch.from_data_list(static_graphs).to(device))
-        return batches
+        return batches, ok
 
     def _predict_all_geos(coords_xyz_np: np.ndarray, batches: list[Any]) -> np.ndarray:
         """Return (M, K) unscaled predictions; M must match the batch slot count.
@@ -2233,9 +2271,23 @@ def _run_acquisition_cma_surrogate(
         ]
 
     def _predict_rebuilt(coords_arr: np.ndarray) -> np.ndarray:
-        """Build accurate per-candidate graphs for these coords and return the
-        (M, K) unscaled per-geology predictions."""
-        return _predict_all_geos(coords_arr, _build_batches(_coords_to_cfgs(coords_arr)))
+        """Build accurate per-candidate graphs; return (M, K) unscaled per-geology
+        predictions. Candidates whose graph can't be built in some geology
+        (dead-rock at their depth) get a full-NaN row, so CMA treats them as
+        failed evals (np.nanmean -> NaN -> ranked worst, filtered from the pool)."""
+        cfgs = _coords_to_cfgs(coords_arr)
+        M_local = coords_arr.shape[0]
+        out = np.full((M_local, K), np.nan, dtype=np.float64)
+        batches, mask = _build_batches_with_mask(cfgs)
+        n_drop = int((~mask).sum())
+        if n_drop:
+            drop_stats["n_dropped"] += n_drop
+            drop_stats["n_gens_with_drops"] += 1
+        if not mask.any():
+            return out  # whole population invalid -> all NaN
+        valid_idx = np.where(mask)[0]
+        out[valid_idx] = _predict_all_geos(coords_arr[valid_idx], batches)
+        return out
 
     # ----- Optional: seed CMA mean from the best real-revenue incumbent --------
     # Gated on cfg.cma_warm_start (default False): the cma_trajectory_long IX
@@ -2295,6 +2347,14 @@ def _run_acquisition_cma_surrogate(
     timings["cma_popsize"] = float(popsize)
     timings["graph_builds"] = float(int(cfg.cma_generations) * popsize * K)
     timings["pool_size"] = float(len(pool_coords))
+    if drop_stats["n_dropped"]:
+        print(
+            f"[acquire-cma] {drop_stats['n_dropped']} candidate-evals scored NaN "
+            f"(well on dead-rock at its CMA-chosen depth) across "
+            f"{drop_stats['n_gens_with_drops']} generations — ranked worst by CMA, "
+            f"excluded from the pool (not a crash).",
+            flush=True,
+        )
     if not pool_coords:
         raise RuntimeError(
             "cma_surrogate: CMA-ES produced no finite-fitness candidates — the "
@@ -2425,6 +2485,7 @@ def _run_acquisition_cma_surrogate(
         "depth_bounds": [int(z_lo_eff), int(z_hi_eff)],
         "n_exploit": cfg.n_exploit,
         "n_frontier": cfg.n_frontier,
+        "dead_rock_drops": int(drop_stats["n_dropped"]),
         "geology_metadata": [
             {
                 "geology_index": g.geology_index,

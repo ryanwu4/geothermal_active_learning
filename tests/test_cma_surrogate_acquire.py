@@ -496,6 +496,39 @@ class TestRunCmaSurrogateFake:
         assert len(ids) == len(set(ids))
 
 
+class TestDeadRockDrop:
+    """A candidate whose graph fails to build in some geology (a well on dead
+    rock at its CMA-chosen depth → extract_well_data drops it → RuntimeError)
+    must be scored NaN and excluded, NOT crash the run (the bug the user hit)."""
+
+    def test_build_failure_scored_nan_not_crashed(self, tmp_path, monkeypatch) -> None:
+        geos, _ = _install_fake_surrogate(monkeypatch, tmp_path, K=2, num_wells=4)
+        # Poison the first candidate the builder ever sees (by its well-0
+        # signature) and raise whenever that candidate is in the batch — both the
+        # full-batch build AND its per-candidate probe — exactly like a real
+        # dead-rock drop. Every other candidate builds fine.
+        state: dict = {"poison": None}
+
+        def _sig(c):
+            return (round(c[0]["x"]), round(c[0]["y"]), int(c[0]["depth"]))
+
+        def _poison_build(cfgs, *a, **k):
+            if state["poison"] is None:
+                state["poison"] = _sig(cfgs[0])
+            if any(_sig(c) == state["poison"] for c in cfgs):
+                raise RuntimeError("simulated dead-rock drop (test)")
+            return [0] * len(cfgs)
+
+        monkeypatch.setattr(acq, "_build_static_batch_for_starts", _poison_build)
+        cfg = _fake_cfg(geos, num_wells=4, n_exploit=3, n_frontier=1, gens=3, popsize=8)
+        res = acq.run_acquisition(cfg, out_dir=tmp_path / "acq", iteration=0)
+        # Completed without crashing; ≥1 drop recorded; all emitted preds finite.
+        assert res["manifest"]["dead_rock_drops"] >= 1
+        assert res["candidates"], "should still emit candidates after dropping the bad one"
+        for c in res["candidates"]:
+            assert np.isfinite(c.predicted_revenue)
+
+
 class TestColdRestartGate:
     """The cma_warm_start gate — the IX-validated cold-restart default."""
 
