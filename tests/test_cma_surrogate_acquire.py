@@ -383,7 +383,8 @@ def _install_fake_surrogate(monkeypatch, tmp_path, *, K, num_wells, nx=40, ny=40
 
 
 def _fake_cfg(geos, *, num_wells, n_exploit, n_frontier, gens, popsize,
-              depth_min=2, depth_max=20, edge_buffer=5):
+              depth_min=2, depth_max=20, edge_buffer=5,
+              cma_warm_start=False, prior_metrics=None):
     wells = [WellSpec(type=("injector" if i % 2 == 0 else "producer"), depth=10)
              for i in range(num_wells)]
     return AcquisitionConfig(
@@ -397,7 +398,23 @@ def _fake_cfg(geos, *, num_wells, n_exploit, n_frontier, gens, popsize,
         cma_popsize=popsize, cma_generations=gens, cma_sigma_init=6.0,
         n_exploit=n_exploit, n_frontier=n_frontier,
         depth_min=depth_min, depth_max=depth_max,
+        cma_warm_start=cma_warm_start, prior_metrics=prior_metrics,
     )
+
+
+def _capture_mean_init(monkeypatch):
+    """Spy on baseline_optimizer.build_optimizer (imported locally inside
+    _run_acquisition_cma_surrogate) to capture the mean_init it receives."""
+    import orchestrator.baseline_optimizer as bopt
+    captured = {}
+    real = bopt.build_optimizer
+
+    def _cap(*a, **k):
+        captured["mean_init"] = k.get("mean_init")
+        return real(*a, **k)
+
+    monkeypatch.setattr(bopt, "build_optimizer", _cap)
+    return captured
 
 
 class TestRunCmaSurrogateFake:
@@ -477,6 +494,42 @@ class TestRunCmaSurrogateFake:
         # snapshot ids unique across exploit + frontier
         ids = [c.snapshot_id for c in res["candidates"]]
         assert len(ids) == len(set(ids))
+
+
+class TestColdRestartGate:
+    """The cma_warm_start gate — the IX-validated cold-restart default."""
+
+    def test_cold_default_ignores_incumbent_at_iter1(self, tmp_path, monkeypatch) -> None:
+        """cma_warm_start=False (default): even at iteration>=1 with prior_metrics
+        present, CMA stays cold (mean_init=None) and candidates carry no seed source."""
+        geos, _ = _install_fake_surrogate(monkeypatch, tmp_path, K=2, num_wells=4)
+        captured = _capture_mean_init(monkeypatch)
+        # If anything other than the flag were gating, a non-empty prior_metrics
+        # would trigger seeding — so this isolates the gate.
+        cfg = _fake_cfg(geos, num_wells=4, n_exploit=3, n_frontier=1, gens=4, popsize=8,
+                        cma_warm_start=False,
+                        prior_metrics=[tmp_path / "iter_0000" / "per_candidate_metrics.json"])
+        res = acq.run_acquisition(cfg, out_dir=tmp_path / "acq", iteration=1)
+        assert captured["mean_init"] is None, "cold restart must pass mean_init=None"
+        for c in res["candidates"]:
+            assert c.extras.get("seed_source_snapshot_id") is None
+
+    def test_warm_start_seeds_from_incumbent_at_iter1(self, tmp_path, monkeypatch) -> None:
+        """cma_warm_start=True: CMA mean is seeded from the incumbent and exploit
+        candidates record the seed source."""
+        geos, _ = _install_fake_surrogate(monkeypatch, tmp_path, K=2, num_wells=4)
+        captured = _capture_mean_init(monkeypatch)
+        coords = np.array([[10.0 + w, 12.0 + w, 15.0] for w in range(4)], dtype=np.float32)
+        monkeypatch.setattr(acq, "_load_elite_seeds_ensemble",
+                            lambda prior_metrics, k, rng: [(coords, "snapXYZ", 0)])
+        cfg = _fake_cfg(geos, num_wells=4, n_exploit=3, n_frontier=1, gens=4, popsize=8,
+                        cma_warm_start=True,
+                        prior_metrics=[tmp_path / "iter_0000" / "per_candidate_metrics.json"])
+        res = acq.run_acquisition(cfg, out_dir=tmp_path / "acq", iteration=1)
+        mi = captured["mean_init"]
+        assert mi is not None and np.asarray(mi).shape == (4 * 3,), "warm start must pass mean_init"
+        exploit = [c for c in res["candidates"] if c.kind == "exploit"]
+        assert exploit and all(c.extras.get("seed_source_snapshot_id") == "snapXYZ" for c in exploit)
 
 
 if __name__ == "__main__":

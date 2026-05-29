@@ -82,6 +82,14 @@ class AcquisitionConfig:
     cma_popsize: int = 16
     cma_generations: int = 10
     cma_sigma_init: float = 5.0
+    # cma_surrogate only: if True, seed the CMA mean from the prior real-revenue
+    # incumbent on iter>=1 (warm start). Default False = cold LHS restart every AL
+    # iteration. The cma_trajectory_long IX experiment showed warm-starting drops
+    # the search into the surrogate's over-confident exploit regime and
+    # over-exploits (real revenue degrades while predicted climbs; pred-real gap
+    # swings to +52 M$), whereas a cold restart stayed calibrated and reached
+    # ~+55 M$ higher real revenue at gen 100.
+    cma_warm_start: bool = False
     # List of prior-iter per_candidate_metrics.json paths, in iter order.
     # Phase script populates this; acquire derives snapshots_json dirs from it
     # to recover well coords for the elite path.
@@ -129,6 +137,20 @@ def _ensure_surrogate_imports(repo_root: Path) -> None:
         sys.path.insert(0, repo_str)
 
 
+# Raw (un-normalized) full grids consumed per-well by extract_well_data /
+# extract_vertical_profiles. Preloading these once per geology (fix #2) lets the
+# CMA-over-surrogate build loop avoid re-reading them from the H5 for every
+# candidate; the dict is keyed by the dataset names those functions index.
+_WELL_DATA_GRID_NAMES = (
+    "Input/PermX",
+    "Input/PermY",
+    "Input/PermZ",
+    "Input/Porosity",
+    "Input/Temperature0",
+    "Input/Pressure0",
+)
+
+
 def _load_geology(
     geology_h5_file: Path,
     norm_config: dict,
@@ -136,8 +158,16 @@ def _load_geology(
     PERM_PROPS,
     get_valid_mask,
     find_z_cutoff,
+    *,
+    preload_well_grids: bool = False,
 ) -> dict[str, Any]:
-    """Load one geology file and produce the static physics tensors + bounds."""
+    """Load one geology file and produce the static physics tensors + bounds.
+
+    When ``preload_well_grids`` is True, also reads the full raw ``Input/*``
+    grids that ``extract_well_data`` / ``extract_vertical_profiles`` consume,
+    returned under ``"well_grids"`` (fix #2: read once per geology, reuse across
+    every candidate). Default False keeps the legacy return shape unchanged.
+    """
     with h5py.File(geology_h5_file, "r") as src:
         valid_mask = get_valid_mask(src)
         z_cutoff = find_z_cutoff(valid_mask, invalid_threshold=0.95)
@@ -161,6 +191,10 @@ def _load_geology(
 
         temp0_full = src["Input/Temperature0"][:]
 
+        well_grids: dict[str, np.ndarray] | None = None
+        if preload_well_grids:
+            well_grids = {name: src[name][:] for name in _WELL_DATA_GRID_NAMES}
+
     physics_dict["valid_mask"] = torch.tensor(valid_mask_cropped, dtype=torch.float32)
     full_shape = (z_cutoff, valid_mask.shape[1], valid_mask.shape[2])
     return {
@@ -171,6 +205,7 @@ def _load_geology(
         "ny": valid_mask.shape[2],
         "z_max": z_cutoff,
         "temp0_full": temp0_full,
+        "well_grids": well_grids,
     }
 
 
@@ -191,8 +226,28 @@ def _build_static_batch_for_starts(
     temp0_full: np.ndarray,
     node_encoder: str = "profile",
     enrich_global_attr: bool = False,
+    device: torch.device | str | None = None,
+    preloaded_grids: dict[str, np.ndarray] | None = None,
 ):
-    """Build a list of normalized HeteroData objects, one per start."""
+    """Build a list of normalized HeteroData objects, one per start.
+
+    Speedups (both numerically identical to the default path):
+
+    * ``device`` (fix #1, physics-on-GPU): when given, the geology's shared
+      ``physics_dict`` tensors are moved to ``device`` ONCE here (they are the
+      same object reference across every candidate's ``physics_context``, see
+      ``data.build_single_hetero_data``). The model's per-graph
+      ``volume.to(device)`` in ``PhysicsSlabExtractor.forward`` then becomes a
+      no-op view instead of re-copying the CPU physics volume to the GPU on
+      every forward of every generation. Caller is responsible for ``.to(device)``
+      on the assembled ``Batch`` as before; this only relocates the physics
+      wrappers PyG does not track.
+    * ``preloaded_grids`` (fix #2): passed straight through to
+      ``extract_well_data`` / ``extract_vertical_profiles`` so the full raw H5
+      grids are read once per geology by the caller instead of re-read from
+      ``src`` for every candidate. ``None`` reproduces the legacy per-candidate
+      H5 reads exactly.
+    """
     static_graphs = []
     with h5py.File(geology_h5_file, "r") as src:
         for m_idx, w_cfg in enumerate(cfgs):
@@ -215,12 +270,14 @@ def _build_static_batch_for_starts(
             (
                 x_idx, y_idx, depth, inj, perm_x, perm_y, perm_z,
                 porosity, temp0, press0, depth_centroid,
-            ) = extract_well_data(is_well, inj_rate, src)
+            ) = extract_well_data(is_well, inj_rate, src, preloaded_grids=preloaded_grids)
             wells = build_wells_table(
                 x_idx, y_idx, depth, inj, perm_x, perm_y, perm_z,
                 porosity, temp0, press0,
             )
-            vertical_profiles = extract_vertical_profiles(is_well, x_idx, y_idx, src)
+            vertical_profiles = extract_vertical_profiles(
+                is_well, x_idx, y_idx, src, preloaded_grids=preloaded_grids
+            )
             raw_graph = build_single_hetero_data(
                 wells=wells,
                 physics_dict=physics_dict,
@@ -243,6 +300,24 @@ def _build_static_batch_for_starts(
                     f"dead-rock placements; this should not happen."
                 )
             static_graphs.append(scaler.transform_graph(raw_graph))
+
+    # Fix #1 (physics-on-GPU): relocate the physics volumes to ``device`` ONCE,
+    # AFTER graph construction. build_single_hetero_data reads physics tensors on
+    # the host (e.g. valid_mask.numpy() for enrich_global_attr), so the move must
+    # happen post-build. Every candidate's PhysicsContext wraps the SAME physics
+    # dict object (by reference, preserved through scaler.transform_graph), so a
+    # single moved dict reassigned onto each context covers the whole geology
+    # batch. The model's per-graph volume.to(device) in PhysicsSlabExtractor then
+    # no-ops on an already-on-device tensor instead of re-copying CPU->GPU on
+    # every forward. Numerically identical: a device move does not alter values.
+    if device is not None and static_graphs:
+        moved: dict[int, dict] = {}
+        for g in static_graphs:
+            pc = g.physics_context
+            key = id(pc.d)
+            if key not in moved:
+                moved[key] = {k: v.to(device) for k, v in pc.d.items()}
+            pc.d = moved[key]
     return static_graphs
 
 
@@ -2049,6 +2124,10 @@ def _run_acquisition_cma_surrogate(
         geology_loaded.append(_load_geology(
             gp, ctx.norm_config,
             ctx.PROPERTIES, ctx.PERM_PROPS, ctx.get_valid_mask, ctx.find_z_cutoff,
+            # Fix #2: read the raw well-data grids ONCE per geology here so the
+            # per-generation per-candidate graph rebuild below reuses them
+            # instead of re-reading the full H5 grids for every CMA candidate.
+            preload_well_grids=True,
         ))
     timings["geo_load_s"] = time.perf_counter() - t0
 
@@ -2102,6 +2181,10 @@ def _run_acquisition_cma_surrogate(
                 ctx.extract_well_data, ctx.build_wells_table, ctx.extract_vertical_profiles,
                 ctx.build_single_hetero_data, d["temp0_full"],
                 node_encoder=ctx.node_encoder, enrich_global_attr=ctx.enrich_global_attr,
+                # Fix #1: physics volumes onto the GPU once per geology (the
+                # model's per-graph volume.to(device) then no-ops). Fix #2: reuse
+                # the grids preloaded above instead of re-reading the H5 per cand.
+                device=device, preloaded_grids=d.get("well_grids"),
             )
             batches.append(Batch.from_data_list(static_graphs).to(device))
         return batches
@@ -2155,10 +2238,14 @@ def _run_acquisition_cma_surrogate(
         return _predict_all_geos(coords_arr, _build_batches(_coords_to_cfgs(coords_arr)))
 
     # ----- Optional: seed CMA mean from the best real-revenue incumbent --------
+    # Gated on cfg.cma_warm_start (default False): the cma_trajectory_long IX
+    # experiment showed warm-starting from the incumbent over-exploits the
+    # surrogate's exploit regime, so we default to a cold LHS restart each
+    # iteration (mean_init stays None).
     mean_init = None
     seed_incumbent_id: str | None = None
     seed_incumbent_iter: int | None = None
-    if iteration >= 1 and cfg.prior_metrics:
+    if cfg.cma_warm_start and iteration >= 1 and cfg.prior_metrics:
         elite_triples = _load_elite_seeds_ensemble(
             prior_metrics=list(cfg.prior_metrics or []), k=1, rng=rng,
         )

@@ -239,6 +239,7 @@ def main() -> int:
         cma_popsize=int(acq_cfg.get("cma_popsize", 16)),
         cma_generations=int(acq_cfg.get("cma_generations", 10)),
         cma_sigma_init=float(acq_cfg.get("cma_sigma_init", 5.0)),
+        cma_warm_start=bool(acq_cfg.get("cma_warm_start", False)),
         prior_metrics=prior_metrics,
         mode=mode,
         n_exploit=int(acq_cfg.get("n_exploit", 0)),

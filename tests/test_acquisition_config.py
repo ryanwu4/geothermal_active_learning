@@ -73,6 +73,7 @@ def test_acquisition_config_depth_defaults() -> None:
     assert cfg.depth_min == 5
     assert cfg.depth_max == 70
     assert cfg.mode == "per_geology"
+    assert cfg.cma_warm_start is False  # cold LHS restart by default
 
 
 def test_acquisition_config_accepts_cma_surrogate_overrides() -> None:
@@ -85,8 +86,10 @@ def test_acquisition_config_accepts_cma_surrogate_overrides() -> None:
         cma_sigma_init=12.0,
         n_exploit=16,
         n_frontier=4,
+        cma_warm_start=True,
     )
     assert cfg.mode == "cma_surrogate"
+    assert cfg.cma_warm_start is True
     assert cfg.depth_min == 10
     assert cfg.depth_max == 55
     assert cfg.cma_popsize == 32

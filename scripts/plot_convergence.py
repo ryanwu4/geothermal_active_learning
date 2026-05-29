@@ -867,6 +867,74 @@ def plot_calibration_metrics(history: list[dict], out_dir: Path) -> None:
     _save(fig, out_dir / "calibration_over_iterations.png")
 
 
+def plot_pred_real_gap(rows: list[dict], out_dir: Path) -> None:
+    """Over-exploitation monitor: predicted − real revenue (M$) per AL iteration.
+
+    NEGATIVE = surrogate UNDER-predicts the points it selected — the safe,
+    conservative regime (real meets/exceeds prediction). A swing strongly
+    POSITIVE = the surrogate over-predicts its own picks → over-exploitation
+    (it is selecting configs IX doesn't reward). Mirrors the pred−real gap the
+    cma_trajectory_long IX experiment used as the acquisition-termination cue:
+    the cold/from-scratch run stayed negative the whole way, while the
+    incumbent-warm-started run crossed to +52 M$ as real revenue degraded.
+
+    The gap is computed PER CANDIDATE (ensemble EMV): for each (iteration,
+    snapshot) we average pred and real over that candidate's per-geology rows,
+    then aggregate over candidates. This matches the experiment's per-candidate
+    definition and avoids over-weighting candidates that happened to run more
+    geologies (e.g. when dead-rock drops reduce a candidate's geology count).
+    """
+    if not rows:
+        return
+    # Collapse per-geology rows to one (pred_emv, real_emv) per (iter, snapshot).
+    by_iter_snap: dict[tuple[int, str], list[tuple[float, float]]] = {}
+    for i, r in enumerate(rows):
+        p, q = r.get("predicted_revenue"), r.get("real_revenue")
+        if p is None or q is None or not (np.isfinite(p) and np.isfinite(q)):
+            continue
+        it = int(r["iteration"])
+        sid = r.get("snapshot_id") or f"_row{i}"  # fall back to per-row if no id
+        by_iter_snap.setdefault((it, sid), []).append((float(p), float(q)))
+    if not by_iter_snap:
+        return
+    by_iter: dict[int, list[float]] = {}
+    for (it, _sid), pairs in by_iter_snap.items():
+        pred_emv = float(np.mean([p for p, _ in pairs]))
+        real_emv = float(np.mean([q for _, q in pairs]))
+        by_iter.setdefault(it, []).append(pred_emv - real_emv)
+    iters = sorted(by_iter)
+    gaps = [np.asarray(by_iter[i]) for i in iters]
+    mean_g = [float(np.mean(g)) / 1e6 for g in gaps]
+    med_g = [float(np.median(g)) / 1e6 for g in gaps]
+    q25 = [float(np.percentile(g, 25)) / 1e6 for g in gaps]
+    q75 = [float(np.percentile(g, 75)) / 1e6 for g in gaps]
+
+    fig, ax = plt.subplots(figsize=(11, 6), facecolor=MANIM_BG)
+    _style_ax(ax)
+    # ylim must span the mean line too: right-skewed gaps (a few low-value
+    # geologies) push the mean above Q75, and clipping it would hide the
+    # headline over-exploitation signal.
+    lo = min(q25 + med_g + mean_g + [0.0])
+    hi = max(q75 + med_g + mean_g + [0.0])
+    pad = 0.10 * (hi - lo + 1e-6)
+    ax.set_ylim(lo - pad, hi + pad)
+    # shade the over-exploitation (pred > real) half-plane
+    ax.axhspan(0.0, hi + pad, color=MANIM_RED, alpha=0.06)
+    ax.axhline(0.0, color=MANIM_GREY, lw=1.5, ls="--")
+    ax.fill_between(iters, q25, q75, color=MANIM_BLUE, alpha=0.18,
+                    label="per-candidate IQR")
+    ax.plot(iters, med_g, color=MANIM_BLUE, marker="s", lw=2,
+            label="median(pred − real)")
+    ax.plot(iters, mean_g, color=MANIM_ORANGE, marker="o", lw=2,
+            label="mean(pred − real)")
+    ax.set_xlabel("AL iteration")
+    ax.set_ylabel("Predicted − real revenue (M$), per candidate")
+    ax.set_title("Over-exploitation monitor: pred − real per iteration\n"
+                 "(< 0 = under-predict / safe; > 0 = over-predict / over-exploitation risk)")
+    ax.legend(loc="best")
+    _save(fig, out_dir / "pred_real_gap_over_iterations.png")
+
+
 def plot_predicted_vs_real_scatter(rows: list[dict], out_dir: Path) -> None:
     """Predicted vs real revenue across all iterations, colored by iter."""
     if not rows:
@@ -2311,6 +2379,7 @@ def main() -> int:
     plot_best_revenue_with_geo_updates(history, rows, out_dir)
     plot_per_geology_best_so_far_facets(rows, out_dir)
     plot_calibration_metrics(history, out_dir)
+    plot_pred_real_gap(rows, out_dir)
     plot_per_geology_mape_heatmap(history, out_dir)
     plot_training_growth(history, out_dir)
     plot_wallclock_breakdown(history, out_dir)

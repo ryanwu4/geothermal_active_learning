@@ -46,8 +46,9 @@
   "acquisition": {
     "mode": "cma_surrogate",
     "cma_popsize": 24,
-    "cma_generations": 40,
+    "cma_generations": 100,
     "cma_sigma_init": 12.0,
+    "cma_warm_start": false,
     "depth_min": 5,
     "depth_max": 70,
     "n_exploit": 16,
