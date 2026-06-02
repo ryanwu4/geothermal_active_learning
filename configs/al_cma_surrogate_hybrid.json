@@ -46,7 +46,7 @@
   "acquisition": {
     "mode": "cma_surrogate",
     "cma_popsize": 24,
-    "cma_generations": 100,
+    "cma_generations": 40,
     "cma_sigma_init": 12.0,
     "cma_warm_start": false,
     "depth_min": 5,
@@ -66,7 +66,7 @@
   },
 
   "intersect": {
-    "max_concurrent": 30,
+    "max_concurrent": 80,
     "time_per_run": "00:40:00",
     "cpus_per_task": 2,
     "mem_per_task": "8GB",

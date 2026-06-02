@@ -2334,8 +2334,15 @@ def _run_acquisition_cma_surrogate(
     for _gen in range(int(cfg.cma_generations)):
         coords = opt.ask()  # (popsize, num_wells, 3), projected to valid cells
         preds = _predict_rebuilt(coords)  # (popsize, K) — ACCURATE graphs
-        with np.errstate(invalid="ignore"):  # all-NaN row -> NaN, filtered below
-            emv = np.nanmean(preds, axis=1)  # (popsize,)
+        # Ensemble-mean over geologies. Dead-rock-dropped candidates have an
+        # all-NaN row -> leave their emv NaN (so CMA ranks them worst / they're
+        # filtered below) WITHOUT calling nanmean on an all-NaN slice (which
+        # would emit a benign but noisy "Mean of empty slice" RuntimeWarning;
+        # np.errstate does not catch it since it's a warnings-module warning).
+        emv = np.full(preds.shape[0], np.nan, dtype=np.float64)
+        finite_rows = np.isfinite(preds).any(axis=1)
+        if finite_rows.any():
+            emv[finite_rows] = np.nanmean(preds[finite_rows], axis=1)
         opt.tell(coords, emv)
         for i in range(popsize):
             if np.isfinite(emv[i]) and np.isfinite(preds[i]).all():
