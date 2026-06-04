@@ -447,11 +447,43 @@ def _ensure_norm_config(remote: RemoteSession, state: RunState, ws: Path) -> Pat
     return local
 
 
+def _should_clean_start(cfg: dict) -> bool:
+    """Clean-start runs train iter 0 from scratch on a seed H5 instead of
+    loading a pretrained bootstrap checkpoint (which doesn't exist)."""
+    return bool((cfg.get("training") or {}).get("clean_start", False))
+
+
+def _pull_seed_h5(remote: RemoteSession, cfg: dict, ws: Path) -> None:
+    """Clean start (iter 0): pull the seed compiled H5 (+ sibling
+    case_geology_map.json) from Sherlock to the local current-compiled path so
+    ``_train_locally`` trains a fresh surrogate on it.
+    """
+    seed_h5_remote = cfg["paths"]["bootstrap_compiled_h5"]
+    dest = _local_compiled_h5(ws)
+    print(f"[local-driver] clean start: pulling seed compiled H5 {seed_h5_remote} → {dest}")
+    remote.pull(seed_h5_remote, dest)
+    # train.py prefers an adjacent case_geology_map.json for the stratified
+    # geology-aware split; pull it next to the local H5 if present (it falls back
+    # to the runtime resolver otherwise).
+    case_map_remote = str(Path(seed_h5_remote).parent / "case_geology_map.json")
+    if remote.run(["test", "-f", case_map_remote], check=False).returncode == 0:
+        remote.pull(case_map_remote, ws / "case_geology_map.json")
+    else:
+        print(f"[local-driver] note: {case_map_remote} absent; train.py will resolve "
+              f"geology at runtime.")
+
+
 def _ensure_bootstrap_artifacts(
     remote: RemoteSession, cfg: dict, ws: Path
 ) -> tuple[Path, Path]:
-    """For iter 0: pull bootstrap checkpoint + scaler from Sherlock."""
-    boot_dir_remote = cfg["paths"]["bootstrap_checkpoint_dir"]
+    """For iter 0 (non-clean-start): pull bootstrap checkpoint + scaler from Sherlock."""
+    boot_dir_remote = cfg["paths"].get("bootstrap_checkpoint_dir")
+    if not boot_dir_remote:
+        raise RuntimeError(
+            "paths.bootstrap_checkpoint_dir is unset but training.clean_start is "
+            "false. Set clean_start=true (and run the seed pre-step) for a clean "
+            "start, or provide a bootstrap_checkpoint_dir."
+        )
     boot_dir_local = ws / "models" / "bootstrap"
     boot_dir_local.mkdir(parents=True, exist_ok=True)
     # Sync the whole checkpoint dir (small — a few MB).
@@ -897,7 +929,18 @@ def main() -> int:
             _ensure_norm_config(remote, state, ws)
             local_extra = _read_local_extra(ws)
 
-            if iteration == 0:
+            if iteration == 0 and _should_clean_start(cfg):
+                # Clean start: no pretrained checkpoint. Pull the seed H5 and
+                # train a fresh surrogate on it (should_train_from_scratch(0,k)
+                # is True, so _train_locally trains from scratch with no warm ckpt).
+                _pull_seed_h5(remote, cfg, ws)
+                last_step = "pulled seed compiled H5 (clean start)"
+                ckpt, scaler, train_metrics = _train_locally(
+                    state=state, cfg=cfg, ws=ws,
+                    iter_idx=0, local_extra=local_extra,
+                )
+                last_step = "trained iter 0 from scratch (clean start)"
+            elif iteration == 0:
                 ckpt, scaler = _ensure_bootstrap_artifacts(remote, cfg, ws)
                 train_metrics = {"wallclock_train_min": 0.0,
                                  "train_val_loss": None,

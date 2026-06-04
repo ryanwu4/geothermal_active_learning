@@ -80,12 +80,13 @@ def main() -> int:
     acq_cfg = config["acquisition"]
     sel_cfg = config["selection"]
     ix_cfg = config["intersect"]
+    clean_start = bool(train_cfg.get("clean_start", False))
 
     # ----- Step 1: train (warm-start or from-scratch) -----
     iter_dir = paths.iter_dir(state.iteration)
     train_log = paths.logs_dir / f"train_iter_{state.iteration:04d}.log"
 
-    if state.iteration == 0:
+    if state.iteration == 0 and not clean_start:
         # Bootstrap: use existing checkpoint + scaler from config; skip retraining
         # at iter 0 since that data is already represented.
         ckpt_dir = Path(config["paths"]["bootstrap_checkpoint_dir"]).resolve()
@@ -105,9 +106,13 @@ def main() -> int:
         was_from_scratch = False
         print(f"Iteration 0 bootstrap: ckpt={new_ckpt}, scaler={new_scaler}")
     else:
-        # Pick the compiled H5 produced by the previous ingest.
+        # iter > 0, OR clean-start iter 0: train (warm-start or from-scratch).
+        # Pick the compiled H5 produced by the previous ingest; at clean-start
+        # iter 0 there is none, so use the seed H5 (= bootstrap_compiled_h5).
         prior_iter = state.iteration - 1
-        compiled_h5_for_acq = paths.iter_compiled_h5(prior_iter)
+        compiled_h5_for_acq = (
+            paths.iter_compiled_h5(prior_iter) if prior_iter >= 0 else bootstrap_h5
+        )
         if not compiled_h5_for_acq.exists():
             # Fall back to whatever state has tracked.
             if state.current_compiled_h5 and Path(state.current_compiled_h5).exists():
@@ -116,8 +121,12 @@ def main() -> int:
                 print(f"ERROR: no compiled H5 found for iter {prior_iter}", file=sys.stderr)
                 return 1
 
-        from_scratch = should_train_from_scratch(
-            state.iteration, int(train_cfg.get("from_scratch_every_k", 5))
+        # Clean-start iter 0 has no prior checkpoint, so force from-scratch.
+        from_scratch = (
+            True if state.iteration == 0
+            else should_train_from_scratch(
+                state.iteration, int(train_cfg.get("from_scratch_every_k", 5))
+            )
         )
         was_from_scratch = from_scratch
         warm_ckpt = None if from_scratch else (

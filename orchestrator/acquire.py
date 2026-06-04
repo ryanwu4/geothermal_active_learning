@@ -2443,6 +2443,11 @@ def _run_acquisition_cma_surrogate(
             })
         predicted_emv = float(np.mean(pred_row))
         is_exploit = (kind == "exploit")
+        # run_id is a per-candidate uniqueness counter only. Geology is carried
+        # per IX task by the scenario (geology_config_id) token in the output
+        # filename — an ensemble candidate spans all K geologies under one
+        # run_id, so run_id MUST NOT be used to encode geology. The training
+        # split resolves geology by scenario (geothermal.data.resolve_geology_indices).
         snap = _emit_snapshot_ensemble(
             run_id=m,
             iteration_step=int(cfg.cma_generations),
@@ -3166,6 +3171,10 @@ def _run_acquisition_ensemble(
                 # real metric.
                 "total_energy_production": float("nan"),
             })
+        # run_id is a per-candidate uniqueness counter only; geology is carried
+        # per IX task by the scenario (geology_config_id) token, not run_id (an
+        # ensemble candidate spans all K geologies under one run_id). See
+        # geothermal.data.resolve_geology_indices.
         snap = _emit_snapshot_ensemble(
             run_id=m,
             iteration_step=int(cfg.k_safe),
