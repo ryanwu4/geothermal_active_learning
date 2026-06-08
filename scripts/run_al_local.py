@@ -148,9 +148,57 @@ def _send_email_notice(
                 file=sys.stderr,
             )
         else:
-            print(f"[local-driver] sent auth-failure notice to {to_addr}", file=sys.stderr)
+            print(f"[local-driver] sent notification email to {to_addr}", file=sys.stderr)
     except Exception as e:
-        print(f"[local-driver] could not send auth-failure email: {e}", file=sys.stderr)
+        print(f"[local-driver] could not send notification email: {e}", file=sys.stderr)
+
+
+def _notify_run_event(
+    *,
+    event: str,                       # "completed" | "failed"
+    ws: Path,
+    driver_label: str,                # e.g. "AL hybrid" / "baseline"
+    run_id: str | None,
+    iteration: int | None,
+    last_step: str,
+    notify_email: str | None,
+    notify_msmtp_account: str = "gmail",
+    detail: str = "",
+) -> None:
+    """Email a run-lifecycle event (completion / failure). Best-effort, never raises.
+
+    No-op when ``notify_email`` is unset, so the behavior is purely config-driven
+    (``compute.notify_email``) and applies to every config without code changes.
+    SSH-unavailable pauses keep their own richer notice via ``_write_needs_auth``;
+    this helper covers the "run finished" and "run crashed" cases.
+    """
+    if not notify_email:
+        return
+    status = {"completed": "completed", "failed": "FAILED"}.get(event, event)
+    host = socket.gethostname()
+    subject = (
+        f"[{driver_label}] run {status} on {host} "
+        f"(run={run_id or 'unbootstrapped'}, iter={iteration})"
+    )
+    body_lines = [
+        f"# {driver_label} run {status}",
+        "",
+        f"- Host: {host}",
+        f"- Run id: {run_id or '(not bootstrapped yet)'}",
+        f"- Iteration: {iteration if iteration is not None else '(unknown)'}",
+        f"- Last successful step: {last_step}",
+        f"- Workspace: {ws}",
+    ]
+    if detail:
+        body_lines += ["", detail]
+    if event == "failed" and run_id:
+        body_lines += ["", f"Resume with: --run-id {run_id} after resolving the issue."]
+    _send_email_notice(
+        to_addr=notify_email,
+        msmtp_account=notify_msmtp_account,
+        subject=subject,
+        body="\n".join(body_lines),
+    )
 
 
 def _write_needs_auth(
@@ -809,6 +857,10 @@ def main() -> int:
     ws = Path(compute["local_workspace"]).expanduser().resolve()
     _ensure_workspace(ws)
 
+    # Email notification target (shared by completion / failure / auth notices).
+    notify_email = compute.get("notify_email")
+    notify_msmtp_account = compute.get("notify_msmtp_account", "gmail")
+
     # Prevent two drivers from clobbering each other on the same workspace.
     # The lock auto-releases when ``lock_fd`` is GC'd / process exits.
     lock_path = ws / ".driver.lock"
@@ -896,6 +948,12 @@ def main() -> int:
                 (ws / "NEEDS_AUTH.md").unlink(missing_ok=True)
                 if wandb_handle is not None:
                     wandb_handle.finish()
+                _notify_run_event(
+                    event="completed", ws=ws, driver_label="AL hybrid",
+                    run_id=run_id, iteration=iteration, last_step=last_step,
+                    notify_email=notify_email, notify_msmtp_account=notify_msmtp_account,
+                    detail="Sherlock wrote done.json — the run finished cleanly.",
+                )
                 return 0
 
             state = _pull_state(remote, remote_run_root, ws)
@@ -1134,6 +1192,14 @@ def main() -> int:
                 if wandb_handle is not None:
                     wandb_handle.log({"ingest_terminal_state": final}, step=iteration)
                     wandb_handle.finish()
+                _notify_run_event(
+                    event="failed", ws=ws, driver_label="AL hybrid",
+                    run_id=run_id, iteration=iteration, last_step=last_step,
+                    notify_email=notify_email, notify_msmtp_account=notify_msmtp_account,
+                    detail=(f"Ingest job {ingest_job} finished non-COMPLETED ({final}). "
+                            f"Logs: {remote_run_root}/logs/ingest_iter_{iteration:04d}.err "
+                            f"on Sherlock."),
+                )
                 return 1
 
     except SshUnavailable as e:
@@ -1146,10 +1212,26 @@ def main() -> int:
             error=e,
             ssh_host=compute["ssh_host"],
             control_path=compute["ssh_control_path"],
-            notify_email=compute.get("notify_email"),
-            notify_msmtp_account=compute.get("notify_msmtp_account", "gmail"),
+            notify_email=notify_email,
+            notify_msmtp_account=notify_msmtp_account,
         )
         return 2
+    except Exception as e:
+        # Any other failure during the unattended loop: email, then re-raise so
+        # the traceback still surfaces in the log and the exit code stays
+        # non-zero. KeyboardInterrupt / SystemExit propagate untouched (a manual
+        # stop isn't an error worth paging about).
+        try:
+            _notify_run_event(
+                event="failed", ws=ws, driver_label="AL hybrid",
+                run_id=run_id, iteration=iteration, last_step=last_step,
+                notify_email=notify_email, notify_msmtp_account=notify_msmtp_account,
+                detail=f"Driver crashed with {type(e).__name__}: {e}",
+            )
+        except Exception as notify_err:
+            print(f"[local-driver] failure-notify itself failed: {notify_err}",
+                  file=sys.stderr)
+        raise
 
 
 def _read_julia_config(remote: RemoteSession, cfg: dict) -> dict:

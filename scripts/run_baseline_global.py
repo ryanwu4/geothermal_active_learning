@@ -64,6 +64,7 @@ from orchestrator.state import IterationRecord, RunState, new_run_id, new_wandb_
 from run_al_local import (  # type: ignore  # noqa: E402
     _build_geology_remappings,
     _make_sherlock_runner,
+    _notify_run_event,
     _poll_until_terminal,
     _rewrite_manifest_paths,
     _send_email_notice,
@@ -689,6 +690,10 @@ def main() -> int:
     ws = Path(compute["local_workspace"]).expanduser().resolve()
     _ensure_workspace(ws)
 
+    # Email notification target (shared by completion / failure / auth notices).
+    notify_email = compute.get("notify_email")
+    notify_msmtp_account = compute.get("notify_msmtp_account", "gmail")
+
     # Lock so two drivers don't clobber the same workspace.
     lock_path = ws / ".driver.lock"
     lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
@@ -784,6 +789,12 @@ def main() -> int:
                 (ws / "NEEDS_AUTH.md").unlink(missing_ok=True)
                 if wandb_handle is not None:
                     wandb_handle.finish()
+                _notify_run_event(
+                    event="completed", ws=ws, driver_label="baseline",
+                    run_id=run_id, iteration=iteration, last_step=last_step,
+                    notify_email=notify_email, notify_msmtp_account=notify_msmtp_account,
+                    detail="done.json present on Sherlock — the run finished cleanly.",
+                )
                 return 0
 
             state = _pull_state(remote, remote_run_root, ws)
@@ -800,6 +811,12 @@ def main() -> int:
                 remote.push(done_local, f"{remote_run_root}/done.json")
                 if wandb_handle is not None:
                     wandb_handle.finish()
+                _notify_run_event(
+                    event="completed", ws=ws, driver_label="baseline",
+                    run_id=run_id, iteration=iteration, last_step=last_step,
+                    notify_email=notify_email, notify_msmtp_account=notify_msmtp_account,
+                    detail=f"Reached max_iterations={max_iters} — wrote done.json.",
+                )
                 return 0
 
             if wandb_handle is None:
@@ -948,6 +965,14 @@ def main() -> int:
                 if wandb_handle is not None:
                     wandb_handle.log({"ingest_terminal_state": final}, step=iteration)
                     wandb_handle.finish()
+                _notify_run_event(
+                    event="failed", ws=ws, driver_label="baseline",
+                    run_id=run_id, iteration=iteration, last_step=last_step,
+                    notify_email=notify_email, notify_msmtp_account=notify_msmtp_account,
+                    detail=(f"Ingest finished non-COMPLETED ({final}). Logs: "
+                            f"{remote_run_root}/logs/ingest_baseline_iter_{iteration:04d}.err "
+                            f"on Sherlock."),
+                )
                 return 1
 
             # ---- 7. Pull fitness.json + tell() ----
@@ -1067,10 +1092,26 @@ def main() -> int:
             last_step=last_step,
             error=e,
             ssh_host=compute["ssh_host"],
-            notify_email=compute.get("notify_email"),
-            notify_msmtp_account=compute.get("notify_msmtp_account", "gmail"),
+            notify_email=notify_email,
+            notify_msmtp_account=notify_msmtp_account,
         )
         return 2
+    except Exception as e:
+        # Any other failure during the unattended loop (incl. the all-NaN-batch
+        # and state/optimizer-mismatch RuntimeErrors): email, then re-raise so
+        # the traceback still surfaces and the exit code stays non-zero.
+        # KeyboardInterrupt / SystemExit propagate untouched.
+        try:
+            _notify_run_event(
+                event="failed", ws=ws, driver_label="baseline",
+                run_id=run_id, iteration=iteration, last_step=last_step,
+                notify_email=notify_email, notify_msmtp_account=notify_msmtp_account,
+                detail=f"Driver crashed with {type(e).__name__}: {e}",
+            )
+        except Exception as notify_err:
+            print(f"[baseline-driver] failure-notify itself failed: {notify_err}",
+                  file=sys.stderr)
+        raise
 
     return 0
 
