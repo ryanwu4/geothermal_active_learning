@@ -671,6 +671,58 @@ def _wells_is_injector(cfg: dict) -> list[bool]:
     return [str(w["type"]).lower() == "injector" for w in cfg["wells"]]
 
 
+def _build_baseline_npv_state(cfg: dict, geology_entries: list[dict],
+                              is_injector_list: list[bool]) -> dict | None:
+    """Local proxy-NPV state for the direct-IX-CMA ablation, or None in revenue mode.
+
+    Gated on cfg["optimizer"].get("objective")=="npv" (mirrors the surrogate path's
+    acquisition.objective). The driver runs locally with the cube + local geology H5s, so it
+    wraps each candidate's real-IX per-geology revenue with the deviated-well CAPEX + surface
+    flowline + surface-facility CAPEX + discounted OPEX from economics.json. Reused from
+    geothermal.well_geometry so the math is identical to the surrogate path.
+    """
+    opt_cfg = cfg.get("optimizer", {})
+    if str(opt_cfg.get("objective", "revenue")) != "npv":
+        return None
+    import h5py  # local-only import; baseline ingest stays revenue-based on Sherlock
+    surrogate_repo = Path(
+        cfg.get("compute", {}).get("local_surrogate_repo") or cfg["paths"]["surrogate_repo"]
+    ).expanduser().resolve()
+    if str(surrogate_repo) not in sys.path:
+        sys.path.insert(0, str(surrogate_repo))
+    from geothermal.well_geometry import (  # type: ignore
+        load_geo_coord_cube, reservoir_top_k_map, facilities_surface_xy,
+        surface_flowline_length, compute_angled_well_length, compute_npv, load_npv_terms,
+    )
+    geo_cube_path = opt_cfg.get("geo_cube_path")
+    if not geo_cube_path or not Path(geo_cube_path).expanduser().exists():
+        raise FileNotFoundError(
+            f"objective='npv' requires optimizer.geo_cube_path (CX/CY/CZ h5); got {geo_cube_path}"
+        )
+    econ_path = opt_cfg.get("economics_config_path") or (surrogate_repo / "configs" / "economics.json")
+    ksurf = int(opt_cfg.get("ksurf", 2))
+    poro_thresh = float(opt_cfg.get("poro_thresh", 0.01))
+    facilities = opt_cfg.get("facilities", [[20, 30], [40, 40]])
+    cube = load_geo_coord_cube(Path(geo_cube_path).expanduser())
+    terms = load_npv_terms(str(econ_path))
+    fac_surf = facilities_surface_xy(cube, facilities, ksurf=ksurf)
+    flowline = surface_flowline_length(fac_surf)
+    rtop_by_geo: dict[int, np.ndarray] = {}
+    for e in geology_entries:
+        with h5py.File(e["geology_h5_file"], "r") as h:
+            poro = h["Input/Porosity"][:]
+        rtop_by_geo[int(e["geology_index"])] = reservoir_top_k_map(poro, poro_thresh=poro_thresh)
+    print(f"[baseline-driver] objective=npv: flowline_between={flowline:.1f} m, "
+          f"{len(rtop_by_geo)} geologies, surface_capex={terms.get('CAPEX_SURFACE_FACILITIES', 0.0):.3e}")
+    return {
+        "compute_angled_well_length": compute_angled_well_length,
+        "compute_npv": compute_npv,
+        "cube": cube, "terms": terms, "fac_surf": fac_surf, "flowline": flowline,
+        "rtop_by_geo": rtop_by_geo, "vertical_lead_m": float(opt_cfg.get("vertical_lead_m", 1000.0)),
+        "ksurf": ksurf, "is_injector_list": is_injector_list,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, required=True,
@@ -680,6 +732,14 @@ def main() -> int:
     args = parser.parse_args()
 
     cfg = _load_config(args.config)
+    # Foot-gun guard: the baseline reads objective under cfg["optimizer"] (the surrogate
+    # path reads it under cfg["acquisition"]). If a user put objective:"npv" under
+    # "acquisition" here it would be silently ignored and run revenue — fail loudly instead.
+    if str((cfg.get("acquisition") or {}).get("objective", "revenue")) == "npv":
+        print("ERROR: baseline reads objective from cfg['optimizer'], not cfg['acquisition']. "
+              "Move objective/economics_config_path/geo_cube_path/facilities/vertical_lead_m "
+              "into the 'optimizer' block.", file=sys.stderr)
+        return 1
     compute = cfg.get("compute") or {}
     for required in ("ssh_host", "ssh_control_path", "remote_repo_root",
                      "local_workspace", "local_geologies_config"):
@@ -689,6 +749,9 @@ def main() -> int:
 
     ws = Path(compute["local_workspace"]).expanduser().resolve()
     _ensure_workspace(ws)
+    # Pin the objective to this workspace so a resume with a flipped config fails loud.
+    from orchestrator.npv_metrics import assert_objective_marker
+    assert_objective_marker(ws, str((cfg.get("optimizer") or {}).get("objective", "revenue")))
 
     # Email notification target (shared by completion / failure / auth notices).
     notify_email = compute.get("notify_email")
@@ -716,6 +779,8 @@ def main() -> int:
     # Geology + bounds resolution (one-shot, all iters share).
     geology_entries, valid_xy, nx, ny, nz_min = _load_geologies_resolved(cfg)
     is_injector_list = _wells_is_injector(cfg)
+    # Proxy-NPV ablation state (None unless optimizer.objective == "npv").
+    npv_state = _build_baseline_npv_state(cfg, geology_entries, is_injector_list)
 
     last_step = "start"
     run_id = args.run_id
@@ -999,14 +1064,42 @@ def main() -> int:
                     p_idx = int(p_token[1])
                 except ValueError:
                     continue
-                v = c.get("ensemble_mean_revenue", float("nan"))
+                if npv_state is not None and p_idx < coords.shape[0]:
+                    # Wrap real-IX per-geology revenue with the proxy-NPV cost terms.
+                    # NPV_k = revenue_k - CAPEX(coords, geo_k) - flowline - surface - discounted OPEX;
+                    # fitness = ensemble-mean NPV (higher = better, same sign as revenue).
+                    per_geo = c.get("per_geology_revenue", {}) or {}
+                    npvs: list[float] = []
+                    for gk, gr in per_geo.items():
+                        rtop = npv_state["rtop_by_geo"].get(int(gk))
+                        if rtop is None or gr is None or not np.isfinite(gr):
+                            continue
+                        wl = npv_state["compute_angled_well_length"](
+                            coords[p_idx], cube=npv_state["cube"], fac_surf_xy=npv_state["fac_surf"],
+                            reservoir_top_k_map=rtop, vertical_lead_m=npv_state["vertical_lead_m"],
+                            ksurf=npv_state["ksurf"],
+                        )
+                        npvs.append(npv_state["compute_npv"](
+                            float(gr), wl, npv_state["is_injector_list"],
+                            flowline_between_m=npv_state["flowline"], npv_terms=npv_state["terms"],
+                        )["npv"])
+                    v = float(np.mean(npvs)) if npvs else float("nan")
+                    c["ensemble_mean_npv"] = v  # recorded in the re-saved local fitness copy
+                else:
+                    v = c.get("ensemble_mean_revenue", float("nan"))
                 cands_by_pop[p_idx] = float(v) if v is not None else float("nan")
+            if npv_state is not None:
+                # Persist the NPV-augmented fitness locally (remote ingest stays revenue-based).
+                with open(local_fitness, "w") as f:
+                    json.dump(fitness_payload, f, indent=2)
             fitnesses = np.array(
                 [cands_by_pop.get(p, float("nan")) for p in range(popsize)],
                 dtype=np.float64,
             )
             n_finite = int(np.isfinite(fitnesses).sum())
-            print(f"[baseline-driver] tell(): {n_finite}/{popsize} finite fitnesses, "
+            fit_label = "NPV" if npv_state is not None else "revenue"
+            best_npv_in_batch = float(np.nanmax(fitnesses)) if (npv_state is not None and n_finite) else None
+            print(f"[baseline-driver] tell(): {n_finite}/{popsize} finite {fit_label} fitnesses, "
                   f"max={np.nanmax(fitnesses) if n_finite else 'nan'}")
 
             # I4: all-NaN batch guard. If every candidate's IX evaluation
@@ -1050,17 +1143,27 @@ def main() -> int:
 
             # wandb log
             if wandb_handle is not None and wandb_handle.is_active:
-                wandb_handle.log({
+                log_payload = {
                     "iteration": iteration,
                     "generation": optimizer.generation,
                     "popsize": popsize,
                     "n_finite_in_batch": n_finite,
+                    "objective": ("npv" if npv_state is not None else "revenue"),
+                    # NB: best_ensemble_revenue_* always track REVENUE (from the remote
+                    # ingest). In npv mode the optimizer climbs NPV, so the NPV series
+                    # below is the one that matches what tell() optimized.
                     "best_ensemble_revenue_in_batch": fitness_payload.get("best_ensemble_revenue_in_batch"),
                     "best_ensemble_revenue_so_far": fitness_payload.get("best_ensemble_revenue_so_far"),
                     "n_submitted_tasks": stage.tasks_count,
                     "n_completed_tasks": fitness_payload.get("n_completed_tasks"),
                     "wallclock_ask_min": ask_min,
-                }, step=iteration)
+                }
+                if npv_state is not None:
+                    # Match the hybrid/dashboard key names so npv runs overlay on one wandb panel.
+                    log_payload["best_real_npv_in_batch"] = best_npv_in_batch
+                    bsf = getattr(optimizer, "best_fitness_so_far", None)
+                    log_payload["best_real_npv_so_far"] = float(bsf if bsf is not None else best_npv_in_batch)
+                wandb_handle.log(log_payload, step=iteration)
 
             # ---- 8. Refresh state from Sherlock for the next iter loop ----
             # The Sherlock-side ingest already advanced state.iteration; we
@@ -1076,6 +1179,16 @@ def main() -> int:
             # rows and the iter history.
             try:
                 if _pull_per_candidate_metrics(remote, remote_run_root, iteration, ws):
+                    # In npv mode, augment the pulled metrics with locally-computed real NPV
+                    # (remote ingest is revenue-only) so the dashboard shows the NPV objective.
+                    if npv_state is not None:
+                        from orchestrator.npv_metrics import augment_metrics_file
+                        for it_done in range(iteration + 1):
+                            augment_metrics_file(
+                                ws / f"iter_{it_done:04d}" / "per_candidate_metrics.json",
+                                ws / "acquire" / f"iter_{it_done:04d}" / "snapshots_json",
+                                npv_state,
+                            )
                     _render_plots(ws)
             except SshUnavailable:
                 raise

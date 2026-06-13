@@ -554,7 +554,7 @@ class TestColdRestartGate:
         captured = _capture_mean_init(monkeypatch)
         coords = np.array([[10.0 + w, 12.0 + w, 15.0] for w in range(4)], dtype=np.float32)
         monkeypatch.setattr(acq, "_load_elite_seeds_ensemble",
-                            lambda prior_metrics, k, rng: [(coords, "snapXYZ", 0)])
+                            lambda prior_metrics, k, rng, objective="revenue": [(coords, "snapXYZ", 0)])
         cfg = _fake_cfg(geos, num_wells=4, n_exploit=3, n_frontier=1, gens=4, popsize=8,
                         cma_warm_start=True,
                         prior_metrics=[tmp_path / "iter_0000" / "per_candidate_metrics.json"])

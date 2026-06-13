@@ -112,6 +112,19 @@ class AcquisitionConfig:
     depth_min: int = 5
     depth_max: int = 70
 
+    # ----- proxy-NPV objective (gated; default "revenue" preserves current behavior) -----
+    # When objective=="npv", the cma_surrogate fitness wraps the surrogate's predicted
+    # per-geology discounted revenue with the deviated-well CAPEX (geothermal.well_geometry),
+    # a surface-flowline cost between the fixed facilities, surface-facility CAPEX, and
+    # discounted OPEX. All economic numbers come from economics_config_path.
+    objective: str = "revenue"                 # "revenue" | "npv"
+    economics_config_path: Path | None = None
+    geo_cube_path: Path | None = None          # h5 with CX/CY/CZ structural coord cube (k,j,i)
+    facilities: tuple = ((20, 30), (40, 40))   # fixed surface facility (i, j) locations
+    vertical_lead_m: float = 1000.0
+    ksurf: int = 2
+    poro_thresh: float = 0.01
+
 
 # Canonical ordering for snapshots in the aggregate manifest so parallel runs
 # produce byte-identical output to serial runs.
@@ -366,6 +379,19 @@ class _WorkerContext:
     # we build here match the scaler the model was trained with.
     node_encoder: str = "profile"
     enrich_global_attr: bool = False
+    # ----- proxy-NPV state (only populated when objective=="npv") -----
+    objective: str = "revenue"
+    npv_terms: dict | None = None
+    geo_cube: dict | None = None
+    fac_surf_xy: Any = None              # (F, 2) facility surface coords (m)
+    flowline_between_m: float = 0.0      # constant surface flowline length between facilities
+    vertical_lead_m: float = 1000.0
+    ksurf: int = 2
+    poro_thresh: float = 0.01
+    # well_geometry callables (late-resolved from the surrogate repo)
+    compute_angled_well_length: Any = None
+    compute_npv: Any = None
+    reservoir_top_k_map: Any = None
 
 
 def _build_worker_context(
@@ -423,6 +449,36 @@ def _build_worker_context(
     num_wells = len(cfg.wells)
     base_seed = cfg.seed + iteration
 
+    # ----- proxy-NPV state (geology-independent parts loaded once) -----
+    objective = str(getattr(cfg, "objective", "revenue"))
+    npv_terms = None
+    geo_cube = None
+    fac_surf_xy = None
+    flowline_between_m = 0.0
+    compute_angled_well_length = compute_npv = reservoir_top_k_map = None
+    if objective == "npv":
+        from geothermal.well_geometry import (  # type: ignore
+            load_geo_coord_cube,
+            reservoir_top_k_map,
+            facilities_surface_xy,
+            surface_flowline_length,
+            compute_angled_well_length,
+            compute_npv,
+            load_npv_terms,
+        )
+        if not cfg.economics_config_path or not Path(cfg.economics_config_path).exists():
+            raise FileNotFoundError(
+                f"objective='npv' requires economics_config_path; got {cfg.economics_config_path}"
+            )
+        if not cfg.geo_cube_path or not Path(cfg.geo_cube_path).exists():
+            raise FileNotFoundError(
+                f"objective='npv' requires geo_cube_path (CX/CY/CZ h5); got {cfg.geo_cube_path}"
+            )
+        npv_terms = load_npv_terms(str(cfg.economics_config_path))
+        geo_cube = load_geo_coord_cube(cfg.geo_cube_path)
+        fac_surf_xy = facilities_surface_xy(geo_cube, cfg.facilities, ksurf=int(cfg.ksurf))
+        flowline_between_m = surface_flowline_length(fac_surf_xy)
+
     return _WorkerContext(
         device=device,
         model=model,
@@ -445,6 +501,17 @@ def _build_worker_context(
         get_valid_mask=get_valid_mask,
         node_encoder=node_encoder,
         enrich_global_attr=enrich_global_attr,
+        objective=objective,
+        npv_terms=npv_terms,
+        geo_cube=geo_cube,
+        fac_surf_xy=fac_surf_xy,
+        flowline_between_m=flowline_between_m,
+        vertical_lead_m=float(cfg.vertical_lead_m),
+        ksurf=int(cfg.ksurf),
+        poro_thresh=float(cfg.poro_thresh),
+        compute_angled_well_length=compute_angled_well_length,
+        compute_npv=compute_npv,
+        reservoir_top_k_map=reservoir_top_k_map,
     )
 
 
@@ -1374,6 +1441,14 @@ def run_acquisition(
       - ``out_dir/snapshots_json/<snapshot_id>.json`` per snapshot
       - ``out_dir/manifest.json`` aggregate
     """
+    # Foot-gun guard: only the cma_surrogate path implements the NPV objective. The Adam
+    # ensemble / per_geology / multi-GPU paths silently score+rank on revenue; pairing them with
+    # objective="npv" would optimize revenue while the dashboard relabels everything NPV. Fail loud.
+    if getattr(cfg, "objective", "revenue") == "npv" and getattr(cfg, "mode", "per_geology") != "cma_surrogate":
+        raise ValueError(
+            f"objective='npv' is only implemented for mode='cma_surrogate'; got mode="
+            f"'{getattr(cfg, 'mode', 'per_geology')}'. Set mode='cma_surrogate' or objective='revenue'."
+        )
     if getattr(cfg, "mode", "per_geology") == "cma_surrogate":
         return _run_acquisition_cma_surrogate(
             cfg, out_dir=out_dir, iteration=iteration, run_id_prefix=run_id_prefix,
@@ -1668,14 +1743,18 @@ def _load_elite_seeds_ensemble(
     prior_metrics: list[Path],
     k: int,
     rng: np.random.Generator,
+    objective: str = "revenue",
 ) -> list[tuple[np.ndarray, str, int]]:
     """Pull top-K real-EMV configs across prior iters (ensemble mode).
 
     Returns at most ``k`` triples of ``(coords, source_snapshot_id, source_iteration)``,
-    ranked by descending per-candidate real EMV (mean of K real revenues across
-    the geology runs of that candidate). Candidate EMV is read from
-    ``per_candidate_emv`` if present in the metrics payload; otherwise it's
-    derived by averaging real_revenue grouped by snapshot_id across all rows.
+    ranked by descending per-candidate real EMV (mean over the candidate's K geology runs).
+    In npv mode the ranking value is real NPV (per-row ``real_npv``, written into prior
+    per_candidate_metrics by the local driver's npv augmentation) so the warm-start incumbent is
+    the best-NPV config, not the best-revenue one. In revenue mode it's real_revenue, read from
+    the pre-aggregated ``per_candidate_emv`` when present.
+
+    Coordinates come from each candidate's ``snapshots_json/<id>.json`` file.
 
     Coordinates come from each candidate's ``snapshots_json/<id>.json`` file.
     Enforces a minimum pairwise L2 distance (>=3 grid cells in flattened coord
@@ -1703,26 +1782,28 @@ def _load_elite_seeds_ensemble(
         except Exception:
             continue
         iter_idx = int(payload.get("iteration", -1))
-        # Prefer the pre-aggregated per_candidate_emv if it's there.
-        per_cand_emv = payload.get("per_candidate_emv") or {}
+        use_npv = (objective == "npv")
+        # Prefer the pre-aggregated per_candidate_emv (REVENUE) only in revenue mode. In npv mode
+        # it is the wrong quantity, so always aggregate from per-row real_npv instead.
+        per_cand_emv = {} if use_npv else (payload.get("per_candidate_emv") or {})
         if not isinstance(per_cand_emv, dict):
             per_cand_emv = {}
         # Otherwise, aggregate on the fly from the candidates list. Only
         # snapshots that fanned out to >1 IX run are real EMVs; per-geology
         # iterations have one row per snapshot whose "EMV" would just be that
-        # single geology's revenue, which is meaningless for ensemble seeding.
+        # single geology's value, which is meaningless for ensemble seeding.
         if not per_cand_emv:
             grouped: dict[str, list[float]] = {}
             for c in payload.get("candidates", []):
                 sid = c.get("snapshot_id")
-                rev = c.get("real_revenue")
-                if not sid or rev is None or not np.isfinite(rev):
+                val = c.get("real_npv") if use_npv else c.get("real_revenue")
+                if not sid or val is None or not np.isfinite(val):
                     continue
-                grouped.setdefault(str(sid), []).append(float(rev))
+                grouped.setdefault(str(sid), []).append(float(val))
             per_cand_emv = {
-                sid: float(np.mean(revs))
-                for sid, revs in grouped.items()
-                if len(revs) > 1
+                sid: float(np.mean(vals))
+                for sid, vals in grouped.items()
+                if len(vals) > 1
             }
         for sid, emv in per_cand_emv.items():
             if emv is None or not np.isfinite(emv):
@@ -1790,6 +1871,7 @@ def _emit_snapshot_ensemble(
     well_configs_dir: Path,
     snapshots_json_dir: Path,
     to_julia_wells_text,
+    extra_fields: dict | None = None,
 ) -> dict[str, Any]:
     """Write one .jl + one snapshot JSON for an ensemble candidate.
 
@@ -1850,6 +1932,8 @@ def _emit_snapshot_ensemble(
         "wells": wells_json,
         "predictions_by_geology": predictions_by_geology,
     }
+    if extra_fields:
+        snap_payload.update(extra_fields)
     with open(json_path, "w") as f:
         json.dump(snap_payload, f, indent=2)
 
@@ -1887,6 +1971,8 @@ def _emit_snapshot_ensemble(
         "seed_source_iteration": (None if seed_source_iteration is None else int(seed_source_iteration)),
         "seed_predicted_emv": (None if seed_predicted_emv is None else float(seed_predicted_emv)),
     }
+    if extra_fields:
+        snapshot_record.update(extra_fields)
     return snapshot_record
 
 
@@ -2105,6 +2191,8 @@ def _run_acquisition_cma_surrogate(
     target_scale = ctx.target_scale
     is_injector_list = ctx.is_injector_list
     num_wells = ctx.num_wells
+    # Defensive: fake worker contexts in tests may omit the npv fields.
+    objective = getattr(ctx, "objective", "revenue")
 
     geologies = list(cfg.geologies)
     K = len(geologies)
@@ -2121,15 +2209,33 @@ def _run_acquisition_cma_surrogate(
             geology_metas[g.geology_index] = _read_geology_metadata_safe(
                 ctx.read_geology_metadata, src, g.geology_name or gp.stem
             )
-        geology_loaded.append(_load_geology(
+        d = _load_geology(
             gp, ctx.norm_config,
             ctx.PROPERTIES, ctx.PERM_PROPS, ctx.get_valid_mask, ctx.find_z_cutoff,
             # Fix #2: read the raw well-data grids ONCE per geology here so the
             # per-generation per-candidate graph rebuild below reuses them
             # instead of re-reading the full H5 grids for every CMA candidate.
             preload_well_grids=True,
-        ))
+        )
+        if objective == "npv":
+            # Per-geology reservoir-top map from the already-preloaded raw porosity
+            # (geothermal.well_geometry.reservoir_top_k_map). Indexed [j-1, i-1].
+            d["reservoir_top_k"] = ctx.reservoir_top_k_map(
+                d["well_grids"]["Input/Porosity"], poro_thresh=ctx.poro_thresh
+            )
+        geology_loaded.append(d)
     timings["geo_load_s"] = time.perf_counter() - t0
+
+    # If every geology shares the same reservoir-top map (the common case — the
+    # porous/overburden stratigraphy is structural, while geologies differ in
+    # perm/temp), the deviated well length is geology-independent. Detect this once
+    # so the NPV fitness computes each candidate's well length ONCE instead of K
+    # times, and the emitted cost breakdown reconciles exactly with predicted NPV.
+    shared_rtop = None
+    if objective == "npv":
+        rtops = [d["reservoir_top_k"] for d in geology_loaded]
+        if all(np.array_equal(rtops[0], rt) for rt in rtops[1:]):
+            shared_rtop = rtops[0]
 
     nx = min(d["nx"] for d in geology_loaded)
     ny = min(d["ny"] for d in geology_loaded)
@@ -2299,8 +2405,16 @@ def _run_acquisition_cma_surrogate(
     seed_incumbent_iter: int | None = None
     if cfg.cma_warm_start and iteration >= 1 and cfg.prior_metrics:
         elite_triples = _load_elite_seeds_ensemble(
-            prior_metrics=list(cfg.prior_metrics or []), k=1, rng=rng,
+            prior_metrics=list(cfg.prior_metrics or []), k=1, rng=rng, objective=objective,
         )
+        # Make a silent degrade-to-cold visible: in npv mode the incumbent ranking needs the
+        # prior metrics to carry real_npv (written by the local dashboard augmentation). If that
+        # didn't happen (augmentation failed/skipped), elite_triples is empty and warm-start
+        # quietly becomes a cold restart — log it rather than hide it.
+        if not elite_triples and objective == "npv":
+            print("[acquire-cma] WARNING: cma_warm_start requested but no NPV-ranked incumbent "
+                  "found in prior metrics (real_npv missing — augmentation may have been skipped); "
+                  "falling back to a COLD restart.", flush=True)
         # Guard: only seed if the incumbent has the same well count as this run.
         if elite_triples and np.asarray(elite_triples[0][0]).shape[0] == num_wells:
             base, seed_incumbent_id, seed_incumbent_iter = elite_triples[0]
@@ -2325,30 +2439,69 @@ def _run_acquisition_cma_surrogate(
         mean_init=mean_init,
     )
 
+    def _candidate_scores(coords_np: np.ndarray, preds: np.ndarray):
+        """Map (popsize, K) revenue preds -> (score (popsize,), npv_rows).
+
+        revenue mode: score = ensemble-mean predicted revenue; npv_rows is None.
+        npv mode: per-geology NPV_k = revenue_k - deviated-well CAPEX(coords, geo_k) -
+        surface-flowline CAPEX - surface-facility CAPEX - discounted OPEX (all from
+        economics.json); score = ensemble-mean NPV; npv_rows is (popsize, K). The cost
+        terms are geology-dependent only via each geology's reservoir-top map. Rows with
+        no finite revenue stay NaN (CMA ranks them worst), matching the revenue path.
+        """
+        M = preds.shape[0]
+        score = np.full(M, np.nan, dtype=np.float64)
+        finite = np.isfinite(preds).any(axis=1)
+        if objective != "npv":
+            if finite.any():
+                score[finite] = np.nanmean(preds[finite], axis=1)
+            return score, None
+        npv_rows = np.full((M, K), np.nan, dtype=np.float64)
+        for r in np.where(finite)[0]:
+            wl_shared = None
+            if shared_rtop is not None:
+                wl_shared = ctx.compute_angled_well_length(
+                    coords_np[r], cube=ctx.geo_cube, fac_surf_xy=ctx.fac_surf_xy,
+                    reservoir_top_k_map=shared_rtop,
+                    vertical_lead_m=ctx.vertical_lead_m, ksurf=ctx.ksurf,
+                )
+            for k_idx, d in enumerate(geology_loaded):
+                rev = preds[r, k_idx]
+                if not np.isfinite(rev):
+                    continue
+                wl = wl_shared if wl_shared is not None else ctx.compute_angled_well_length(
+                    coords_np[r], cube=ctx.geo_cube, fac_surf_xy=ctx.fac_surf_xy,
+                    reservoir_top_k_map=d["reservoir_top_k"],
+                    vertical_lead_m=ctx.vertical_lead_m, ksurf=ctx.ksurf,
+                )
+                npv_rows[r, k_idx] = ctx.compute_npv(
+                    float(rev), wl, is_injector_list,
+                    flowline_between_m=ctx.flowline_between_m, npv_terms=ctx.npv_terms,
+                )["npv"]
+        nfinite = np.isfinite(npv_rows).any(axis=1)
+        if nfinite.any():
+            score[nfinite] = np.nanmean(npv_rows[nfinite], axis=1)
+        return score, npv_rows
+
     # Pool keeps each finite candidate's coords AND its accurate per-geology
-    # prediction row, so the emit step reuses them with no recompute.
+    # prediction row, so the emit step reuses them with no recompute. In npv mode
+    # pool_npv carries the per-geology NPV row (None in revenue mode).
     pool_coords: list[np.ndarray] = []   # each (num_wells, 3)
-    pool_preds: list[np.ndarray] = []    # each (K,) accurate per-geology row
-    pool_emv: list[float] = []
+    pool_preds: list[np.ndarray] = []    # each (K,) accurate per-geology revenue row
+    pool_emv: list[float] = []           # the candidate SCORE (NPV in npv mode, else revenue)
+    pool_npv: list[Any] = []             # each (K,) per-geology NPV row, or None
     t0 = time.perf_counter()
     for _gen in range(int(cfg.cma_generations)):
         coords = opt.ask()  # (popsize, num_wells, 3), projected to valid cells
         preds = _predict_rebuilt(coords)  # (popsize, K) — ACCURATE graphs
-        # Ensemble-mean over geologies. Dead-rock-dropped candidates have an
-        # all-NaN row -> leave their emv NaN (so CMA ranks them worst / they're
-        # filtered below) WITHOUT calling nanmean on an all-NaN slice (which
-        # would emit a benign but noisy "Mean of empty slice" RuntimeWarning;
-        # np.errstate does not catch it since it's a warnings-module warning).
-        emv = np.full(preds.shape[0], np.nan, dtype=np.float64)
-        finite_rows = np.isfinite(preds).any(axis=1)
-        if finite_rows.any():
-            emv[finite_rows] = np.nanmean(preds[finite_rows], axis=1)
+        emv, npv_rows = _candidate_scores(coords, preds)
         opt.tell(coords, emv)
         for i in range(popsize):
             if np.isfinite(emv[i]) and np.isfinite(preds[i]).all():
                 pool_coords.append(coords[i].astype(np.float32).copy())
                 pool_preds.append(preds[i].astype(np.float32).copy())
                 pool_emv.append(float(emv[i]))
+                pool_npv.append(npv_rows[i].astype(np.float32).copy() if npv_rows is not None else None)
     timings["cma_loop_s"] = time.perf_counter() - t0
     timings["cma_generations"] = float(cfg.cma_generations)
     timings["cma_popsize"] = float(popsize)
@@ -2382,6 +2535,7 @@ def _run_acquisition_cma_surrogate(
     # ----- Frontier picks: LHS + FPS on xy, scored on accurate rebuilt graphs --
     frontier_coords: list[np.ndarray] = []
     frontier_preds: list[np.ndarray] = []
+    frontier_npv: list[Any] = []
     if n_frontier > 0:
         pool_n = max(8, 4 * n_frontier)
         sampler = qmc.LatinHypercube(d=2 * num_wells, seed=int(rng.integers(0, 2**31 - 1)))
@@ -2405,33 +2559,36 @@ def _run_acquisition_cma_surrogate(
         t0 = time.perf_counter()
         sel_preds = _predict_rebuilt(sel_coords)  # (n_frontier, K) — ACCURATE
         timings["frontier_forward_s"] = time.perf_counter() - t0
+        _, sel_npv = _candidate_scores(sel_coords, sel_preds)
         for j in range(sel_coords.shape[0]):
             frontier_coords.append(sel_coords[j].astype(np.float32))
             frontier_preds.append(sel_preds[j].astype(np.float32))
+            frontier_npv.append(sel_npv[j].astype(np.float32) if sel_npv is not None else None)
 
     # ----- Assemble emit list (exploit first, then frontier), reusing the
     # accurate per-geology predictions computed during the search/frontier. -----
-    emit_entries: list[tuple[np.ndarray, str, np.ndarray]] = []
+    emit_entries: list[tuple[np.ndarray, str, np.ndarray, Any]] = []
     for i in exploit_idx:
-        emit_entries.append((pool_coords[i], "exploit", pool_preds[i]))
-    for c, p in zip(frontier_coords, frontier_preds):
+        emit_entries.append((pool_coords[i], "exploit", pool_preds[i], pool_npv[i]))
+    for c, p, npvr in zip(frontier_coords, frontier_preds, frontier_npv):
         if np.isfinite(p).all():
-            emit_entries.append((c, "frontier", p))
+            emit_entries.append((c, "frontier", p, npvr))
     if not emit_entries:
         raise RuntimeError("cma_surrogate: no finite candidates to emit.")
+    npv_mode = (objective == "npv")
 
     # ----- Emit snapshots + candidates -----
     snapshots: list[dict[str, Any]] = []
     candidates: list[Candidate] = []
     t0 = time.perf_counter()
-    for m, (cxyz, kind, pred_row) in enumerate(emit_entries):
+    for m, (cxyz, kind, pred_row, npv_row) in enumerate(emit_entries):
         if not np.isfinite(pred_row).all() or not np.isfinite(cxyz).all():
             print(f"[acquire-cma] skip non-finite candidate m={m} kind={kind}", flush=True)
             continue
         predictions_by_geology = []
         for k_idx, g in enumerate(geologies):
             meta = geology_metas.get(g.geology_index, {})
-            predictions_by_geology.append({
+            entry = {
                 "geology_index": g.geology_index,
                 "geology_name": g.geology_name or Path(g.geology_h5_file).stem,
                 "geology_file": str(Path(g.geology_h5_file).resolve()),
@@ -2440,8 +2597,44 @@ def _run_acquisition_cma_surrogate(
                 "geology_sample_num": meta.get("sample_num"),
                 "discounted_total_revenue": float(pred_row[k_idx]),
                 "total_energy_production": float("nan"),
-            })
-        predicted_emv = float(np.mean(pred_row))
+            }
+            if npv_mode and npv_row is not None:
+                entry["npv"] = float(npv_row[k_idx])
+            predictions_by_geology.append(entry)
+        # The candidate SCORE that selection ranks on: ensemble NPV in npv mode
+        # (so the manifest/Candidate.predicted_revenue carries NPV), else mean revenue.
+        extra_fields = None
+        if npv_mode and npv_row is not None:
+            predicted_emv = float(np.nanmean(npv_row))
+            # Cost breakdown uses the MEAN well length over geologies so it reconciles
+            # EXACTLY with predicted_npv (NPV is linear in revenue and in Σwell_length, so
+            # mean-over-geologies of NPV == NPV at the mean well length). When reservoir tops
+            # are shared this is just the single per-candidate well length.
+            if shared_rtop is not None:
+                wl_bd = ctx.compute_angled_well_length(
+                    cxyz, cube=ctx.geo_cube, fac_surf_xy=ctx.fac_surf_xy,
+                    reservoir_top_k_map=shared_rtop,
+                    vertical_lead_m=ctx.vertical_lead_m, ksurf=ctx.ksurf,
+                )
+            else:
+                wl_bd = np.mean([
+                    ctx.compute_angled_well_length(
+                        cxyz, cube=ctx.geo_cube, fac_surf_xy=ctx.fac_surf_xy,
+                        reservoir_top_k_map=d["reservoir_top_k"],
+                        vertical_lead_m=ctx.vertical_lead_m, ksurf=ctx.ksurf,
+                    ) for d in geology_loaded
+                ], axis=0)
+            extra_fields = {
+                "objective": "npv",
+                "predicted_npv": predicted_emv,
+                "predicted_revenue_mean": float(np.nanmean(pred_row)),
+                "npv_cost_breakdown": ctx.compute_npv(
+                    float(np.nanmean(pred_row)), wl_bd, is_injector_list,
+                    flowline_between_m=ctx.flowline_between_m, npv_terms=ctx.npv_terms,
+                ),
+            }
+        else:
+            predicted_emv = float(np.mean(pred_row))
         is_exploit = (kind == "exploit")
         # run_id is a per-candidate uniqueness counter only. Geology is carried
         # per IX task by the scenario (geology_config_id) token in the output
@@ -2464,6 +2657,7 @@ def _run_acquisition_cma_surrogate(
             well_configs_dir=well_configs_dir,
             snapshots_json_dir=snapshots_json_dir,
             to_julia_wells_text=ctx.to_julia_wells_text,
+            extra_fields=extra_fields,
         )
         snapshots.append(snap)
         candidates.append(_snapshot_to_candidate_ensemble(snap, cxyz, is_injector_list))

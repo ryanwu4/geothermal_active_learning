@@ -99,6 +99,9 @@ def main() -> int:
         surrogate_repo / "norm_config.json"
     )
     economics_config = surrogate_repo / "configs" / "economics.json"
+    # Acquisition objective (revenue|npv). The ingest itself stays revenue-based (no cube on
+    # Sherlock); we only need it to tag reporting and to skip the revenue-plateau stop in npv mode.
+    objective = str(config.get("acquisition", {}).get("objective", "revenue"))
     bootstrap_h5 = Path(config["paths"]["bootstrap_compiled_h5"]).resolve()
 
     prior_iter = state.iteration - 1
@@ -212,6 +215,10 @@ def main() -> int:
         wandb_handle.log(
             {
                 "iteration": state.iteration,
+                # NOTE: in npv mode the OPTIMIZED objective is NPV; these revenue series are the
+                # surrogate's ground-truth revenue (still useful), NOT the objective. The NPV
+                # best-so-far is logged by the local driver (run_al_local.py) which has the cube.
+                "objective": objective,
                 "best_real_revenue_so_far": metrics.best_real_revenue_so_far,
                 "best_real_revenue_in_batch": metrics.best_real_revenue_in_batch,
                 "batch_mape_real_vs_pred": metrics.batch_mape,
@@ -245,12 +252,15 @@ def main() -> int:
             config["stopping"].get("consecutive_zero_completion_limit", 2)
         ),
     )
-    decision = evaluate_stopping(state, stop_cfg)
+    decision = evaluate_stopping(state, stop_cfg, objective=objective)
     if decision.should_stop:
         marker = paths.done_marker
         marker.write_text(json.dumps({
             "stopped_at_iteration": state.iteration,
             "reason": decision.reason,
+            # best_real_revenue is REVENUE even on npv runs (the ingest is revenue-based); the
+            # objective tag disambiguates so post-processors don't read it as the optimized value.
+            "objective": objective,
             "history": [
                 {"iteration": r.iteration, "best_real_revenue": r.best_real_revenue, "batch_mape": r.batch_mape}
                 for r in state.history

@@ -64,6 +64,17 @@ KIND_OFFSETS = {
 }
 
 
+# Objective label, set once by main() after detecting the run's objective. Defaults to revenue;
+# flipped to "NPV" for npv-objective runs so axis labels/titles track what is actually plotted.
+# (The objective-value fields in the rows/history are swapped to NPV at load time; surrogate
+# revenue is preserved in *_rev fields. The predicted-real GAP is identical in NPV space because
+# the per-candidate costs cancel, so accuracy/gap plots remain meaningful.)
+OBJECTIVE_MODE = "revenue"
+OBJ_LABEL = "discounted revenue"
+OBJ_LABEL_CAP = "Discounted revenue"
+OBJ_EMV = "EMV (mean discounted revenue across ensemble)"
+
+
 def _set_style() -> None:
     plt.rcParams.update({
         "font.size": FONT_SIZE,
@@ -140,6 +151,48 @@ def _all_candidate_rows(run_root: Path, history: list[dict]) -> list[dict]:
     return rows
 
 
+def _detect_objective(run_root: Path, history: list[dict]) -> str:
+    """Return "npv" if any iteration's per_candidate_metrics is tagged objective=npv, else "revenue"."""
+    for rec in history:
+        payload = _load_per_candidate(run_root, rec["iteration"])
+        if payload and str(payload.get("objective", "revenue")) == "npv":
+            return "npv"
+    return "revenue"
+
+
+def _apply_npv_objective(run_root: Path, history: list[dict], rows: list[dict]) -> None:
+    """Swap objective-value fields to NPV for npv-objective runs (in place).
+
+    The local drivers (via orchestrator.npv_metrics) write real_npv / predicted_npv /
+    terminal_real_npv per row and best_real_npv_in_batch per iter into per_candidate_metrics.json.
+    Here we move those into the field names the plots already consume so every objective /
+    convergence / ensemble plot shows NPV with no per-plot edits. Surrogate revenue stays available
+    in real_revenue_rev / predicted_revenue_rev. History best fields are rebuilt as the running max
+    of each iter's best_real_npv_in_batch.
+    """
+    for r in rows:
+        # Use the NPV value; if it couldn't be computed for this row (missing snapshot coords,
+        # dead-rock, well-count mismatch), set NaN so finite-guards drop it rather than leaving a
+        # REVENUE value mixed into an NPV axis.
+        r["real_revenue"] = r["real_npv"] if r.get("real_npv") is not None else float("nan")
+        r["predicted_revenue"] = r["predicted_npv"] if r.get("predicted_npv") is not None else float("nan")
+        # Always bind the ensemble "real EMV" to the NPV value (None if augmentation couldn't
+        # compute it). Leaving the revenue-valued terminal_real_emv would silently plot
+        # predicted-NPV (y) against real-REVENUE (x) on the ensemble pred-vs-real panels; binding
+        # None instead makes those panels' finite-guards drop the row rather than mix units.
+        r["terminal_real_emv"] = r.get("terminal_real_npv")
+    run_max = None
+    for rec in history:
+        payload = _load_per_candidate(run_root, rec["iteration"])
+        b = payload.get("best_real_npv_in_batch") if payload else None
+        if b is not None and np.isfinite(b):
+            run_max = b if run_max is None else max(run_max, b)
+        if run_max is not None:
+            rec["best_real_revenue"] = run_max
+            rec["best_emv_in_batch"] = b
+            rec["best_emv_so_far"] = run_max
+
+
 # -----------------------------------------------------------------------------
 # Plots
 # -----------------------------------------------------------------------------
@@ -195,8 +248,8 @@ def plot_best_revenue(history: list[dict], rows: list[dict], out_dir: Path) -> N
                 markersize=6, label="Best so far", zorder=5)
 
     ax.set_xlabel("AL iteration")
-    ax.set_ylabel("Discounted revenue")
-    ax.set_title("Best real revenue per iter (per (snapshot, geology) rows; orange ◇ = per-kind mean)")
+    ax.set_ylabel(OBJ_LABEL_CAP)
+    ax.set_title(f"Best real {OBJ_LABEL} per iter (per (snapshot, geology) rows; orange ◇ = per-kind mean)")
     if iters:
         ax.set_xticks(iters)
     ax.legend(loc="lower right")
@@ -246,8 +299,8 @@ def plot_kind_revenue_summary(rows: list[dict], out_dir: Path) -> None:
         return
 
     ax.set_xlabel("AL iteration")
-    ax.set_ylabel("Best real revenue so far (per kind)")
-    ax.set_title("Per-kind best-so-far real revenue (max over (snapshot, geology) rows)")
+    ax.set_ylabel(f"Best real {OBJ_LABEL} so far (per kind)")
+    ax.set_title(f"Per-kind best-so-far real {OBJ_LABEL} (max over (snapshot, geology) rows)")
     if iters:
         ax.set_xticks(iters)
     ax.legend(loc="lower right")
@@ -392,7 +445,7 @@ def plot_per_geology_winner_heatmap(rows: list[dict], out_dir: Path) -> None:
     ax.set_yticklabels([f"geo {g}" for g in geos])
     ax.set_xlabel("AL iteration")
     ax.set_ylabel("Geology")
-    ax.set_title("Per-cell winner: which kind produced the best real revenue?")
+    ax.set_title(f"Per-cell winner: which kind produced the best real {OBJ_LABEL}?")
     # Custom discrete colorbar with kind labels.
     cbar = fig.colorbar(im, ax=ax, ticks=range(len(kinds)),
                         boundaries=bounds, fraction=0.04, pad=0.02)
@@ -460,7 +513,7 @@ def plot_per_geology_faceted_best(rows: list[dict], out_dir: Path) -> None:
         fig.legend(handles, [lbl.capitalize() for lbl in labels],
                    loc="upper center", ncol=len(labels),
                    bbox_to_anchor=(0.5, 1.01), facecolor="#111111")
-    fig.suptitle("Per-geology best real revenue per kind (running max)",
+    fig.suptitle(f"Per-geology best real {OBJ_LABEL} per kind (running max)",
                  color=MANIM_WHITE, y=1.04)
     fig.text(0.5, 0.02, "AL iteration", ha="center", color=MANIM_WHITE)
     fig.text(0.005, 0.5, "Best real revenue per kind", va="center",
@@ -621,7 +674,7 @@ def plot_per_geology_best_so_far_facets(rows: list[dict], out_dir: Path) -> None
     fig.legend(handles=legend_handles, loc="upper center",
                ncol=len(legend_handles),
                bbox_to_anchor=(0.5, 1.02), facecolor="#111111")
-    fig.suptitle("Per-geology best real revenue so far "
+    fig.suptitle(f"Per-geology best real {OBJ_LABEL} so far "
                  "(marker color = improvement source)",
                  color=MANIM_WHITE, y=1.06)
     fig.text(0.5, 0.01, "AL iteration", ha="center", color=MANIM_WHITE)
@@ -732,7 +785,7 @@ def plot_best_revenue_with_geo_updates(
         color = cmap((geo - geo_min) / geo_span)
         ax_line.plot(xs, ys, color=color, lw=1.6, marker="o", ms=4,
                      alpha=0.95, zorder=3)
-    ax_line.set_ylabel("Best real revenue so far (per geology)",
+    ax_line.set_ylabel(f"Best real {OBJ_LABEL} so far (per geology)",
                       color=MANIM_WHITE)
     ax_line.tick_params(axis="y", colors=MANIM_WHITE)
     ax_line.spines["right"].set_color(MANIM_WHITE)
@@ -820,7 +873,7 @@ def plot_per_kind_gap_distribution(rows: list[dict], out_dir: Path) -> None:
 
     ax.set_xticks(positions)
     ax.set_xticklabels([k.capitalize() for k in plotted_kinds])
-    ax.set_ylabel("Gap to cell-best real revenue (lower = better)")
+    ax.set_ylabel(f"Gap to cell-best real {OBJ_LABEL} (lower = better)")
     ax.set_xlabel("Acquisition kind")
     ax.set_title("Per-cell gap distribution: how far behind the cell winner?")
     ax.legend(loc="upper right")
@@ -928,7 +981,7 @@ def plot_pred_real_gap(rows: list[dict], out_dir: Path) -> None:
     ax.plot(iters, mean_g, color=MANIM_ORANGE, marker="o", lw=2,
             label="mean(pred − real)")
     ax.set_xlabel("AL iteration")
-    ax.set_ylabel("Predicted − real revenue (M$), per candidate")
+    ax.set_ylabel(f"Predicted − real {OBJ_LABEL} (M$), per candidate")
     ax.set_title("Over-exploitation monitor: pred − real per iteration\n"
                  "(< 0 = under-predict / safe; > 0 = over-predict / over-exploitation risk)")
     ax.legend(loc="best")
@@ -984,8 +1037,8 @@ def plot_predicted_vs_real_scatter(rows: list[dict], out_dir: Path) -> None:
     hi = float(max(max(all_pred), max(all_real)))
     ax.plot([lo, hi], [lo, hi], color=MANIM_WHITE, lw=1, ls="--", label="y = x")
 
-    ax.set_xlabel("Intersect-true revenue")
-    ax.set_ylabel("Surrogate-predicted revenue")
+    ax.set_xlabel(f"Intersect-true {OBJ_LABEL}")
+    ax.set_ylabel(f"Surrogate-predicted {OBJ_LABEL}")
     ax.set_title("Predicted vs real per (snapshot, geology) row, colored by AL iteration")
     ax.legend(loc="best")
     _save(fig, out_dir / "scatter_pred_vs_real.png")
@@ -1067,8 +1120,8 @@ def plot_real_revenue_distribution(rows: list[dict], out_dir: Path) -> None:
         ax.scatter(x, vals, s=15, color=MANIM_GREEN, alpha=0.6, edgecolors="none")
 
     ax.set_xlabel("AL iteration")
-    ax.set_ylabel("Real revenue (per (snapshot, geology) row)")
-    ax.set_title("Distribution of real revenue per (snapshot, geology) row, across iterations")
+    ax.set_ylabel(f"Real {OBJ_LABEL} (per (snapshot, geology) row)")
+    ax.set_title(f"Distribution of real {OBJ_LABEL} per (snapshot, geology) row, across iterations")
     _save(fig, out_dir / "real_revenue_distribution.png")
 
 
@@ -1104,8 +1157,8 @@ def plot_topk_mean_gap(rows: list[dict], out_dir: Path) -> None:
             label="top1 − median")
     ax.axhline(0, color=MANIM_GREY, lw=1, ls="--")
     ax.set_xlabel("AL iteration")
-    ax.set_ylabel("Revenue gap")
-    ax.set_title("Top-1 vs mean of per-(snapshot, geology) real revenues, per iter")
+    ax.set_ylabel(f"{OBJ_LABEL_CAP} gap")
+    ax.set_title(f"Top-1 vs mean of per-(snapshot, geology) real {OBJ_LABEL}, per iter")
     ax.legend(loc="best")
     _save(fig, out_dir / "topk_mean_gap.png")
 
@@ -1157,9 +1210,9 @@ def plot_pred_real_kde_shift(rows: list[dict], out_dir: Path, n_recent: int = 5)
         if len(pred_vals) >= 2 and len(set(pred_vals)) > 1:
             ax.plot(xs, gaussian_kde(pred_vals)(xs), color=color, lw=2, ls="--",
                     label=f"iter {it} pred")
-    ax.set_xlabel("Discounted revenue")
+    ax.set_xlabel(OBJ_LABEL_CAP)
     ax.set_ylabel("Density")
-    ax.set_title(f"Predicted (--) vs real (—) per-geology revenue KDEs, last {n} iters")
+    ax.set_title(f"Predicted (--) vs real (—) per-geology {OBJ_LABEL} KDEs, last {n} iters")
     ax.legend(loc="best", ncol=2)
     _save(fig, out_dir / "pred_real_kde_shift.png")
 
@@ -1239,7 +1292,7 @@ def plot_pred_real_kde_shift_ensemble(rows: list[dict], out_dir: Path,
         if len(pred_vals) >= 2 and len(set(pred_vals)) > 1:
             ax.plot(xs, gaussian_kde(pred_vals)(xs), color=color, lw=2, ls="--",
                     label=f"iter {it} pred (n={len(pred_vals)})")
-    ax.set_xlabel("Ensemble EMV (mean discounted revenue over K geologies)")
+    ax.set_xlabel(f"Ensemble EMV (mean {OBJ_LABEL} over K geologies)")
     ax.set_ylabel("Density")
     ax.set_title(f"Predicted (--) vs real (—) ENSEMBLE EMV KDEs, last {n} iters")
     ax.legend(loc="best", ncol=2)
@@ -1922,7 +1975,7 @@ def _per_iter_emv_by_kind(rows: list[dict]) -> dict[int, dict[str, list[float]]]
             continue
         kind_to_emvs: dict[str, list[float]] = {}
         for sid, rs in snap_map.items():
-            reals = [float(r.get("real_revenue", float("nan"))) for r in rs]
+            reals = [float(v) if (v := r.get("real_revenue")) is not None else float("nan") for r in rs]
             reals = [v for v in reals if np.isfinite(v)]
             if not reals:
                 continue
@@ -1996,7 +2049,7 @@ def plot_emv_distribution(history: list[dict], rows: list[dict], out_dir: Path) 
 
     ax.set_xticks(iters_sorted)
     ax.set_xlabel("AL iteration")
-    ax.set_ylabel("Real EMV (mean discounted revenue across ensemble)")
+    ax.set_ylabel(f"Real EMV (mean {OBJ_LABEL} across ensemble)")
     ax.set_title("Per-snapshot real EMV distribution by kind (mean over K geologies)")
     ax.legend(loc="upper left", ncol=2)
     _save(fig, out_dir / "emv_distribution.png")
@@ -2113,7 +2166,7 @@ def _exploit_seed_rows(rows: list[dict]) -> list[dict]:
         seed_pred = first.get("seed_predicted_emv")
         term_pred = first.get("terminal_predicted_emv")
         seed_real = first.get("seed_real_emv")
-        reals = [float(r.get("real_revenue", float("nan"))) for r in rs]
+        reals = [float(v) if (v := r.get("real_revenue")) is not None else float("nan") for r in rs]
         reals = [v for v in reals if np.isfinite(v)]
         term_real = float(np.mean(reals)) if reals else None
         out.append({
@@ -2365,6 +2418,19 @@ def main() -> int:
 
     print(f"Generating plots from {args.run_root} -> {out_dir}")
     rows = _all_candidate_rows(args.run_root, history)
+
+    # Objective-aware: in npv-objective runs swap the objective-value fields to NPV so the
+    # convergence / objective / ensemble plots show what was actually optimized, and relabel axes.
+    objective = _detect_objective(args.run_root, history)
+    if objective == "npv":
+        _apply_npv_objective(args.run_root, history, rows)
+        global OBJECTIVE_MODE, OBJ_LABEL, OBJ_LABEL_CAP, OBJ_EMV
+        OBJECTIVE_MODE = "npv"
+        OBJ_LABEL = "NPV"
+        OBJ_LABEL_CAP = "NPV"
+        OBJ_EMV = "EMV (mean NPV across ensemble)"
+        print("Objective: NPV (proxy). Objective/convergence/ensemble plots show NPV; surrogate "
+              "revenue preserved in *_rev. Predicted-real gap is identical in NPV space (costs cancel).")
     plot_best_revenue(history, rows, out_dir)
     plot_kind_revenue_summary(rows, out_dir)
     # Per-geology kind-attribution suite (5 plots): cumulative wins bar,

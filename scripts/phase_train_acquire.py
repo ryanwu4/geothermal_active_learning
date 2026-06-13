@@ -255,6 +255,21 @@ def main() -> int:
         n_frontier=int(acq_cfg.get("n_frontier", 0)),
         depth_min=int(acq_cfg.get("depth_min", 5)),
         depth_max=int(acq_cfg.get("depth_max", 70)),
+        # ----- proxy-NPV objective (default "revenue" preserves current behavior) -----
+        objective=str(acq_cfg.get("objective", "revenue")),
+        economics_config_path=(
+            Path(acq_cfg["economics_config_path"]).expanduser()
+            if acq_cfg.get("economics_config_path")
+            else surrogate_repo / "configs" / "economics.json"
+        ),
+        geo_cube_path=(
+            Path(acq_cfg["geo_cube_path"]).expanduser()
+            if acq_cfg.get("geo_cube_path") else None
+        ),
+        facilities=tuple(tuple(int(v) for v in p) for p in acq_cfg.get("facilities", [[20, 30], [40, 40]])),
+        vertical_lead_m=float(acq_cfg.get("vertical_lead_m", 1000.0)),
+        ksurf=int(acq_cfg.get("ksurf", 2)),
+        poro_thresh=float(acq_cfg.get("poro_thresh", 0.01)),
     )
     acq_started = time.time()
     acq_result = run_acquisition(

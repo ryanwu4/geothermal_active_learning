@@ -371,7 +371,37 @@ def _rewrite_manifest_paths(local_manifest: Path, remappings: list[tuple[str, st
     return _walk(payload)
 
 
-def _render_local_plots(state: RunState, ws: Path) -> None:
+def _maybe_build_npv_state(cfg: dict):
+    """Build local proxy-NPV state if acquisition.objective == "npv", else None.
+
+    The remote Sherlock ingest computes only REVENUE (no cube); we recompute NPV locally so the
+    diagnostic dashboard reflects the optimized objective. Reuses orchestrator.npv_metrics.
+    """
+    acq = cfg["acquisition"]
+    if str(acq.get("objective", "revenue")) != "npv":
+        return None
+    from orchestrator.npv_metrics import build_npv_state
+    geology_path = Path(cfg["compute"]["local_geologies_config"]).expanduser().resolve()
+    geology_entries = [
+        {"geology_index": int(e["geology_index"]),
+         "geology_h5_file": str(Path(e["geology_h5_file"]).resolve())}
+        for e in _load_geology_list(geology_path)
+    ]
+    is_injector_list = [str(w["type"]).lower() == "injector" for w in cfg["wells"]]
+    surrogate_repo = cfg["compute"]["local_surrogate_repo"]
+    return build_npv_state(
+        surrogate_repo=surrogate_repo,
+        economics_config_path=acq.get("economics_config_path")
+        or (Path(surrogate_repo) / "configs" / "economics.json"),
+        geo_cube_path=acq["geo_cube_path"],
+        facilities=acq.get("facilities", [[20, 30], [40, 40]]),
+        vertical_lead_m=float(acq.get("vertical_lead_m", 1000.0)),
+        ksurf=int(acq.get("ksurf", 2)), poro_thresh=float(acq.get("poro_thresh", 0.01)),
+        geology_entries=geology_entries, is_injector_list=is_injector_list,
+    )
+
+
+def _render_local_plots(state: RunState, ws: Path, npv_state=None) -> None:
     """Render the full diagnostic dashboard into ``<ws>/plots/``.
 
     Delegates to ``scripts/plot_convergence.py`` so the hybrid dashboard never
@@ -381,11 +411,25 @@ def _render_local_plots(state: RunState, ws: Path) -> None:
     Runs in a subprocess so a plot-side import (matplotlib backend, etc.) can't
     contaminate the driver's interpreter state. Plotting is diagnostic — never
     let a plot bug kill the AL loop.
+
+    In npv mode (npv_state set), each local iter's per_candidate_metrics.json is augmented with
+    real_npv/predicted_npv (computed locally from the snapshot coords + cube) before plotting so
+    plot_convergence renders the NPV objective.
     """
     if not state.history:
         return
     out_dir = ws / "plots"
     out_dir.mkdir(parents=True, exist_ok=True)
+    if npv_state is not None:
+        from orchestrator.npv_metrics import augment_metrics_file
+        for rec in state.history:
+            it = rec.iteration if hasattr(rec, "iteration") else rec.get("iteration")
+            metrics = ws / f"iter_{it:04d}" / "per_candidate_metrics.json"
+            snaps = ws / "acquire" / f"iter_{it:04d}" / "snapshots_json"
+            try:
+                augment_metrics_file(metrics, snaps, npv_state)
+            except Exception as e:  # never let augmentation kill the loop
+                print(f"[local-driver] npv augmentation failed for iter {it}: {e}", file=sys.stderr)
     plot_script = REPO_ROOT / "scripts" / "plot_convergence.py"
     cmd = [sys.executable, str(plot_script), str(ws), "--out-dir", str(out_dir)]
     try:
@@ -774,6 +818,21 @@ def _acquire_and_select_locally(
         n_frontier=int(acq_cfg.get("n_frontier", 0)),
         depth_min=int(acq_cfg.get("depth_min", 5)),
         depth_max=int(acq_cfg.get("depth_max", 70)),
+        # ----- proxy-NPV objective (default "revenue" preserves current behavior) -----
+        objective=str(acq_cfg.get("objective", "revenue")),
+        economics_config_path=(
+            Path(acq_cfg["economics_config_path"]).expanduser()
+            if acq_cfg.get("economics_config_path")
+            else surrogate_repo / "configs" / "economics.json"
+        ),
+        geo_cube_path=(
+            Path(acq_cfg["geo_cube_path"]).expanduser()
+            if acq_cfg.get("geo_cube_path") else None
+        ),
+        facilities=tuple(tuple(int(v) for v in p) for p in acq_cfg.get("facilities", [[20, 30], [40, 40]])),
+        vertical_lead_m=float(acq_cfg.get("vertical_lead_m", 1000.0)),
+        ksurf=int(acq_cfg.get("ksurf", 2)),
+        poro_thresh=float(acq_cfg.get("poro_thresh", 0.01)),
     )
     started = time.time()
     out_dir = ws / "acquire" / f"iter_{iter_idx:04d}"
@@ -856,6 +915,9 @@ def main() -> int:
 
     ws = Path(compute["local_workspace"]).expanduser().resolve()
     _ensure_workspace(ws)
+    # Pin the objective to this workspace so a resume with a flipped config fails loud.
+    from orchestrator.npv_metrics import assert_objective_marker
+    assert_objective_marker(ws, str(cfg["acquisition"].get("objective", "revenue")))
 
     # Email notification target (shared by completion / failure / auth notices).
     notify_email = compute.get("notify_email")
@@ -942,6 +1004,13 @@ def main() -> int:
             )
         last_step = "loaded julia_config"
 
+        # Proxy-NPV dashboard state (None unless acquisition.objective == "npv"). Built once;
+        # the cube load is ~20 MB so we don't rebuild per iteration.
+        npv_state = _maybe_build_npv_state(cfg)
+        if npv_state is not None:
+            print(f"[local-driver] objective=npv: dashboard will show NPV "
+                  f"(flowline={npv_state['flowline']:.0f} m, {len(npv_state['rtop_by_geo'])} geologies)")
+
         while True:
             if _check_done(remote, remote_run_root):
                 print(f"[local-driver] Sherlock has done.json — run complete.")
@@ -964,7 +1033,7 @@ def main() -> int:
             # Refresh the diagnostic plots up-front so the user sees a current
             # picture of the previous iterations even while the new one is
             # still training/staging.
-            _render_local_plots(state, ws)
+            _render_local_plots(state, ws, npv_state)
 
             if wandb_handle is None:
                 print(f"[wandb] initializing run_id={state.wandb_run_id} "
@@ -1176,7 +1245,15 @@ def main() -> int:
             try:
                 fresh_state = _pull_state(remote, remote_run_root, ws)
                 _pull_per_candidate_metrics(remote, remote_run_root, iteration, ws)
-                _render_local_plots(fresh_state, ws)
+                _render_local_plots(fresh_state, ws, npv_state)
+                # wandb parity: in npv mode the remote ingest logs only revenue; surface the
+                # locally-computed best NPV so the dashboard's headline metric matches the objective.
+                if npv_state is not None and wandb_handle is not None and wandb_handle.is_active:
+                    mfile = ws / f"iter_{iteration:04d}" / "per_candidate_metrics.json"
+                    if mfile.exists():
+                        bnpv = json.load(open(mfile)).get("best_real_npv_in_batch")
+                        if bnpv is not None:
+                            wandb_handle.log({"best_real_npv_in_batch": float(bnpv)}, step=iteration)
             except SshUnavailable:
                 raise
             except Exception as e:

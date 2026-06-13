@@ -42,9 +42,16 @@ def _revenue_plateau(state: RunState, window: int, threshold_rel: float) -> bool
         return False
     best_now = max(revs)  # robust to non-monotone recordings
     best_prior = max(revs[:-window])
-    if best_now is None or best_prior is None or best_now == 0:
+    if best_now is None or best_prior is None:
         return False
-    improvement = max(0.0, (best_now - best_prior) / abs(best_now))
+    # Sign-safe relative improvement: normalize by the larger magnitude of the two
+    # bests rather than abs(best_now). This keeps the ratio well-behaved even for a
+    # sign-unbounded objective (e.g. NPV crossing zero), where dividing by abs(best_now)
+    # alone would explode near break-even or invert when best_now straddles 0.
+    denom = max(abs(best_now), abs(best_prior))
+    if denom == 0:
+        return False
+    improvement = max(0.0, (best_now - best_prior) / denom)
     return improvement < threshold_rel
 
 
@@ -87,7 +94,7 @@ def _consecutive_zero_completions(state: RunState, limit: int) -> int:
     return count
 
 
-def evaluate_stopping(state: RunState, cfg: StoppingConfig) -> StopDecision:
+def evaluate_stopping(state: RunState, cfg: StoppingConfig, objective: str = "revenue") -> StopDecision:
     # `state.iteration` is 0-indexed and is the *just-completed* iteration when
     # this check runs (in phase_ingest, before the increment that schedules the
     # next iter). `max_iterations` is the total count the user asked for, so
@@ -109,7 +116,12 @@ def evaluate_stopping(state: RunState, cfg: StoppingConfig) -> StopDecision:
                 "investigate before continuing"
             ),
         )
-    if _revenue_plateau(state, cfg.plateau_window, cfg.plateau_threshold_relative):
+    # The revenue plateau keys on best_real_revenue, which the remote ingest computes from IX.
+    # In npv mode the optimized objective is NPV (computed only locally on the GPU host, not on
+    # the Sherlock ingest where this check runs), so a revenue plateau is the WRONG stop signal —
+    # NPV can still be improving while revenue plateaus (cheaper/shorter wells) or vice versa.
+    # Skip it in npv mode and rely on max_iterations / the MAPE-target stop.
+    if objective != "npv" and _revenue_plateau(state, cfg.plateau_window, cfg.plateau_threshold_relative):
         return StopDecision(
             should_stop=True,
             reason=f"revenue plateau over last {cfg.plateau_window} iters "
