@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -172,10 +173,12 @@ def _apply_npv_objective(run_root: Path, history: list[dict], rows: list[dict]) 
     """
     for r in rows:
         # Use the NPV value; if it couldn't be computed for this row (missing snapshot coords,
-        # dead-rock, well-count mismatch), set NaN so finite-guards drop it rather than leaving a
-        # REVENUE value mixed into an NPV axis.
-        r["real_revenue"] = r["real_npv"] if r.get("real_npv") is not None else float("nan")
-        r["predicted_revenue"] = r["predicted_npv"] if r.get("predicted_npv") is not None else float("nan")
+        # dead-rock, well-count mismatch), set None — NOT NaN. Every plot filters these fields with
+        # `is not None`, which a NaN slips past (breaking gaussian_kde / asarray_chkfinite); None is
+        # the value the plots already handle (baseline predicted_revenue is always None), so missing
+        # rows are dropped from the NPV axis instead of mixing units or crashing the dashboard.
+        r["real_revenue"] = r["real_npv"] if r.get("real_npv") is not None else None
+        r["predicted_revenue"] = r["predicted_npv"] if r.get("predicted_npv") is not None else None
         # Always bind the ensemble "real EMV" to the NPV value (None if augmentation couldn't
         # compute it). Leaving the revenue-valued terminal_real_emv would silently plot
         # predicted-NPV (y) against real-REVENUE (x) on the ensemble pred-vs-real panels; binding
@@ -1185,7 +1188,7 @@ def plot_pred_real_kde_shift(rows: list[dict], out_dir: Path, n_recent: int = 5)
     all_vals = [r[k] for r in rows
                 if r["iteration"] in recent
                 for k in ("real_revenue", "predicted_revenue")
-                if r.get(k) is not None]
+                if r.get(k) is not None and np.isfinite(r[k])]
     if len(all_vals) < 2:
         return
     lo, hi = float(np.min(all_vals)), float(np.max(all_vals))
@@ -1201,9 +1204,11 @@ def plot_pred_real_kde_shift(rows: list[dict], out_dir: Path, n_recent: int = 5)
         frac = 0.35 + 0.65 * (i / max(1, n - 1))
         color = cmap(frac)
         real_vals = [r["real_revenue"] for r in rows
-                     if r["iteration"] == it and r.get("real_revenue") is not None]
+                     if r["iteration"] == it and r.get("real_revenue") is not None
+                     and np.isfinite(r["real_revenue"])]
         pred_vals = [r["predicted_revenue"] for r in rows
-                     if r["iteration"] == it and r.get("predicted_revenue") is not None]
+                     if r["iteration"] == it and r.get("predicted_revenue") is not None
+                     and np.isfinite(r["predicted_revenue"])]
         if len(real_vals) >= 2 and len(set(real_vals)) > 1:
             ax.plot(xs, gaussian_kde(real_vals)(xs), color=color, lw=2,
                     label=f"iter {it} real")
@@ -2431,52 +2436,67 @@ def main() -> int:
         OBJ_EMV = "EMV (mean NPV across ensemble)"
         print("Objective: NPV (proxy). Objective/convergence/ensemble plots show NPV; surrogate "
               "revenue preserved in *_rev. Predicted-real gap is identical in NPV space (costs cancel).")
-    plot_best_revenue(history, rows, out_dir)
-    plot_kind_revenue_summary(rows, out_dir)
-    # Per-geology kind-attribution suite (5 plots): cumulative wins bar,
-    # winner heatmap, per-geology faceted best-so-far, win-share over iters,
-    # gap distribution. Together they answer: "which kind finds the most
-    # bests for each geology, and by how much does it beat the others?"
-    plot_cumulative_wins_per_kind(rows, out_dir)
-    plot_per_geology_winner_heatmap(rows, out_dir)
-    plot_per_geology_faceted_best(rows, out_dir)
-    plot_win_rate_over_iters(rows, out_dir)
-    plot_per_kind_gap_distribution(rows, out_dir)
-    plot_best_revenue_with_geo_updates(history, rows, out_dir)
-    plot_per_geology_best_so_far_facets(rows, out_dir)
-    plot_calibration_metrics(history, out_dir)
-    plot_pred_real_gap(rows, out_dir)
-    plot_per_geology_mape_heatmap(history, out_dir)
-    plot_training_growth(history, out_dir)
-    plot_wallclock_breakdown(history, out_dir)
-    plot_predicted_vs_real_scatter(rows, out_dir)
-    plot_real_revenue_distribution(rows, out_dir)
-    plot_topk_mean_gap(rows, out_dir)
-    plot_pred_real_kde_shift(rows, out_dir)
-    # Ensemble-level companion plots — collapse K rows per snapshot to one EMV
-    # point. Guarded for per-geology runs (produce a "skipping" placeholder).
-    plot_pred_real_kde_shift_ensemble(rows, out_dir)
-    plot_predicted_vs_real_scatter_ensemble(rows, out_dir)
-    holdout_rows = _all_holdout_rows(args.run_root, history)
-    plot_holdout_mape_over_iters(holdout_rows, out_dir)
-    plot_holdout_per_geology_heatmap(holdout_rows, out_dir)
-    plot_holdout_pred_vs_real_scatter(holdout_rows, out_dir)
-    well_rows = _load_well_coord_rows(args.run_root, history)
-    plot_well_position_heatmaps(well_rows, out_dir)
-    plot_well_position_heatmaps_by_kind(well_rows, out_dir)
-    plot_well_position_heatmaps_over_iters(well_rows, out_dir)
-    plot_best_well_config(args.run_root, well_rows, out_dir)
+    # Data prep for the holdout / well-coord plot families. Guarded so a load failure can't
+    # block the rest of the dashboard.
+    try:
+        holdout_rows = _all_holdout_rows(args.run_root, history)
+    except Exception as e:  # noqa: BLE001
+        print(f"  [skip] holdout-row load failed: {type(e).__name__}: {e}", file=sys.stderr)
+        holdout_rows = []
+    try:
+        well_rows = _load_well_coord_rows(args.run_root, history)
+    except Exception as e:  # noqa: BLE001
+        print(f"  [skip] well-coord load failed: {type(e).__name__}: {e}", file=sys.stderr)
+        well_rows = []
 
-    # Ensemble-mode EMV plots (guarded: produce a placeholder PNG if no
-    # ensemble iterations are present in this run).
-    plot_emv_distribution(history, rows, out_dir)
-    plot_best_emv_so_far(history, out_dir)
-    plot_exploit_seed_vs_terminal_predicted(rows, out_dir)
-    plot_exploit_seed_vs_terminal_real(rows, out_dir)
-    plot_exploit_emv_progression(history, out_dir)
-    plot_exploit_per_geology_progression(history, out_dir)
+    # Each plot is dispatched independently: a single plot raising (e.g. gaussian_kde on a
+    # degenerate cohort) must NOT abort the whole dashboard subprocess and silently drop every
+    # subsequent plot. Render what we can; log and skip what we can't.
+    plot_calls = [
+        ("best_revenue", lambda: plot_best_revenue(history, rows, out_dir)),
+        ("kind_revenue_summary", lambda: plot_kind_revenue_summary(rows, out_dir)),
+        ("cumulative_wins_per_kind", lambda: plot_cumulative_wins_per_kind(rows, out_dir)),
+        ("per_geology_winner_heatmap", lambda: plot_per_geology_winner_heatmap(rows, out_dir)),
+        ("per_geology_faceted_best", lambda: plot_per_geology_faceted_best(rows, out_dir)),
+        ("win_rate_over_iters", lambda: plot_win_rate_over_iters(rows, out_dir)),
+        ("per_kind_gap_distribution", lambda: plot_per_kind_gap_distribution(rows, out_dir)),
+        ("best_revenue_with_geo_updates", lambda: plot_best_revenue_with_geo_updates(history, rows, out_dir)),
+        ("per_geology_best_so_far_facets", lambda: plot_per_geology_best_so_far_facets(rows, out_dir)),
+        ("calibration_metrics", lambda: plot_calibration_metrics(history, out_dir)),
+        ("pred_real_gap", lambda: plot_pred_real_gap(rows, out_dir)),
+        ("per_geology_mape_heatmap", lambda: plot_per_geology_mape_heatmap(history, out_dir)),
+        ("training_growth", lambda: plot_training_growth(history, out_dir)),
+        ("wallclock_breakdown", lambda: plot_wallclock_breakdown(history, out_dir)),
+        ("predicted_vs_real_scatter", lambda: plot_predicted_vs_real_scatter(rows, out_dir)),
+        ("real_revenue_distribution", lambda: plot_real_revenue_distribution(rows, out_dir)),
+        ("topk_mean_gap", lambda: plot_topk_mean_gap(rows, out_dir)),
+        ("pred_real_kde_shift", lambda: plot_pred_real_kde_shift(rows, out_dir)),
+        ("pred_real_kde_shift_ensemble", lambda: plot_pred_real_kde_shift_ensemble(rows, out_dir)),
+        ("predicted_vs_real_scatter_ensemble", lambda: plot_predicted_vs_real_scatter_ensemble(rows, out_dir)),
+        ("holdout_mape_over_iters", lambda: plot_holdout_mape_over_iters(holdout_rows, out_dir)),
+        ("holdout_per_geology_heatmap", lambda: plot_holdout_per_geology_heatmap(holdout_rows, out_dir)),
+        ("holdout_pred_vs_real_scatter", lambda: plot_holdout_pred_vs_real_scatter(holdout_rows, out_dir)),
+        ("well_position_heatmaps", lambda: plot_well_position_heatmaps(well_rows, out_dir)),
+        ("well_position_heatmaps_by_kind", lambda: plot_well_position_heatmaps_by_kind(well_rows, out_dir)),
+        ("well_position_heatmaps_over_iters", lambda: plot_well_position_heatmaps_over_iters(well_rows, out_dir)),
+        ("best_well_config", lambda: plot_best_well_config(args.run_root, well_rows, out_dir)),
+        ("emv_distribution", lambda: plot_emv_distribution(history, rows, out_dir)),
+        ("best_emv_so_far", lambda: plot_best_emv_so_far(history, out_dir)),
+        ("exploit_seed_vs_terminal_predicted", lambda: plot_exploit_seed_vs_terminal_predicted(rows, out_dir)),
+        ("exploit_seed_vs_terminal_real", lambda: plot_exploit_seed_vs_terminal_real(rows, out_dir)),
+        ("exploit_emv_progression", lambda: plot_exploit_emv_progression(history, out_dir)),
+        ("exploit_per_geology_progression", lambda: plot_exploit_per_geology_progression(history, out_dir)),
+    ]
+    n_ok = 0
+    for label, fn in plot_calls:
+        try:
+            fn()
+            n_ok += 1
+        except Exception as e:  # noqa: BLE001 — one bad plot must not drop the rest
+            print(f"  [skip] {label} failed to render: {type(e).__name__}: {e}", file=sys.stderr)
 
-    print(f"\nDone. {len(history)} iteration(s), {len(rows)} candidate rows. Plots in {out_dir}")
+    print(f"\nDone. {len(history)} iteration(s), {len(rows)} candidate rows. "
+          f"{n_ok}/{len(plot_calls)} plots rendered in {out_dir}")
     return 0
 
 

@@ -21,7 +21,7 @@
     "ssh_host": "sherlock",
     "ssh_control_path": "~/.ssh/cm-rwu4@login.sherlock.stanford.edu:22",
     "remote_repo_root": "/home/users/rwu4/geothermal_active_learning",
-    "local_workspace": "/home/rwu4/omv_geothermal/geothermal_active_learning/local_workspace_baseline_npv",
+    "local_workspace": "/home/rwu4/omv_geothermal/geothermal_active_learning/local_workspace_baseline_npv_seed42",
     "local_surrogate_repo": "/home/rwu4/omv_geothermal/Geothermal_Graph_Surrogate",
     "local_geologies_config": "/home/rwu4/omv_geothermal/geothermal_active_learning/configs/geologies_full_local.json",
     "poll_interval_sec": 600,
@@ -48,7 +48,7 @@
   },
 
   "intersect": {
-    "max_concurrent": 50,
+    "max_concurrent": 80,
     "time_per_run": "00:40:00",
     "cpus_per_task": 2,
     "mem_per_task": "8GB",
