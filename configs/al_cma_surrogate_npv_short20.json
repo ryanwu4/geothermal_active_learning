@@ -1,0 +1,115 @@
+{
+  "run_id_prefix": "al_cma_npv_L2",
+  "target": "graph_discounted_net_revenue",
+  "_note": "SAMPLE-EFFICIENCY floor probe L2: 1 iter x B=20 (distinct-K 20) frontier-free CMA exploit over the 256-IX clean seed. ~556 IX = 8.9% of baseline. Illustrative single-draw floor (NOT an equivalence claim; K=20 is the noisy CV~2.1% knee). Launch R=3 with acquisition.seed/training.seed in {42,100,200} + per-seed workspace/run_id suffix. assert_distinct_k fails pre-IX if < ceil(0.9*20)=18 distinct.",
+
+  "wandb": {
+    "project": "geothermal_active_learning",
+    "entity": "ryanwu4",
+    "tags": ["cma_surrogate", "npv_objective", "sample_efficiency", "L2", "frontier_free", "clean_start", "lhs_seed"]
+  },
+
+  "paths": {
+    "scratch_root": "/scratch/users/rwu4/al_runs",
+    "surrogate_repo": "/home/users/rwu4/Geothermal_Graph_Surrogate",
+    "julia_repo": "/home/users/rwu4/GeologicalSimulationWrapper.jl",
+    "julia_config": "configs/sherlock_ryan.json",
+    "bootstrap_compiled_h5": "/scratch/users/rwu4/al_runs/seed_clean/seed_compiled.h5",
+    "geologies_config": "configs/geologies_full.json",
+    "norm_config_path": "/scratch/users/rwu4/al_runs/seed_clean/seed_norm_config.json"
+  },
+
+  "compute": {
+    "train_acquire_location": "local",
+    "ssh_host": "sherlock",
+    "ssh_control_path": "~/.ssh/cm-rwu4@login.sherlock.stanford.edu:22",
+    "remote_repo_root": "/home/users/rwu4/geothermal_active_learning",
+    "local_workspace": "/home/rwu4/omv_geothermal/geothermal_active_learning/local_workspace_cma_npv_L2_s42",
+    "local_surrogate_repo": "/home/rwu4/omv_geothermal/Geothermal_Graph_Surrogate",
+    "local_geologies_config": "/home/rwu4/omv_geothermal/geothermal_active_learning/configs/geologies_full_local.json",
+    "poll_interval_sec": 600,
+    "notify_email": "ryanwu2002@gmail.com",
+    "notify_msmtp_account": "gmail"
+  },
+
+  "seed": {
+    "seed_id": "clean",
+    "n_seed_samples": 256,
+    "depth_min": 5,
+    "depth_max": 70,
+    "edge_buffer": 10,
+    "seed": 42
+  },
+
+  "training": {
+    "clean_start": true,
+    "from_scratch_every_k": 1,
+    "max_epochs_full": 180,
+    "max_epochs_finetune": 60,
+    "early_stop_patience": 30,
+    "lr": 3e-4,
+    "batch_size": 16,
+    "edge_encoder": "cnn",
+    "seed": 42
+  },
+
+  "acquisition": {
+    "mode": "cma_surrogate",
+    "objective": "npv",
+    "economics_config_path": "/home/rwu4/omv_geothermal/Geothermal_Graph_Surrogate/configs/economics.json",
+    "geo_cube_path": "/home/rwu4/omv_geothermal/geothermal_active_learning/analysis/angled_well_length/geo_coords.h5",
+    "facilities": [[20, 30], [40, 40]],
+    "vertical_lead_m": 1000.0,
+    "ksurf": 2,
+    "poro_thresh": 0.01,
+    "cma_popsize": 24,
+    "cma_generations": 40,
+    "cma_sigma_init": 12.0,
+    "cma_warm_start": false,
+    "assert_distinct_k": true,
+    "depth_min": 5,
+    "depth_max": 70,
+    "n_exploit": 20,
+    "n_frontier": 0,
+    "elite_top_k": 16,
+    "elite_seed_noise": 2.0,
+    "k_safe": 45,
+    "edge_buffer": 10,
+    "seed": 42,
+    "devices": ["cuda:0"]
+  },
+
+  "selection": {
+    "batch_size": 20
+  },
+
+  "intersect": {
+    "max_concurrent": 80,
+    "time_per_run": "00:40:00",
+    "cpus_per_task": 2,
+    "mem_per_task": "8GB",
+    "np": 2
+  },
+
+  "stopping": {
+    "max_iterations": 1,
+    "plateau_window": 20,
+    "plateau_threshold_relative": 0.005,
+    "target_mape": null
+  },
+
+  "wells": [
+    {"depth": 50, "type": "injector"},
+    {"depth": 50, "type": "producer"},
+    {"depth": 50, "type": "injector"},
+    {"depth": 50, "type": "producer"},
+    {"depth": 50, "type": "injector"},
+    {"depth": 50, "type": "producer"},
+    {"depth": 50, "type": "injector"},
+    {"depth": 50, "type": "producer"},
+    {"depth": 50, "type": "injector"},
+    {"depth": 50, "type": "producer"},
+    {"depth": 50, "type": "injector"},
+    {"depth": 50, "type": "producer"}
+  ]
+}

@@ -270,6 +270,7 @@ def main() -> int:
         vertical_lead_m=float(acq_cfg.get("vertical_lead_m", 1000.0)),
         ksurf=int(acq_cfg.get("ksurf", 2)),
         poro_thresh=float(acq_cfg.get("poro_thresh", 0.01)),
+        assert_distinct_k=bool(acq_cfg.get("assert_distinct_k", False)),
     )
     acq_started = time.time()
     acq_result = run_acquisition(

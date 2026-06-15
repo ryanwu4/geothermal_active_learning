@@ -118,6 +118,12 @@ class AcquisitionConfig:
     # a surface-flowline cost between the fixed facilities, surface-facility CAPEX, and
     # discounted OPEX. All economic numbers come from economics_config_path.
     objective: str = "revenue"                 # "revenue" | "npv"
+    # PRE-0 distinct-K guard (cma_surrogate only): the hardcoded min_xy_dist=4 dedup
+    # SILENTLY backfills near-duplicate layouts when the (converged) pool can't supply
+    # n_exploit distinct picks. distinct_k_realized is ALWAYS logged; when this flag is
+    # True the acquisition HARD-FAILS (pre-IX) if distinct < ceil(0.9*n_exploit) so
+    # duplicate layouts never ship as wasted IX. Default False preserves prior behavior.
+    assert_distinct_k: bool = False
     economics_config_path: Path | None = None
     geo_cube_path: Path | None = None          # h5 with CX/CY/CZ structural coord cube (k,j,i)
     facilities: tuple = ((20, 30), (40, 40))   # fixed surface facility (i, j) locations
@@ -2130,6 +2136,29 @@ def _dedup_indices_by_xy(
     return picked
 
 
+def _count_distinct_xy(
+    coords_list: list[np.ndarray],
+    indices: list[int],
+    num_wells: int,
+    min_xy_dist: float,
+) -> int:
+    """Count how many of ``indices`` have mutually-distinct xy layouts (greedy, L2 over
+    the flattened per-well xy vector, >= ``min_xy_dist`` apart) — i.e. the number of picks
+    that are NOT near-duplicate backfill from :func:`_dedup_indices_by_xy`. Used by the
+    PRE-0 distinct-K guard so silent backfill (which inflates the apparent batch with
+    duplicate layouts = wasted IX) is observable and, optionally, fatal pre-IX.
+    """
+    kept_xy: list[np.ndarray] = []
+    for i in indices:
+        xy = np.asarray(coords_list[int(i)])[:, :2].reshape(-1)
+        if kept_xy:
+            d = np.linalg.norm(np.stack(kept_xy) - xy[None, :], axis=1)
+            if float(d.min()) < min_xy_dist:
+                continue
+        kept_xy.append(xy)
+    return len(kept_xy)
+
+
 def _run_acquisition_cma_surrogate(
     cfg: AcquisitionConfig,
     *,
@@ -2532,6 +2561,35 @@ def _run_acquisition_cma_surrogate(
             flush=True,
         )
 
+    # ----- PRE-0 distinct-K guard ------------------------------------------------
+    # The min_xy_dist=4 dedup above backfills near-duplicate layouts when the pool
+    # can't supply n_exploit distinct picks; the len()<n_exploit warning never fires
+    # (the pool is large), so duplicates would ship as wasted IX (15 redundant runs
+    # each) AND corrupt the distinct-K x-axis of the sample-efficiency study. Always
+    # log the truly-distinct count; HARD-FAIL pre-IX (no IX wasted) when the config
+    # opts in via assert_distinct_k. Threshold: >= ceil(0.9 * n_exploit).
+    distinct_k_realized = _count_distinct_xy(pool_coords, exploit_idx, num_wells, 4.0)
+    distinct_k_floor = int(np.ceil(0.9 * n_exploit))
+    timings["distinct_k_realized"] = float(distinct_k_realized)
+    timings["n_exploit_requested"] = float(n_exploit)
+    timings["distinct_k_floor"] = float(distinct_k_floor)
+    print(
+        f"[acquire-cma] distinct-K: {distinct_k_realized}/{n_exploit} emitted exploit "
+        f"layouts are >=4-apart distinct (floor {distinct_k_floor}); "
+        f"{n_exploit - distinct_k_realized} backfilled near-duplicate(s).",
+        flush=True,
+    )
+    if getattr(cfg, "assert_distinct_k", False) and distinct_k_realized < distinct_k_floor:
+        raise RuntimeError(
+            f"cma_surrogate distinct-K guard: only {distinct_k_realized} of {n_exploit} "
+            f"emitted exploit layouts are distinct (>= {distinct_k_floor} required); the "
+            f"min_xy_dist=4 dedup backfilled {n_exploit - distinct_k_realized} near-duplicate(s) "
+            f"(pool={len(pool_coords)}, popsize={popsize}, generations={cfg.cma_generations}). "
+            f"Raise cma_popsize/cma_generations (more pre-convergence spread), split the batch "
+            f"across more cold-restart iterations, or implement CMA multi-restart. Failing "
+            f"pre-IX so no IX is wasted."
+        )
+
     # ----- Frontier picks: LHS + FPS on xy, scored on accurate rebuilt graphs --
     frontier_coords: list[np.ndarray] = []
     frontier_preds: list[np.ndarray] = []
@@ -2691,6 +2749,8 @@ def _run_acquisition_cma_surrogate(
         "depth_bounds": [int(z_lo_eff), int(z_hi_eff)],
         "n_exploit": cfg.n_exploit,
         "n_frontier": cfg.n_frontier,
+        "distinct_k_realized": int(distinct_k_realized),
+        "distinct_k_floor": int(distinct_k_floor),
         "dead_rock_drops": int(drop_stats["n_dropped"]),
         "geology_metadata": [
             {
