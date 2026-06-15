@@ -105,6 +105,30 @@ def _style_ax(ax) -> None:
         spine.set_edgecolor(MANIM_WHITE)
 
 
+def _style_ax3d(ax) -> None:
+    """Apply the Manim dark theme to a 3D axes — its panes/grid aren't covered by the global
+    rcParams or _style_ax, so without this the 3D panel renders light-grey-on-white and clashes
+    with the rest of the (black) dashboard."""
+    ax.set_facecolor(MANIM_BG)
+    for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+        try:
+            axis.set_pane_color((0.0, 0.0, 0.0, 1.0))      # black panes (MANIM_BG)
+        except Exception:
+            pass
+        try:
+            axis.pane.set_edgecolor(MANIM_GREY)
+        except Exception:
+            pass
+        try:
+            axis._axinfo["grid"].update(color=(0.27, 0.27, 0.27, 0.7), linewidth=0.6)
+        except Exception:
+            pass
+        axis.label.set_color(MANIM_WHITE)
+        axis.line.set_color(MANIM_WHITE)
+    ax.tick_params(colors=MANIM_WHITE)
+    ax.title.set_color(MANIM_WHITE)
+
+
 def _save(fig, out_path: Path) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
@@ -136,6 +160,19 @@ def _load_per_candidate(run_root: Path, iteration: int) -> dict | None:
         return None
     with open(p, "r") as f:
         return json.load(f)
+
+
+def _load_npv_context(run_root: Path) -> dict | None:
+    """Read npv_context.json (written by the local driver in npv mode) — the paths/params needed
+    to rebuild the deviated-well geometry for the 3D best-config rendering. None if absent."""
+    p = run_root / "npv_context.json"
+    if not p.exists():
+        return None
+    try:
+        with open(p, "r") as f:
+            return json.load(f)
+    except Exception:
+        return None
 
 
 def _all_candidate_rows(run_root: Path, history: list[dict]) -> list[dict]:
@@ -1802,9 +1839,70 @@ def plot_well_position_heatmaps_over_iters(rows: list[dict], out_dir: Path,
     _save(fig, out_dir / "well_position_heatmap_over_iters.png")
 
 
+def _render_deviated_3d(ax3, wells: list[dict], npv_ctx: dict) -> None:
+    """Draw the 3-segment deviated well shape (1 km lead + diagonal to reservoir top + vertical
+    through reservoir) for ``wells`` into a 3D axes, rebuilding the geometry from npv_context
+    (cube + one geology's reservoir top + facilities). Mirrors the analysis render prototype."""
+    import sys as _sys
+    sr = npv_ctx.get("surrogate_repo")
+    if sr and sr not in _sys.path:
+        _sys.path.insert(0, sr)
+    import h5py
+    from geothermal.well_geometry import (  # type: ignore
+        load_geo_coord_cube, reservoir_top_k_map, facilities_surface_xy, angled_well_segments,
+    )
+    cube = load_geo_coord_cube(npv_ctx["geo_cube_path"])
+    with h5py.File(npv_ctx["reservoir_geology_h5"], "r") as h:
+        poro = h["Input/Porosity"][:]
+    ksurf = int(npv_ctx.get("ksurf", 2))
+    lead = float(npv_ctx.get("vertical_lead_m", 1000.0))
+    rtop = reservoir_top_k_map(poro, poro_thresh=float(npv_ctx.get("poro_thresh", 0.01)))
+    fac_surf = facilities_surface_xy(cube, npv_ctx["facilities"], ksurf=ksurf)
+    _style_ax3d(ax3)  # match the dashboard's black Manim theme (panes/grid/ticks/labels)
+    coords = np.array([[w["x"], w["y"], w["z"]] for w in wells], dtype=float)
+    is_inj = [w.get("well_type") == "injector" for w in wells]
+    segs = angled_well_segments(coords, cube=cube, fac_surf_xy=fac_surf,
+                                reservoir_top_k_map=rtop, vertical_lead_m=lead, ksurf=ksurf)
+    zmax = lead
+    for fx, fy in fac_surf:  # facility vertical leads, drawn once each
+        ax3.plot([fx, fx], [fy, fy], [0.0, lead], color=MANIM_GREY, lw=3, zorder=4)
+        # White-filled square so the facility is visible on the black pane (a black marker
+        # would vanish); mirrors the white-edged facility marker in the 2D map.
+        ax3.scatter([fx], [fy], [0.0], marker="s", s=70, color=MANIM_WHITE,
+                    edgecolor=MANIM_WHITE, zorder=6)
+    seen = {"injector": False, "producer": False}
+    for s, inj in zip(segs, is_inj):
+        c = MANIM_BLUE if inj else MANIM_ORANGE
+        fx, fy = s["fac_xy"]
+        rx, ry, rt = s["reservoir_top"]
+        bx, by, bt = s["well_bottom"]
+        lbl = ("Injector" if inj else "Producer")
+        key = "injector" if inj else "producer"
+        ax3.plot([fx, rx], [fy, ry], [lead, rt], color=c, lw=1.8, zorder=5,
+                 label=(lbl if not seen[key] else None))
+        seen[key] = True
+        ax3.plot([rx, bx], [ry, by], [rt, bt], color=MANIM_PURPLE, lw=2.8, zorder=6)
+        ax3.scatter([bx], [by], [bt], marker="^" if inj else "v", color=c, s=45,
+                    edgecolor=MANIM_WHITE, linewidths=0.5, zorder=7)
+        zmax = max(zmax, rt, bt)
+    ax3.set_xlabel("X east (m)")
+    ax3.set_ylabel("Y north (m)")
+    ax3.set_zlabel("TVD (m)")
+    ax3.set_zlim(zmax + 150, -100)  # depth increases downward
+    try:
+        ax3.set_box_aspect((4, 4, 3))
+    except Exception:
+        pass
+    ax3.view_init(elev=18, azim=-60)
+    ax3.set_title("Deviated well shape — 1 km lead (grey) + diagonal to reservoir top\n"
+                  "+ vertical through reservoir (purple)")
+
+
 def plot_best_well_config(run_root: Path, well_rows: list[dict], out_dir: Path,
+                          rows: list[dict] | None = None, npv_ctx: dict | None = None,
                           z_slice: int = 30) -> None:
-    """Top-1 well config across all iters, over a single-Z slice of log PermX."""
+    """Top-1 well config across all iters, over a single-Z slice of log PermX. In npv mode (npv_ctx
+    set) the "best" is the ensemble-mean-NPV winner and a 3D deviated-well shape is added."""
     if not well_rows:
         return
     by_snap: dict[tuple[int, str], dict] = {}
@@ -1825,7 +1923,24 @@ def plot_best_well_config(run_root: Path, well_rows: list[dict], out_dir: Path,
         by_snap[key]["wells"].append(r)
     if not by_snap:
         return
-    _, best = max(by_snap.items(), key=lambda kv: kv[1]["real_revenue"])
+    # Best selection: ensemble-mean NPV when available (npv mode), else IX revenue.
+    npv_by_snap: dict[tuple[int, str], list[float]] = {}
+    for r in (rows or []):
+        v = r.get("real_npv")
+        if v is None or not np.isfinite(float(v)):
+            continue
+        npv_by_snap.setdefault((int(r["iteration"]), str(r["snapshot_id"])), []).append(float(v))
+    best = None
+    score_label = None
+    if npv_by_snap:
+        cands = [(k, float(np.mean(v))) for k, v in npv_by_snap.items() if k in by_snap]
+        if cands:
+            best_key, best_npv = max(cands, key=lambda kv: kv[1])
+            best = by_snap[best_key]
+            score_label = f"ensemble-mean NPV = {best_npv / 1e6:.1f} M$"
+    if best is None:
+        _, best = max(by_snap.items(), key=lambda kv: kv[1]["real_revenue"])
+        score_label = f"INTERSECT discounted revenue = {best['real_revenue'] / 1e6:.1f} M$"
     best_sid = best["snapshot_id"]
     wells = best["wells"]
 
@@ -1861,7 +1976,15 @@ def plot_best_well_config(run_root: Path, well_rows: list[dict], out_dir: Path,
         except Exception as e:
             print(f"  warning: could not load geology background: {e}")
 
-    fig, ax = plt.subplots(figsize=(9, 8), facecolor=MANIM_BG)
+    # Two-panel (map + 3D deviated shape) in npv mode; single map otherwise.
+    ax3 = None
+    if npv_ctx is not None:
+        from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (registers the 3d projection)
+        fig = plt.figure(figsize=(19, 8), facecolor=MANIM_BG)
+        ax = fig.add_subplot(1, 2, 1)
+        ax3 = fig.add_subplot(1, 2, 2, projection="3d")
+    else:
+        fig, ax = plt.subplots(figsize=(9, 8), facecolor=MANIM_BG)
     _style_ax(ax)
     if background is not None:
         im = ax.imshow(background, origin="lower", cmap="viridis", alpha=0.7,
@@ -1870,11 +1993,23 @@ def plot_best_well_config(run_root: Path, well_rows: list[dict], out_dir: Path,
         cbar.set_label(f"log10(PermX) at z = {z_slice}", color=MANIM_WHITE)
         cbar.ax.tick_params(colors=MANIM_WHITE)
 
-    xs_all = [w["x"] for w in wells]
-    ys_all = [w["y"] for w in wells]
-    if background is None:
+    # Facilities (from npv_ctx) in the same grid convention as the wells: a facility (i, j)
+    # plots at x = j-1, y = i-1 (wells use x = j_idx-1, y = i_idx-1).
+    fac_grid = [(int(fj) - 1, int(fi) - 1) for (fi, fj) in (npv_ctx or {}).get("facilities", [])]
+
+    xs_all = [w["x"] for w in wells] + [fx for fx, _ in fac_grid]
+    ys_all = [w["y"] for w in wells] + [fy for _, fy in fac_grid]
+    if background is None and xs_all:
         ax.set_xlim(min(xs_all) - 2, max(xs_all) + 2)
         ax.set_ylim(min(ys_all) - 2, max(ys_all) + 2)
+    seen_fac = False
+    for (fx, fy), (fi, fj) in zip(fac_grid, (npv_ctx or {}).get("facilities", [])):
+        ax.scatter(fx, fy, marker="s", s=170, color="#000000", edgecolors=MANIM_WHITE,
+                   linewidths=1.6, zorder=7, label=("Facility" if not seen_fac else None))
+        seen_fac = True
+        ax.annotate(f"facility ({int(fi)},{int(fj)})", (fx, fy),
+                    xytext=(6, 6), textcoords="offset points", fontsize=9,
+                    color=MANIM_WHITE, zorder=8)
     seen = {"injector": False, "producer": False}
     for w in wells:
         is_inj = (w["well_type"] == "injector")
@@ -1895,10 +2030,17 @@ def plot_best_well_config(run_root: Path, well_rows: list[dict], out_dir: Path,
     ax.set_ylabel("y  (≈ i grid index)")
     ax.set_title(
         f"Best well config — iter {best['iteration']}, {best['kind']}, "
-        f"geo {best['geology_index']} ({geology_name})\n"
-        f"INTERSECT discounted revenue = {best['real_revenue']/1e6:.1f} M$"
+        f"geo {best['geology_index']} ({geology_name})\n{score_label}"
     )
     ax.legend(loc="upper right")
+    if ax3 is not None:
+        try:
+            _render_deviated_3d(ax3, wells, npv_ctx)
+            ax3.legend(loc="upper right", fontsize=9)
+        except Exception as e:  # never let the 3D panel kill the (working) 2D map
+            ax3.set_axis_off()
+            ax3.text2D(0.5, 0.5, f"3D deviated render skipped:\n{type(e).__name__}: {e}",
+                       ha="center", va="center", color=MANIM_GREY, transform=ax3.transAxes)
     _save(fig, out_dir / "best_well_config.png")
 
 
@@ -2058,6 +2200,103 @@ def plot_emv_distribution(history: list[dict], rows: list[dict], out_dir: Path) 
     ax.set_title("Per-snapshot real EMV distribution by kind (mean over K geologies)")
     ax.legend(loc="upper left", ncol=2)
     _save(fig, out_dir / "emv_distribution.png")
+
+
+def _per_iter_pes_by_kind(rows: list[dict]) -> dict[int, dict[str, list[float]]]:
+    """Group rows by (iteration, kind) and compute per-candidate Probability of Economic Success.
+
+    PES per candidate = percent of its K geology runs with NPV > 0 (computed from per-(snapshot,
+    geology) ``real_npv``). Returns {iter: {kind: [pes_pct, ...]}}. NPV-mode only: rows without
+    ``real_npv`` contribute nothing, so revenue runs yield an empty dict (placeholder plot).
+    Iterations with no multi-geology snapshots are skipped (no ensemble PES interpretation).
+    """
+    by_iter_snap: dict[int, dict[str, list[dict]]] = {}
+    for r in rows:
+        it = int(r.get("iteration", -1))
+        sid = r.get("snapshot_id")
+        if it < 0 or not sid:
+            continue
+        by_iter_snap.setdefault(it, {}).setdefault(str(sid), []).append(r)
+    out: dict[int, dict[str, list[float]]] = {}
+    for it, snap_map in by_iter_snap.items():
+        if not any(len(rs) > 1 for rs in snap_map.values()):
+            continue
+        kind_to_pes: dict[str, list[float]] = {}
+        for sid, rs in snap_map.items():
+            npvs = [float(v) for r in rs
+                    if (v := r.get("real_npv")) is not None and np.isfinite(float(v))]
+            if not npvs:
+                continue
+            pes = 100.0 * float(np.mean([1.0 if v > 0 else 0.0 for v in npvs]))
+            kind = str(rs[0].get("kind", "frontier"))
+            kind_to_pes.setdefault(kind, []).append(pes)
+        if kind_to_pes:
+            out[it] = kind_to_pes
+    return out
+
+
+def plot_pes_distribution(history: list[dict], rows: list[dict], out_dir: Path) -> None:
+    """Per-iteration distribution of Probability of Economic Success (PES = % of geologies with
+    NPV > 0) per candidate, split by kind. Same style as plot_emv_distribution. NPV-mode only."""
+    grouped = _per_iter_pes_by_kind(rows)
+    if not grouped:
+        fig, ax = plt.subplots(figsize=(8, 4))
+        _style_ax(ax)
+        ax.text(0.5, 0.5, "No per-geology NPV — PES needs an NPV-objective ensemble run",
+                ha="center", va="center", color=MANIM_GREY)
+        ax.set_axis_off()
+        _save(fig, out_dir / "pes_distribution.png")
+        return
+
+    iters_sorted = sorted(grouped.keys())
+    fig, ax = plt.subplots(figsize=(max(8, 0.6 * len(iters_sorted) + 4), 5))
+    _style_ax(ax)
+    for kind, color in KIND_COLORS.items():
+        offset = KIND_OFFSETS.get(kind, 0.0)
+        positions, data = [], []
+        for it in iters_sorted:
+            vals = grouped[it].get(kind, [])
+            if not vals:
+                continue
+            positions.append(it + offset)
+            data.append(vals)
+        if not data:
+            continue
+        for pos, vals in zip(positions, data):
+            seed = abs(int(pos * 100)) % (2**32 - 1)
+            jitter = (np.random.RandomState(seed).rand(len(vals)) - 0.5) * 0.08
+            ax.scatter(np.full(len(vals), pos) + jitter, vals,
+                       s=18, color=color, alpha=0.7, edgecolor="none", label=None)
+        violin_data = [d for d in data if len(d) >= 4]
+        violin_pos = [p for p, d in zip(positions, data) if len(d) >= 4]
+        if violin_data:
+            parts = ax.violinplot(violin_data, positions=violin_pos, widths=0.18,
+                                   showmedians=True, showextrema=False)
+            for pc in parts["bodies"]:
+                pc.set_facecolor(color)
+                pc.set_edgecolor(color)
+                pc.set_alpha(0.35)
+            if "cmedians" in parts:
+                parts["cmedians"].set_color(color)
+        ax.plot([], [], color=color, marker="o", linestyle="None", label=kind)
+
+    # Mean-PES-per-iter trend overlay (all kinds pooled).
+    mean_iters, mean_vals = [], []
+    for it in iters_sorted:
+        allv = [v for vals in grouped[it].values() for v in vals]
+        if allv:
+            mean_iters.append(it)
+            mean_vals.append(float(np.mean(allv)))
+    if mean_iters:
+        ax.plot(mean_iters, mean_vals, color=MANIM_WHITE, linewidth=1.5, label="mean PES")
+
+    ax.set_ylim(-5, 105)
+    ax.set_xticks(iters_sorted)
+    ax.set_xlabel("AL iteration")
+    ax.set_ylabel("Probability of economic success  (% of geologies with NPV > 0)")
+    ax.set_title("Per-snapshot PES distribution by kind (fraction of K geologies with positive NPV)")
+    ax.legend(loc="best", ncol=2)
+    _save(fig, out_dir / "pes_distribution.png")
 
 
 def plot_best_emv_so_far(history: list[dict], out_dir: Path) -> None:
@@ -2436,6 +2675,9 @@ def main() -> int:
         OBJ_EMV = "EMV (mean NPV across ensemble)"
         print("Objective: NPV (proxy). Objective/convergence/ensemble plots show NPV; surrogate "
               "revenue preserved in *_rev. Predicted-real gap is identical in NPV space (costs cancel).")
+    # npv_context.json (written by the local driver in npv mode) drives the 3D deviated-well shape
+    # on the best-config panel; None in revenue mode -> that panel stays 2D-only.
+    npv_ctx = _load_npv_context(args.run_root)
     # Data prep for the holdout / well-coord plot families. Guarded so a load failure can't
     # block the rest of the dashboard.
     try:
@@ -2479,8 +2721,10 @@ def main() -> int:
         ("well_position_heatmaps", lambda: plot_well_position_heatmaps(well_rows, out_dir)),
         ("well_position_heatmaps_by_kind", lambda: plot_well_position_heatmaps_by_kind(well_rows, out_dir)),
         ("well_position_heatmaps_over_iters", lambda: plot_well_position_heatmaps_over_iters(well_rows, out_dir)),
-        ("best_well_config", lambda: plot_best_well_config(args.run_root, well_rows, out_dir)),
+        ("best_well_config", lambda: plot_best_well_config(args.run_root, well_rows, out_dir,
+                                                           rows=rows, npv_ctx=npv_ctx)),
         ("emv_distribution", lambda: plot_emv_distribution(history, rows, out_dir)),
+        ("pes_distribution", lambda: plot_pes_distribution(history, rows, out_dir)),
         ("best_emv_so_far", lambda: plot_best_emv_so_far(history, out_dir)),
         ("exploit_seed_vs_terminal_predicted", lambda: plot_exploit_seed_vs_terminal_predicted(rows, out_dir)),
         ("exploit_seed_vs_terminal_real", lambda: plot_exploit_seed_vs_terminal_real(rows, out_dir)),

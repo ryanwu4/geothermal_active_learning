@@ -42,6 +42,37 @@ def assert_objective_marker(ws: Path, objective: str) -> None:
         marker.write_text(str(objective))
 
 
+def write_npv_context(
+    ws: Path,
+    *,
+    surrogate_repo: str | Path,
+    geo_cube_path: str | Path,
+    facilities: Any,
+    vertical_lead_m: float,
+    ksurf: int,
+    poro_thresh: float,
+    reservoir_geology_h5: str | Path,
+) -> None:
+    """Write ws/npv_context.json so the standalone plotting subprocess can rebuild the deviated-well
+    geometry (cube + facilities + one geology's reservoir top) to render the 3D best-config shape.
+    Best-effort: never raises into the driver loop."""
+    try:
+        ctx = {
+            "surrogate_repo": str(surrogate_repo),
+            "geo_cube_path": str(geo_cube_path),
+            "facilities": [list(map(int, f)) for f in facilities],
+            "vertical_lead_m": float(vertical_lead_m),
+            "ksurf": int(ksurf),
+            "poro_thresh": float(poro_thresh),
+            "reservoir_geology_h5": str(reservoir_geology_h5),
+        }
+        Path(ws).mkdir(parents=True, exist_ok=True)
+        with open(Path(ws) / "npv_context.json", "w") as f:
+            json.dump(ctx, f, indent=2)
+    except Exception as e:  # noqa: BLE001
+        print(f"[npv] could not write npv_context.json: {e}")
+
+
 def build_npv_state(
     *,
     surrogate_repo: str | Path,

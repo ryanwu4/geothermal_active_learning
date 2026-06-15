@@ -672,7 +672,7 @@ def _wells_is_injector(cfg: dict) -> list[bool]:
 
 
 def _build_baseline_npv_state(cfg: dict, geology_entries: list[dict],
-                              is_injector_list: list[bool]) -> dict | None:
+                              is_injector_list: list[bool], ws: Path | None = None) -> dict | None:
     """Local proxy-NPV state for the direct-IX-CMA ablation, or None in revenue mode.
 
     Gated on cfg["optimizer"].get("objective")=="npv" (mirrors the surrogate path's
@@ -714,6 +714,14 @@ def _build_baseline_npv_state(cfg: dict, geology_entries: list[dict],
         rtop_by_geo[int(e["geology_index"])] = reservoir_top_k_map(poro, poro_thresh=poro_thresh)
     print(f"[baseline-driver] objective=npv: flowline_between={flowline:.1f} m, "
           f"{len(rtop_by_geo)} geologies, surface_capex={terms.get('CAPEX_SURFACE_FACILITIES', 0.0):.3e}")
+    if ws is not None:
+        from orchestrator.npv_metrics import write_npv_context
+        write_npv_context(
+            ws, surrogate_repo=surrogate_repo, geo_cube_path=geo_cube_path, facilities=facilities,
+            vertical_lead_m=float(opt_cfg.get("vertical_lead_m", 1000.0)), ksurf=ksurf,
+            poro_thresh=poro_thresh,
+            reservoir_geology_h5=geology_entries[0]["geology_h5_file"] if geology_entries else "",
+        )
     return {
         "compute_angled_well_length": compute_angled_well_length,
         "compute_npv": compute_npv,
@@ -780,7 +788,7 @@ def main() -> int:
     geology_entries, valid_xy, nx, ny, nz_min = _load_geologies_resolved(cfg)
     is_injector_list = _wells_is_injector(cfg)
     # Proxy-NPV ablation state (None unless optimizer.objective == "npv").
-    npv_state = _build_baseline_npv_state(cfg, geology_entries, is_injector_list)
+    npv_state = _build_baseline_npv_state(cfg, geology_entries, is_injector_list, ws=ws)
 
     last_step = "start"
     run_id = args.run_id

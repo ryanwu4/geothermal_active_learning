@@ -371,16 +371,17 @@ def _rewrite_manifest_paths(local_manifest: Path, remappings: list[tuple[str, st
     return _walk(payload)
 
 
-def _maybe_build_npv_state(cfg: dict):
+def _maybe_build_npv_state(cfg: dict, ws: Path):
     """Build local proxy-NPV state if acquisition.objective == "npv", else None.
 
     The remote Sherlock ingest computes only REVENUE (no cube); we recompute NPV locally so the
-    diagnostic dashboard reflects the optimized objective. Reuses orchestrator.npv_metrics.
+    diagnostic dashboard reflects the optimized objective. Also writes ws/npv_context.json so the
+    plotting subprocess can render the 3D deviated-well shape. Reuses orchestrator.npv_metrics.
     """
     acq = cfg["acquisition"]
     if str(acq.get("objective", "revenue")) != "npv":
         return None
-    from orchestrator.npv_metrics import build_npv_state
+    from orchestrator.npv_metrics import build_npv_state, write_npv_context
     geology_path = Path(cfg["compute"]["local_geologies_config"]).expanduser().resolve()
     geology_entries = [
         {"geology_index": int(e["geology_index"]),
@@ -389,16 +390,25 @@ def _maybe_build_npv_state(cfg: dict):
     ]
     is_injector_list = [str(w["type"]).lower() == "injector" for w in cfg["wells"]]
     surrogate_repo = cfg["compute"]["local_surrogate_repo"]
-    return build_npv_state(
+    facilities = acq.get("facilities", [[20, 30], [40, 40]])
+    vertical_lead_m = float(acq.get("vertical_lead_m", 1000.0))
+    ksurf = int(acq.get("ksurf", 2))
+    poro_thresh = float(acq.get("poro_thresh", 0.01))
+    state = build_npv_state(
         surrogate_repo=surrogate_repo,
         economics_config_path=acq.get("economics_config_path")
         or (Path(surrogate_repo) / "configs" / "economics.json"),
-        geo_cube_path=acq["geo_cube_path"],
-        facilities=acq.get("facilities", [[20, 30], [40, 40]]),
-        vertical_lead_m=float(acq.get("vertical_lead_m", 1000.0)),
-        ksurf=int(acq.get("ksurf", 2)), poro_thresh=float(acq.get("poro_thresh", 0.01)),
+        geo_cube_path=acq["geo_cube_path"], facilities=facilities,
+        vertical_lead_m=vertical_lead_m, ksurf=ksurf, poro_thresh=poro_thresh,
         geology_entries=geology_entries, is_injector_list=is_injector_list,
     )
+    write_npv_context(
+        ws, surrogate_repo=surrogate_repo, geo_cube_path=acq["geo_cube_path"],
+        facilities=facilities, vertical_lead_m=vertical_lead_m, ksurf=ksurf,
+        poro_thresh=poro_thresh,
+        reservoir_geology_h5=geology_entries[0]["geology_h5_file"] if geology_entries else "",
+    )
+    return state
 
 
 def _render_local_plots(state: RunState, ws: Path, npv_state=None) -> None:
@@ -1006,7 +1016,7 @@ def main() -> int:
 
         # Proxy-NPV dashboard state (None unless acquisition.objective == "npv"). Built once;
         # the cube load is ~20 MB so we don't rebuild per iteration.
-        npv_state = _maybe_build_npv_state(cfg)
+        npv_state = _maybe_build_npv_state(cfg, ws)
         if npv_state is not None:
             print(f"[local-driver] objective=npv: dashboard will show NPV "
                   f"(flowline={npv_state['flowline']:.0f} m, {len(npv_state['rtop_by_geo'])} geologies)")
