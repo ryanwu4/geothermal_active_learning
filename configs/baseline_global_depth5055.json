@@ -1,0 +1,72 @@
+{
+  "run_id_prefix": "baseline_depth5055",
+  "target": "baseline_ensemble_mean_discounted_revenue",
+
+  "_note": "DEPTH-ORACLE ABLATION of baseline_global.json (revenue, seed 42, direct CMA-ES->IX). IDENTICAL except the well-depth search is confined to z in [50, 55] (optimizer.depth_min/depth_max) instead of [5, 62]. Rationale: real revenue rises with depth and SATURATES by z~50-55 (corr(mean_z, real_rev)=0.53 over 1438 baseline IX configs; bins 375M@z35 -> 447M@z50-55, 55-63 no better), and the surrogate-AL's edge over the full-range baseline is almost entirely that it reaches this productive depth immediately (surrogate iter0 mean_z=52.6 vs baseline iter0 z=37.7 crawling to 48 by iter29). This run removes depth as a discovery problem so the optimizer searches xy only. Test question: does the depth-pinned baseline reach the surrogate's ~514M (deep baseline configs already hit 510M) at far fewer IX -> if so, the surrogate+CMA add ~nothing beyond a depth heuristic. Overlay vs local_workspace_baseline_seed42 (full-range) and the cma_clean_6_5 surrogate on the IX-budget convergence plot.",
+
+  "wandb": {
+    "project": "geothermal_active_learning",
+    "entity": "ryanwu4",
+    "tags": ["baseline", "ablation", "no_surrogate", "cmaes_direct_ix", "depth_oracle", "depth_5055"]
+  },
+
+  "paths": {
+    "scratch_root": "/scratch/users/rwu4/baseline_runs",
+    "surrogate_repo": "/home/users/rwu4/Geothermal_Graph_Surrogate",
+    "julia_repo": "/home/users/rwu4/GeologicalSimulationWrapper.jl",
+    "julia_config": "configs/sherlock_ryan.json",
+    "geologies_config": "configs/geologies_full.json",
+    "norm_config_path": "/scratch/users/rwu4/al_runs/norm_config.json"
+  },
+
+  "compute": {
+    "ssh_host": "sherlock",
+    "ssh_control_path": "~/.ssh/cm-rwu4@login.sherlock.stanford.edu:22",
+    "remote_repo_root": "/home/users/rwu4/geothermal_active_learning",
+    "local_workspace": "/home/rwu4/omv_geothermal/geothermal_active_learning/local_workspace_baseline_depth5055",
+    "local_geologies_config": "/home/rwu4/omv_geothermal/geothermal_active_learning/configs/geologies_full_local.json",
+    "poll_interval_sec": 600,
+    "notify_email": "ryanwu2002@gmail.com",
+    "notify_msmtp_account": "gmail",
+    "wandb_mode": "online"
+  },
+
+  "optimizer": {
+    "type": "cmaes",
+    "popsize": 16,
+    "sigma_init": 12.0,
+    "edge_buffer": 10,
+    "seed": 42,
+    "depth_min": 50,
+    "depth_max": 55
+  },
+
+  "intersect": {
+    "max_concurrent": 90,
+    "time_per_run": "00:40:00",
+    "cpus_per_task": 2,
+    "mem_per_task": "8GB",
+    "np": 2
+  },
+
+  "stopping": {
+    "max_iterations": 15,
+    "plateau_window": 5,
+    "plateau_threshold_relative": 0.005
+  },
+
+  "wells": [
+    {"depth": 52, "type": "injector"},
+    {"depth": 52, "type": "producer"},
+    {"depth": 52, "type": "injector"},
+    {"depth": 52, "type": "producer"},
+    {"depth": 52, "type": "injector"},
+    {"depth": 52, "type": "producer"},
+    {"depth": 52, "type": "injector"},
+    {"depth": 52, "type": "producer"},
+    {"depth": 52, "type": "injector"},
+    {"depth": 52, "type": "producer"},
+    {"depth": 52, "type": "injector"},
+    {"depth": 52, "type": "producer"}
+  ]
+}

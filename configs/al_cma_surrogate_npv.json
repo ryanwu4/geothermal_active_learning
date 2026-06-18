@@ -34,7 +34,7 @@
   "seed": {
     "seed_id": "clean",
     "n_seed_samples": 256,
-    "depth_min": 5,
+    "depth_min": 11,
     "depth_max": 70,
     "edge_buffer": 10,
     "seed": 42
@@ -65,7 +65,7 @@
     "cma_generations": 40,
     "cma_sigma_init": 12.0,
     "cma_warm_start": false,
-    "depth_min": 5,
+    "depth_min": 11,
     "depth_max": 70,
     "n_exploit": 16,
     "n_frontier": 4,

@@ -36,7 +36,7 @@
     "sigma_init": 12.0,
     "edge_buffer": 10,
     "seed": 42,
-    "depth_min": 5,
+    "depth_min": 11,
     "depth_max": 70,
     "objective": "npv",
     "economics_config_path": "/home/rwu4/omv_geothermal/Geothermal_Graph_Surrogate/configs/economics.json",

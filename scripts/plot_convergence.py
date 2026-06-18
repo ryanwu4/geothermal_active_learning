@@ -2096,6 +2096,168 @@ def plot_wallclock_breakdown(history: list[dict], out_dir: Path) -> None:
 
 
 # -----------------------------------------------------------------------------
+# Run-health: simulation failures
+# -----------------------------------------------------------------------------
+
+
+def _is_finite_num(x) -> bool:
+    return x is not None and isinstance(x, (int, float)) and np.isfinite(x)
+
+
+def _failure_stats_per_iter(run_root: Path, history: list[dict]) -> list[dict]:
+    """Per-iteration IX-failure stats, read FRESH from each per_candidate_metrics.json.
+
+    Deliberately re-reads the file (rather than using the shared ``rows``) so the count keys off the
+    raw ``real_revenue`` sim output: ``_apply_npv_objective`` overwrites ``rows[*]["real_revenue"]``
+    with NPV (None when the proxy-NPV couldn't be built even though the sim succeeded), which would
+    misclassify good sims as failures. The on-disk file always keeps the true revenue.
+
+    A "failed individual run" = a submitted (config, geology) IX task that did NOT yield a finite
+    real_revenue — whether it produced no output at all or produced an unusable one. We split that
+    into ``no_output`` (submitted minus completed=files-produced) and ``bad_output`` (produced but
+    non-finite revenue) using the file's ``n_completed``.
+
+    A "config with a failing geology" = a snapshot whose finite-revenue geology count is below the
+    ensemble size K (= distinct geology_index this iter). Configs that lost *every* geology leave no
+    rows in the surrogate-path file, so we recover their count from submitted/K and fold them in.
+    """
+    stats: list[dict] = []
+    for rec in history:
+        it = rec["iteration"]
+        payload = _load_per_candidate(run_root, it)
+        if payload is None:
+            continue
+        cands = payload.get("candidates", []) or []
+        submitted = payload.get("n_submitted")
+        if submitted is None:  # fall back to state's per-iter count
+            submitted = rec.get("submitted")
+        completed = payload.get("n_completed")
+        if completed is None:
+            completed = rec.get("completed")
+
+        geo_ids = {c.get("geology_index") for c in cands if c.get("geology_index") is not None}
+        K = len(geo_ids)
+        by_snap: dict[str, int] = {}          # snapshot_id -> finite-revenue geology count
+        for c in cands:
+            sid = c.get("snapshot_id")
+            if not sid:
+                continue
+            by_snap.setdefault(sid, 0)
+            if _is_finite_num(c.get("real_revenue")):
+                by_snap[sid] += 1
+        n_ok = sum(by_snap.values())
+
+        # Configs present in the file plus any that vanished entirely (no rows).
+        configs_present = len(by_snap)
+        expected_configs = round(submitted / K) if (submitted and K) else configs_present
+        missing_configs = max(0, expected_configs - configs_present)
+        configs_total = max(configs_present, expected_configs)
+        configs_with_failure = sum(1 for n in by_snap.values() if n < K) + missing_configs
+
+        sub = int(submitted) if submitted else n_ok
+        comp = int(completed) if completed is not None else n_ok
+        failed_total = max(0, sub - n_ok)
+        no_output = max(0, sub - comp)
+        bad_output = max(0, failed_total - no_output)  # produced a file but revenue unusable
+        stats.append({
+            "iteration": it,
+            "submitted": sub,
+            "n_ok": n_ok,
+            "no_output": no_output,
+            "bad_output": bad_output,
+            "failed_total": failed_total,
+            "failure_rate": (100.0 * failed_total / sub) if sub else 0.0,
+            "K": K,
+            "configs_total": configs_total,
+            "configs_with_failure": configs_with_failure,
+            "configs_clean": max(0, configs_total - configs_with_failure),
+            "frac_configs_failed": (100.0 * configs_with_failure / configs_total) if configs_total else 0.0,
+        })
+    return stats
+
+
+def plot_run_failure_diagnostics(run_root: Path, history: list[dict], out_dir: Path) -> None:
+    """Two-panel run-health diagnostic over iterations:
+
+    (L) individual IX runs split into succeeded / produced-but-unusable / no-output, with the
+        per-iteration failure rate overlaid.
+    (R) well configs split into clean vs has-≥1-failing-geology, with the affected-fraction overlaid.
+    """
+    stats = _failure_stats_per_iter(run_root, history)
+    if not stats:
+        return
+    iters = [s["iteration"] for s in stats]
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 5.5), facecolor=MANIM_BG)
+    width = 0.7
+
+    # ---- Left: individual run failures ----
+    ax = axes[0]
+    _style_ax(ax)
+    ok = [s["n_ok"] for s in stats]
+    bad = [s["bad_output"] for s in stats]
+    no_out = [s["no_output"] for s in stats]
+    ax.bar(iters, ok, width, color=MANIM_GREEN, label="Succeeded (finite revenue)")
+    ax.bar(iters, bad, width, bottom=ok, color=MANIM_ORANGE,
+           label="Produced but unusable")
+    ax.bar(iters, no_out, width, bottom=[o + b for o, b in zip(ok, bad)],
+           color=MANIM_RED, label="No output")
+    for s in stats:  # annotate total failed above the stack
+        if s["failed_total"] > 0:
+            ax.text(s["iteration"], s["submitted"], f" {s['failed_total']}",
+                    ha="center", va="bottom", color=MANIM_WHITE, fontsize=TICK_SIZE)
+    ax.set_xlabel("AL iteration")
+    ax.set_ylabel("Individual IX runs")
+    ax.set_xticks(iters)
+    ax.set_xlim(min(iters) - 0.7, max(iters) + 0.7)  # margin so a 1-iter run isn't a full-width block
+    ax.set_title("Failed individual IX runs per iteration")
+
+    ax_r = ax.twinx()
+    _style_ax(ax_r)
+    ax_r.set_facecolor(MANIM_BG)
+    rates = [s["failure_rate"] for s in stats]
+    ax_r.plot(iters, rates, color=MANIM_WHITE, marker="o", lw=2, label="Failure rate")
+    ax_r.set_ylabel("Failure rate (%)", color=MANIM_WHITE)
+    ax_r.set_ylim(0, max(5.0, min(100.0, max(rates) * 1.4)) if rates else 5.0)
+    h1, l1 = ax.get_legend_handles_labels()
+    h2, l2 = ax_r.get_legend_handles_labels()
+    ax.legend(h1 + h2, l1 + l2, loc="upper right", framealpha=0.9)
+
+    # ---- Right: configs with any failing geology ----
+    ax2 = axes[1]
+    _style_ax(ax2)
+    clean = [s["configs_clean"] for s in stats]
+    cfail = [s["configs_with_failure"] for s in stats]
+    ax2.bar(iters, clean, width, color=MANIM_GREEN, label="All geologies ok")
+    ax2.bar(iters, cfail, width, bottom=clean, color=MANIM_RED,
+            label="≥1 failing geology")
+    for s in stats:
+        if s["configs_with_failure"] > 0:
+            ax2.text(s["iteration"], s["configs_total"],
+                     f" {s['configs_with_failure']}/{s['configs_total']}",
+                     ha="center", va="bottom", color=MANIM_WHITE, fontsize=TICK_SIZE)
+    ax2.set_xlabel("AL iteration")
+    ax2.set_ylabel("Well configs (snapshots)")
+    ax2.set_xticks(iters)
+    ax2.set_xlim(min(iters) - 0.7, max(iters) + 0.7)
+    ax2.set_title("Well configs with ≥1 failing geology per iteration")
+
+    ax2_r = ax2.twinx()
+    _style_ax(ax2_r)
+    ax2_r.set_facecolor(MANIM_BG)
+    fracs = [s["frac_configs_failed"] for s in stats]
+    ax2_r.plot(iters, fracs, color=MANIM_WHITE, marker="o", lw=2, label="% configs affected")
+    ax2_r.set_ylabel("Configs affected (%)", color=MANIM_WHITE)
+    ax2_r.set_ylim(0, max(5.0, min(100.0, max(fracs) * 1.4)) if fracs else 5.0)
+    h1, l1 = ax2.get_legend_handles_labels()
+    h2, l2 = ax2_r.get_legend_handles_labels()
+    ax2.legend(h1 + h2, l1 + l2, loc="upper right", framealpha=0.9)
+
+    fig.suptitle("Run health: simulation failures", color=MANIM_WHITE, fontsize=TITLE_SIZE)
+    _save(fig, out_dir / "run_failure_diagnostics.png")
+
+
+# -----------------------------------------------------------------------------
 # Ensemble-mode EMV plots
 # -----------------------------------------------------------------------------
 
@@ -2709,6 +2871,7 @@ def main() -> int:
         ("per_geology_mape_heatmap", lambda: plot_per_geology_mape_heatmap(history, out_dir)),
         ("training_growth", lambda: plot_training_growth(history, out_dir)),
         ("wallclock_breakdown", lambda: plot_wallclock_breakdown(history, out_dir)),
+        ("run_failure_diagnostics", lambda: plot_run_failure_diagnostics(args.run_root, history, out_dir)),
         ("predicted_vs_real_scatter", lambda: plot_predicted_vs_real_scatter(rows, out_dir)),
         ("real_revenue_distribution", lambda: plot_real_revenue_distribution(rows, out_dir)),
         ("topk_mean_gap", lambda: plot_topk_mean_gap(rows, out_dir)),
