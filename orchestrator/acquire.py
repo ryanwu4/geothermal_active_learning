@@ -318,7 +318,21 @@ def _build_static_batch_for_starts(
                     f"dropped it. The LHS sampler should already resample "
                     f"dead-rock placements; this should not happen."
                 )
-            static_graphs.append(scaler.transform_graph(raw_graph))
+            scaled = scaler.transform_graph(raw_graph)
+            # node_slot[k] = the INPUT slot index of the well that became built node k.
+            # extract_well_data re-sorts wells by (x,y) (via np.where), so node order
+            # != slot order. Carry this map so any pos_xyz overwrite can reorder
+            # slot-order coords to node order (node k's position MUST match node k's
+            # own features/edges). Match by grid cell — exact: n_wells==len(w_cfg) above
+            # guarantees a bijection (no collisions, else the build would have raised).
+            _slot_of_cell = {}
+            for _s, _w in enumerate(w_cfg):
+                _ix = int(np.clip(round(float(_w["x"])), 0, nx - 1))
+                _iy = int(np.clip(round(float(_w["y"])), 0, ny - 1))
+                _slot_of_cell[(_ix, _iy)] = _s
+            _node_slot = [_slot_of_cell[(int(x_idx[_k]), int(y_idx[_k]))] for _k in range(len(x_idx))]
+            scaled["well"].node_slot = torch.tensor(_node_slot, dtype=torch.long)
+            static_graphs.append(scaled)
 
     # Fix #1 (physics-on-GPU): relocate the physics volumes to ``device`` ONCE,
     # AFTER graph construction. build_single_hetero_data reads physics tensors on
@@ -338,6 +352,27 @@ def _build_static_batch_for_starts(
                 moved[key] = {k: v.to(device) for k, v in pc.d.items()}
             pc.d = moved[key]
     return static_graphs
+
+
+def _assign_pos_xyz(batch, coords: torch.Tensor) -> None:
+    """Overwrite ``batch['well'].pos_xyz`` from per-candidate, SLOT-order ``coords``
+    of shape (M, num_wells, 3), REORDERING to each graph's build-time node order via
+    ``well.node_slot`` so node k's position matches node k's own features/edges.
+
+    Fixes the slot-order-vs-(x,y)-sorted-node-order handoff bug: graphs from
+    ``_build_static_batch_for_starts`` have nodes in extract_well_data's (x,y) order,
+    NOT the caller's slot order. Differentiable (``torch.gather``) so gradient-based
+    callers (Adam paths) route grads back to the correct slot coordinate. Falls back
+    to slot-order reshape only for legacy graphs lacking ``node_slot``.
+    """
+    well = batch["well"]
+    ns = getattr(well, "node_slot", None)
+    if ns is None:
+        well.pos_xyz = coords.reshape(-1, 3)
+        return
+    M, W = int(coords.shape[0]), int(coords.shape[1])
+    ns = ns.reshape(M, W).to(coords.device)
+    well.pos_xyz = torch.gather(coords, 1, ns.unsqueeze(-1).expand(M, W, 3)).reshape(-1, 3)
 
 
 def _scaler_to_torch(scaler, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
@@ -758,7 +793,7 @@ def _cma_seed_starts(
                 coords_xyz[i, w, 1] = ry
         c_t = torch.from_numpy(coords_xyz).to(device)
         with torch.no_grad():
-            batch_data["well"].pos_xyz = c_t.view(-1, 3)
+            _assign_pos_xyz(batch_data, c_t)  # reorder slot->node (node_slot); fixes handoff bug
             pred_scaled = model(batch_data).view(M)
             preds = (pred_scaled * target_scale + target_mean).detach().cpu().numpy()
         # Sanitize non-finite predictions before handing to CMA-ES and before
@@ -1015,7 +1050,10 @@ def _run_one_geology(
     last_valid_coords = coords.detach().clone()
 
     def _predict_unscaled(c: torch.Tensor) -> torch.Tensor:
-        batch_data["well"].pos_xyz = c.view(-1, 3)
+        # _assign_pos_xyz reorders slot-order coords to node order (node_slot) via a
+        # DIFFERENTIABLE gather, so Adam gradients route back to the correct slot coord
+        # (fixes the handoff bug that previously moved the wrong wells).
+        _assign_pos_xyz(batch_data, c)
         pred_scaled = model(batch_data).view(M)
         return pred_scaled * target_scale + target_mean
 
@@ -2372,11 +2410,18 @@ def _run_acquisition_cma_surrogate(
         c[:, :, 0] = np.clip(c[:, :, 0], 0, nx - 1)
         c[:, :, 1] = np.clip(c[:, :, 1], 0, ny - 1)
         c[:, :, 2] = np.clip(c[:, :, 2], 0, z_max - 1)
+        # BUGFIX (found 2026-06-17): the static graph's nodes are in extract_well_data's
+        # (x,y)-sorted order, NOT slot order. _assign_pos_xyz reorders these slot-order
+        # coords to each graph's node order (well.node_slot) so node k's overwritten
+        # position matches node k's own features/edges. (Was a per-well scramble that
+        # made the surrogate non-permutation-invariant and added ~±15M config-dependent
+        # error per CMA query; verified to restore invariance + cut re-eval MAE ~28% in
+        # analysis/cma_multistart_compare.)
         c_t = torch.from_numpy(c).to(device)
         cols: list[np.ndarray] = []
         with torch.no_grad():
             for bd in batches:
-                bd["well"].pos_xyz = c_t.view(-1, 3)
+                _assign_pos_xyz(bd, c_t)
                 pred_scaled = model(bd).view(M_local)
                 preds = (pred_scaled * target_scale + target_mean).detach().cpu().numpy()
                 cols.append(preds)
@@ -3155,7 +3200,7 @@ def _run_acquisition_ensemble(
         replica. Returns an ``(M_local,)`` tensor of unscaled predictions
         on that device.
         """
-        bd["well"].pos_xyz = c.view(-1, 3)
+        _assign_pos_xyz(bd, c)  # reorder slot->node (node_slot); differentiable; fixes handoff bug
         pred_scaled = models_per_dev[dev_idx](bd).view(M_local)
         return pred_scaled * target_scales_per_dev[dev_idx] + target_means_per_dev[dev_idx]
 
