@@ -1931,6 +1931,7 @@ def _emit_snapshot_ensemble(
     well_configs_dir: Path,
     snapshots_json_dir: Path,
     to_julia_wells_text,
+    run_id_prefix: str = "",
     extra_fields: dict | None = None,
 ) -> dict[str, Any]:
     """Write one .jl + one snapshot JSON for an ensemble candidate.
@@ -1940,7 +1941,13 @@ def _emit_snapshot_ensemble(
     record's ``well_config_paths_by_geology`` lists K entries pointing to the
     same .jl, so Julia's array prepare expands one candidate into K IX tasks.
     """
-    snapshot_id = f"run{run_id:06d}_step{iteration_step:04d}_{kind}"
+    # run_id_prefix (the unique AL run id, when supplied) namespaces snapshot_id so two
+    # AL runs at the SAME cma_generations can't collide in the IX sim working-dir / shared
+    # well_configs (Julia's config_id = SURROGATE_BC..._<snapshot_id>_G.. carries no run_id
+    # otherwise — only the final h5 name is run-namespaced via output_prefix). Empty prefix
+    # => unchanged legacy id (preserves the Adam-ensemble caller's behavior).
+    _idp = f"{run_id_prefix}_" if run_id_prefix else ""
+    snapshot_id = f"{_idp}run{run_id:06d}_step{iteration_step:04d}_{kind}"
     jl_path = well_configs_dir / f"{snapshot_id}.jl"
     json_path = snapshots_json_dir / f"{snapshot_id}.json"
 
@@ -2816,11 +2823,18 @@ def _run_acquisition_cma_surrogate(
         else:
             predicted_emv = float(np.mean(pred_row))
         is_exploit = (kind == "exploit")
+        # Provenance: which cold CMA start this pick came from (>=0; -1 = frontier).
+        # Routed through extra_fields so it lands in BOTH the on-disk snapshot JSON and
+        # the manifest record (setting it post-emit would miss the already-written JSON).
+        extra_fields = dict(extra_fields or {})
+        extra_fields["source_start"] = int(src_start)
         # run_id is a per-candidate uniqueness counter only. Geology is carried
         # per IX task by the scenario (geology_config_id) token in the output
         # filename — an ensemble candidate spans all K geologies under one
         # run_id, so run_id MUST NOT be used to encode geology. The training
         # split resolves geology by scenario (geothermal.data.resolve_geology_indices).
+        # run_id_prefix (unique AL run id) namespaces snapshot_id -> IX config_id so two
+        # AL runs at the same cma_generations can't collide in the IX sim working-dir.
         snap = _emit_snapshot_ensemble(
             run_id=m,
             iteration_step=int(cfg.cma_generations),
@@ -2837,9 +2851,9 @@ def _run_acquisition_cma_surrogate(
             well_configs_dir=well_configs_dir,
             snapshots_json_dir=snapshots_json_dir,
             to_julia_wells_text=ctx.to_julia_wells_text,
+            run_id_prefix=run_id_prefix,
             extra_fields=extra_fields,
         )
-        snap["source_start"] = int(src_start)  # which cold CMA start (>=0); -1 = frontier
         snapshots.append(snap)
         candidates.append(_snapshot_to_candidate_ensemble(snap, cxyz, is_injector_list))
     timings["snapshot_io_s"] = time.perf_counter() - t0

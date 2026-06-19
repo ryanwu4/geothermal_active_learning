@@ -822,6 +822,7 @@ def _acquire_and_select_locally(
         cma_generations=int(acq_cfg.get("cma_generations", 10)),
         cma_sigma_init=float(acq_cfg.get("cma_sigma_init", 5.0)),
         cma_warm_start=bool(acq_cfg.get("cma_warm_start", False)),
+        align_recombination=bool(acq_cfg.get("align_recombination", True)),
         n_cma_starts=int(acq_cfg.get("n_cma_starts", 1)),
         n_elite_per_start=int(acq_cfg.get("n_elite_per_start", 1)),
         prior_metrics=prior_metrics,
@@ -850,7 +851,10 @@ def _acquire_and_select_locally(
     started = time.time()
     out_dir = ws / "acquire" / f"iter_{iter_idx:04d}"
     out_dir.mkdir(parents=True, exist_ok=True)
-    acq_result = run_acquisition(acq, out_dir=out_dir, iteration=iter_idx)
+    # Pass the UNIQUE run id as run_id_prefix so cma_surrogate snapshot_ids (and thus the
+    # Julia IX sim working-dir / shared well_configs config_id) are namespaced per run —
+    # otherwise two AL runs at the same cma_generations destructively collide in sim_dir.
+    acq_result = run_acquisition(acq, out_dir=out_dir, iteration=iter_idx, run_id_prefix=state.run_id)
     elapsed_min = (time.time() - started) / 60.0
     print(f"[local-driver] acquired {len(acq_result['candidates'])} candidates in {elapsed_min:.2f} min")
 
