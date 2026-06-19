@@ -33,6 +33,44 @@ import numpy as np
 WORST_SENTINEL = 1e30
 
 
+def align_to_reference(W, M, groups=None, metric=None):
+    """Relabel candidate wells ``W`` to match reference wells ``M`` by solving the
+    optimal (Hungarian) assignment that minimizes total squared displacement,
+    restricted to within well-type groups (an injector is never matched to a
+    producer). Local permutation symmetry break for permutation-invariant
+    objectives — see the implementation spec.
+
+    W, M  : (N, p) arrays. Row i = well i.
+    groups: optional (N,) int array of well types; wells permuted only within type.
+    metric: optional (p,) per-coordinate weights (diagonal metric).
+
+    Returns (W_aligned, perm, cost):
+      W_aligned : (N, p)  W reordered so row j corresponds to reference slot j
+      perm      : (N,)    perm[j] = index of the candidate row placed in slot j
+      cost      : float   mean squared displacement (1/N) Σ_j ||W_aligned[j]-M[j]||²
+    """
+    from scipy.optimize import linear_sum_assignment
+
+    W = np.asarray(W, dtype=np.float64)
+    M = np.asarray(M, dtype=np.float64)
+    N = W.shape[0]
+    if groups is None:
+        groups = np.zeros(N, dtype=int)
+    else:
+        groups = np.asarray(groups)
+    w = np.ones(W.shape[1]) if metric is None else np.asarray(metric, dtype=np.float64)
+    perm = np.empty(N, dtype=int)
+    total = 0.0
+    for g in np.unique(groups):
+        idx = np.where(groups == g)[0]                  # global indices in this group
+        diff = W[idx][:, None, :] - M[idx][None, :, :]  # (n_g, n_g, p)
+        Cg = np.sum(w * diff ** 2, axis=2)              # (n_g, n_g) cost matrix
+        r, c = linear_sum_assignment(Cg)                # cand idx[r[k]] -> slot idx[c[k]]
+        perm[idx[c]] = idx[r]                            # slot idx[c[k]] receives cand idx[r[k]]
+        total += Cg[r, c].sum()
+    return W[perm], perm, total / N
+
+
 # ----------------------------------------------------------------------
 # Shared projection helper
 # ----------------------------------------------------------------------
@@ -192,6 +230,15 @@ class CMAESOptimizer:
     # passes this to anchor the search on the current real-revenue incumbent.
     mean_init: np.ndarray | None = field(default=None, repr=False)
 
+    # Permutation-invariant recombination (Hungarian alignment). When True, each
+    # candidate's wells are relabeled to the generating mean (within type group)
+    # before tell()'s recombination/covariance update — a local symmetry break so
+    # averaging over selected candidates is meaningful. Default OFF (production
+    # behavior byte-identical). well_groups: (num_wells,) int per-well type
+    # (0=injector,1=producer); None -> alternating even=inj/odd=prod convention.
+    align_recombination: bool = False
+    well_groups: np.ndarray | None = field(default=None, repr=False)
+
     # Runtime state (populated by __post_init__ / restored by pickle).
     _es: object = field(default=None, repr=False)
     _generation: int = 0
@@ -199,6 +246,7 @@ class CMAESOptimizer:
     _best_coords: np.ndarray | None = field(default=None, repr=False)
     _last_proposal: np.ndarray | None = field(default=None, repr=False)  # (popsize, num_wells, 3) post-projection coords for IX
     _last_raw_sols: np.ndarray | None = field(default=None, repr=False)  # (popsize, dim) raw (continuous) CMA-ES samples for tell()
+    _last_align_diag: dict | None = field(default=None, repr=False)  # transient per-gen alignment diagnostics
 
     def __post_init__(self) -> None:
         if not (self.depth_bounds[1] > self.depth_bounds[0]):
@@ -343,6 +391,12 @@ class CMAESOptimizer:
         raw = self._last_raw_sols.astype(np.float64)
         es = self._es
         assert es is not None
+        if self.align_recombination:
+            # Relabel each candidate's wells to the GENERATING mean (read before
+            # es.tell mutates it) within type groups, so recombination averages
+            # the same physical slots. Per-candidate perm to the common fixed
+            # reference => the recombined mean stays in that frame (no reverse perm).
+            raw = self._align_population(raw, costs)
         es.tell(list(zip([s for s in raw], costs.tolist())))  # type: ignore[attr-defined]
 
         # Update best-so-far over finite evaluations.
@@ -357,6 +411,54 @@ class CMAESOptimizer:
         self._generation += 1
         self._last_proposal = None
         self._last_raw_sols = None
+
+    def _well_groups(self) -> np.ndarray:
+        if self.well_groups is not None:
+            return np.asarray(self.well_groups).reshape(-1)
+        # Default: alternating even=injector(0)/odd=producer(1).
+        return np.array([i % 2 for i in range(self.num_wells)], dtype=int)
+
+    def _align_population(self, raw: np.ndarray, costs: np.ndarray) -> np.ndarray:
+        """Per-candidate Hungarian alignment of raw (continuous) well vectors to
+        the generating mean (raw space) within type groups. Returns aligned raw;
+        also records per-generation diagnostics in ``self._last_align_diag``."""
+        inner = getattr(self._es, "_cma", None)
+        mean_flat = np.asarray(getattr(inner, "_mean", None) if inner is not None
+                               else getattr(self._es, "_mean"), dtype=np.float64)
+        M = mean_flat.reshape(self.num_wells, 3)
+        groups = self._well_groups()
+        aligned = np.empty_like(raw)
+        perms, swaps, residuals = [], [], []
+        ident = np.arange(self.num_wells)
+        for i in range(raw.shape[0]):
+            Wa, perm, cost = align_to_reference(raw[i].reshape(self.num_wells, 3), M, groups=groups)
+            aligned[i] = Wa.reshape(-1)
+            perms.append(tuple(perm.tolist()))
+            swaps.append(float(np.mean(perm != ident)))
+            residuals.append(float(cost))
+        # n_distinct permutations among the selected top-mu (lowest cost).
+        mu = max(1, self.popsize // 2)
+        top = np.argsort(np.asarray(costs))[:mu]
+        n_distinct = len({perms[i] for i in top})
+        nn = self._mean_nn(M)
+        Abar = float(np.mean(residuals))
+        self._last_align_diag = {
+            "residual_mean": Abar,                       # mean squared displacement (grid^2)
+            "swap_frac_mean": float(np.mean(swaps)),
+            "n_distinct_perms_topmu": int(n_distinct),
+            "rms_disp_over_nn": float(np.sqrt(Abar) / nn) if nn > 0 else float("nan"),
+        }
+        return aligned
+
+    @staticmethod
+    def _mean_nn(M: np.ndarray) -> float:
+        """Mean nearest-neighbor distance among reference wells (grid units)."""
+        N = M.shape[0]
+        if N < 2:
+            return 0.0
+        d = np.sqrt(((M[:, None, :] - M[None, :, :]) ** 2).sum(-1))
+        np.fill_diagonal(d, np.inf)
+        return float(d.min(axis=1).mean())
 
     def save_state(self, path: Path) -> None:
         path = Path(path)
@@ -513,6 +615,8 @@ def build_optimizer(
     depth_bounds: tuple[int, int],
     sigma_init: float = 5.0,
     mean_init: np.ndarray | None = None,
+    align_recombination: bool = False,
+    well_groups: np.ndarray | None = None,
 ) -> BaselineOptimizer:
     """Construct an optimizer by string name. Search dim = 3 × num_wells."""
     kind = kind.lower()
@@ -522,6 +626,7 @@ def build_optimizer(
             depth_bounds=depth_bounds, popsize=popsize,
             sigma_init=sigma_init, seed=seed, valid_xy_indices=valid_xy_indices,
             mean_init=mean_init,
+            align_recombination=align_recombination, well_groups=well_groups,
         )
     if kind in ("random", "lhs"):
         return RandomOptimizer(

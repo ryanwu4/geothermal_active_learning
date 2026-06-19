@@ -82,6 +82,14 @@ class AcquisitionConfig:
     cma_popsize: int = 16
     cma_generations: int = 10
     cma_sigma_init: float = 5.0
+    # cma_surrogate multistart (validated in analysis/multistart_elite_vs_random_ix,
+    # FINDINGS.md): run n_cma_starts independent COLD CMA restarts (distinct seeds ->
+    # distinct LHS cold means -> distinct basins) and take the top n_elite_per_start
+    # CONVERGED elites (final-gen, by predicted EMV) from each. n_cma_starts=1 (default)
+    # reproduces the single-run behavior exactly. Real cross-start elite ranking tracks
+    # predicted at Spearman 0.83; per-start elite beats a random final-pop draw +18.9 M$.
+    n_cma_starts: int = 1
+    n_elite_per_start: int = 1
     # cma_surrogate only: if True, seed the CMA mean from the prior real-revenue
     # incumbent on iter>=1 (warm start). Default False = cold LHS restart every AL
     # iteration. The cma_trajectory_long IX experiment showed warm-starting drops
@@ -90,6 +98,14 @@ class AcquisitionConfig:
     # swings to +52 M$), whereas a cold restart stayed calibrated and reached
     # ~+55 M$ higher real revenue at gen 100.
     cma_warm_start: bool = False
+    # Permutation-invariant recombination: relabel each CMA candidate's wells to
+    # the generating mean (within injector/producer groups, Hungarian assignment)
+    # before the covariance/mean update — the well objective is invariant to
+    # relabeling same-type wells, and unaligned recombination averages distinct
+    # physical wells, keeping σ/C inflated. ON by default. Clearly load-bearing
+    # in depth-controlled regimes (CMA converges only with it); a correct, cheap
+    # relabeling otherwise. Set false to reproduce pre-alignment runs.
+    align_recombination: bool = True
     # List of prior-iter per_candidate_metrics.json paths, in iter order.
     # Phase script populates this; acquire derives snapshots_json dirs from it
     # to recover well coords for the elite path.
@@ -2469,15 +2485,25 @@ def _run_acquisition_cma_surrogate(
         out[valid_idx] = _predict_all_geos(coords_arr[valid_idx], batches)
         return out
 
+    # ----- Multistart: K independent COLD CMA restarts (distinct seeds -> distinct
+    # LHS cold means -> distinct basins). n_cma_starts=1 = single-run (back-compat).
+    # Validated in analysis/multistart_elite_vs_random_ix (FINDINGS.md).
+    n_cma_starts = max(1, int(getattr(cfg, "n_cma_starts", 1)))
+    n_elite_per_start = max(1, int(getattr(cfg, "n_elite_per_start", 1)))
+
     # ----- Optional: seed CMA mean from the best real-revenue incumbent --------
     # Gated on cfg.cma_warm_start (default False): the cma_trajectory_long IX
     # experiment showed warm-starting from the incumbent over-exploits the
     # surrogate's exploit regime, so we default to a cold LHS restart each
-    # iteration (mean_init stays None).
+    # iteration (mean_init stays None). In multistart mode warm-start is ignored
+    # entirely — diverse cold basins are the whole point.
     mean_init = None
     seed_incumbent_id: str | None = None
     seed_incumbent_iter: int | None = None
-    if cfg.cma_warm_start and iteration >= 1 and cfg.prior_metrics:
+    if n_cma_starts > 1 and cfg.cma_warm_start:
+        print(f"[acquire-cma] NOTE: cma_warm_start ignored in multistart mode "
+              f"(n_cma_starts={n_cma_starts}); all starts use cold LHS restarts.", flush=True)
+    elif cfg.cma_warm_start and iteration >= 1 and cfg.prior_metrics:
         elite_triples = _load_elite_seeds_ensemble(
             prior_metrics=list(cfg.prior_metrics or []), k=1, rng=rng, objective=objective,
         )
@@ -2503,15 +2529,8 @@ def _run_acquisition_cma_surrogate(
             base[:, 2] = 0.5 * (z_lo_eff + z_hi_eff)
             mean_init = base.reshape(-1)
 
-    opt = build_optimizer(
-        "cmaes",
-        num_wells=num_wells, nx=nx, ny=ny, edge_buffer=int(cfg.edge_buffer),
-        popsize=popsize, seed=int(cfg.seed) + int(iteration),
-        valid_xy_indices=valid_xy_indices,
-        depth_bounds=(z_lo_eff, z_hi_eff),
-        sigma_init=float(cfg.cma_sigma_init),
-        mean_init=mean_init,
-    )
+    # The optimizer is constructed per-start inside the multistart loop below (after
+    # _candidate_scores is defined) so each cold start gets its own CMA instance.
 
     def _candidate_scores(coords_np: np.ndarray, preds: np.ndarray):
         """Map (popsize, K) revenue preds -> (score (popsize,), npv_rows).
@@ -2559,27 +2578,55 @@ def _run_acquisition_cma_surrogate(
 
     # Pool keeps each finite candidate's coords AND its accurate per-geology
     # prediction row, so the emit step reuses them with no recompute. In npv mode
-    # pool_npv carries the per-geology NPV row (None in revenue mode).
+    # pool_npv carries the per-geology NPV row (None in revenue mode). pool_start /
+    # pool_gen tag each candidate with its originating cold start + generation so
+    # multistart selection can pick each start's converged (final-gen) elites.
     pool_coords: list[np.ndarray] = []   # each (num_wells, 3)
     pool_preds: list[np.ndarray] = []    # each (K,) accurate per-geology revenue row
     pool_emv: list[float] = []           # the candidate SCORE (NPV in npv mode, else revenue)
     pool_npv: list[Any] = []             # each (K,) per-geology NPV row, or None
+    pool_start: list[int] = []           # which cold start produced this candidate
+    pool_gen: list[int] = []             # which generation within that start
     t0 = time.perf_counter()
-    for _gen in range(int(cfg.cma_generations)):
-        coords = opt.ask()  # (popsize, num_wells, 3), projected to valid cells
-        preds = _predict_rebuilt(coords)  # (popsize, K) — ACCURATE graphs
-        emv, npv_rows = _candidate_scores(coords, preds)
-        opt.tell(coords, emv)
-        for i in range(popsize):
-            if np.isfinite(emv[i]) and np.isfinite(preds[i]).all():
-                pool_coords.append(coords[i].astype(np.float32).copy())
-                pool_preds.append(preds[i].astype(np.float32).copy())
-                pool_emv.append(float(emv[i]))
-                pool_npv.append(npv_rows[i].astype(np.float32).copy() if npv_rows is not None else None)
+    for start_idx in range(n_cma_starts):
+        # Distinct seed per (iteration, start) -> distinct LHS cold mean -> distinct
+        # basin. With n_cma_starts==1 this is exactly the prior seed (cfg.seed+iteration).
+        start_seed = int(cfg.seed) + int(iteration) * n_cma_starts + start_idx
+        opt = build_optimizer(
+            "cmaes",
+            num_wells=num_wells, nx=nx, ny=ny, edge_buffer=int(cfg.edge_buffer),
+            popsize=popsize, seed=start_seed,
+            valid_xy_indices=valid_xy_indices,
+            depth_bounds=(z_lo_eff, z_hi_eff),
+            sigma_init=float(cfg.cma_sigma_init),
+            mean_init=mean_init,
+            # Permutation-invariant recombination (see AcquisitionConfig.align_recombination).
+            # well_groups: 0=injector, 1=producer — only same-type wells are reassigned.
+            align_recombination=bool(getattr(cfg, "align_recombination", True)),
+            well_groups=np.array([0 if w.type == "injector" else 1 for w in cfg.wells], dtype=int),
+        )
+        for _gen in range(int(cfg.cma_generations)):
+            coords = opt.ask()  # (popsize, num_wells, 3), projected to valid cells
+            preds = _predict_rebuilt(coords)  # (popsize, K) — ACCURATE graphs
+            emv, npv_rows = _candidate_scores(coords, preds)
+            opt.tell(coords, emv)
+            for i in range(popsize):
+                if np.isfinite(emv[i]) and np.isfinite(preds[i]).all():
+                    pool_coords.append(coords[i].astype(np.float32).copy())
+                    pool_preds.append(preds[i].astype(np.float32).copy())
+                    pool_emv.append(float(emv[i]))
+                    pool_npv.append(npv_rows[i].astype(np.float32).copy() if npv_rows is not None else None)
+                    pool_start.append(start_idx)
+                    pool_gen.append(_gen)
+        if n_cma_starts > 1:
+            print(f"[acquire-cma] cold start {start_idx + 1}/{n_cma_starts} "
+                  f"(seed={start_seed}) done; cumulative finite pool={len(pool_coords)}.", flush=True)
     timings["cma_loop_s"] = time.perf_counter() - t0
     timings["cma_generations"] = float(cfg.cma_generations)
     timings["cma_popsize"] = float(popsize)
-    timings["graph_builds"] = float(int(cfg.cma_generations) * popsize * K)
+    timings["n_cma_starts"] = float(n_cma_starts)
+    timings["n_elite_per_start"] = float(n_elite_per_start)
+    timings["graph_builds"] = float(n_cma_starts * int(cfg.cma_generations) * popsize * K)
     timings["pool_size"] = float(len(pool_coords))
     if drop_stats["n_dropped"]:
         print(
@@ -2596,7 +2643,37 @@ def _run_acquisition_cma_surrogate(
         )
 
     # ----- Exploit picks: top accurate-EMV, de-duplicated by xy layout --------
-    order = np.argsort(-np.asarray(pool_emv))
+    # Single start: rank the whole (all-gens) pool by EMV (prior behavior). Multistart:
+    # lead with each start's CONVERGED elites (top-n_elite_per_start of its FINAL-gen
+    # population by EMV) so genuinely-different basins are preferred, then backfill with
+    # the rest of the pool by EMV. Both orderings feed the same xy-dedup below.
+    pool_emv_arr = np.asarray(pool_emv)
+    if n_cma_starts > 1:
+        pool_start_arr = np.asarray(pool_start)
+        pool_gen_arr = np.asarray(pool_gen)
+        final_gen = int(cfg.cma_generations) - 1
+        elite_idx_list: list[int] = []
+        for s in range(n_cma_starts):
+            in_start = np.where(pool_start_arr == s)[0]
+            if in_start.size == 0:
+                continue  # this start produced no finite candidate (all dead-rock)
+            fin = in_start[pool_gen_arr[in_start] == final_gen]
+            cand = fin if fin.size > 0 else in_start  # fallback: best over all gens
+            cand_sorted = cand[np.argsort(-pool_emv_arr[cand])]
+            elite_idx_list.extend(int(i) for i in cand_sorted[:n_elite_per_start])
+        elite_idx = np.array(elite_idx_list, dtype=int)
+        elite_order = elite_idx[np.argsort(-pool_emv_arr[elite_idx])] if elite_idx.size else elite_idx
+        is_elite = np.zeros(len(pool_coords), dtype=bool)
+        if elite_idx.size:
+            is_elite[elite_idx] = True
+        rest = np.where(~is_elite)[0]
+        rest_order = rest[np.argsort(-pool_emv_arr[rest])]
+        order = np.concatenate([elite_order, rest_order]).astype(int)
+        print(f"[acquire-cma] multistart selection: {len(elite_idx)} per-start elites "
+              f"(top-{n_elite_per_start} final-gen across {n_cma_starts} starts) lead the exploit "
+              f"order; rest of pool ({rest.size}) backfills.", flush=True)
+    else:
+        order = np.argsort(-pool_emv_arr)
     exploit_idx = _dedup_indices_by_xy(pool_coords, order, num_wells, n_exploit, min_xy_dist=4.0)
     if len(exploit_idx) < n_exploit:
         print(
@@ -2670,12 +2747,12 @@ def _run_acquisition_cma_surrogate(
 
     # ----- Assemble emit list (exploit first, then frontier), reusing the
     # accurate per-geology predictions computed during the search/frontier. -----
-    emit_entries: list[tuple[np.ndarray, str, np.ndarray, Any]] = []
+    emit_entries: list[tuple[np.ndarray, str, np.ndarray, Any, int]] = []
     for i in exploit_idx:
-        emit_entries.append((pool_coords[i], "exploit", pool_preds[i], pool_npv[i]))
+        emit_entries.append((pool_coords[i], "exploit", pool_preds[i], pool_npv[i], int(pool_start[i])))
     for c, p, npvr in zip(frontier_coords, frontier_preds, frontier_npv):
         if np.isfinite(p).all():
-            emit_entries.append((c, "frontier", p, npvr))
+            emit_entries.append((c, "frontier", p, npvr, -1))
     if not emit_entries:
         raise RuntimeError("cma_surrogate: no finite candidates to emit.")
     npv_mode = (objective == "npv")
@@ -2684,7 +2761,7 @@ def _run_acquisition_cma_surrogate(
     snapshots: list[dict[str, Any]] = []
     candidates: list[Candidate] = []
     t0 = time.perf_counter()
-    for m, (cxyz, kind, pred_row, npv_row) in enumerate(emit_entries):
+    for m, (cxyz, kind, pred_row, npv_row, src_start) in enumerate(emit_entries):
         if not np.isfinite(pred_row).all() or not np.isfinite(cxyz).all():
             print(f"[acquire-cma] skip non-finite candidate m={m} kind={kind}", flush=True)
             continue
@@ -2762,6 +2839,7 @@ def _run_acquisition_cma_surrogate(
             to_julia_wells_text=ctx.to_julia_wells_text,
             extra_fields=extra_fields,
         )
+        snap["source_start"] = int(src_start)  # which cold CMA start (>=0); -1 = frontier
         snapshots.append(snap)
         candidates.append(_snapshot_to_candidate_ensemble(snap, cxyz, is_injector_list))
     timings["snapshot_io_s"] = time.perf_counter() - t0
@@ -2791,6 +2869,8 @@ def _run_acquisition_cma_surrogate(
         "cma_popsize": int(cfg.cma_popsize),
         "cma_generations": int(cfg.cma_generations),
         "cma_sigma_init": float(cfg.cma_sigma_init),
+        "n_cma_starts": int(n_cma_starts),
+        "n_elite_per_start": int(n_elite_per_start),
         "depth_bounds": [int(z_lo_eff), int(z_hi_eff)],
         "n_exploit": cfg.n_exploit,
         "n_frontier": cfg.n_frontier,

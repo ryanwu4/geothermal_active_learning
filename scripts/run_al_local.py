@@ -822,6 +822,8 @@ def _acquire_and_select_locally(
         cma_generations=int(acq_cfg.get("cma_generations", 10)),
         cma_sigma_init=float(acq_cfg.get("cma_sigma_init", 5.0)),
         cma_warm_start=bool(acq_cfg.get("cma_warm_start", False)),
+        n_cma_starts=int(acq_cfg.get("n_cma_starts", 1)),
+        n_elite_per_start=int(acq_cfg.get("n_elite_per_start", 1)),
         prior_metrics=prior_metrics,
         mode=mode,
         n_exploit=int(acq_cfg.get("n_exploit", 0)),

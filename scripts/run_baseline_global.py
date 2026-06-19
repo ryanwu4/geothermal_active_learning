@@ -650,10 +650,15 @@ def _build_or_load_optimizer(
     opt_cfg = cfg["optimizer"]
     num_wells = len(cfg["wells"])
     depth_bounds = _resolve_depth_bounds(opt_cfg, nz_min)
+    # Permutation-invariant recombination (Hungarian alignment within well-type
+    # groups). ON by default; set optimizer.align_recombination=false to reproduce
+    # pre-alignment runs. well_groups: 0=injector, 1=producer.
+    align_recombination = bool(opt_cfg.get("align_recombination", True))
+    well_groups = np.array([0 if inj else 1 for inj in _wells_is_injector(cfg)], dtype=int)
     print(f"[baseline-driver] building optimizer "
           f"(type={opt_cfg.get('type', 'cmaes')}, popsize={opt_cfg['popsize']}, "
           f"num_wells={num_wells}, z ∈ [{depth_bounds[0]}, {depth_bounds[1]}], "
-          f"nz_min={nz_min})")
+          f"nz_min={nz_min}, align_recombination={align_recombination})")
     return build_optimizer(
         kind=str(opt_cfg.get("type", "cmaes")),
         num_wells=num_wells,
@@ -664,6 +669,8 @@ def _build_or_load_optimizer(
         valid_xy_indices=valid_xy,
         depth_bounds=depth_bounds,
         sigma_init=float(opt_cfg.get("sigma_init", 5.0)),
+        align_recombination=align_recombination,
+        well_groups=well_groups,
     )
 
 
