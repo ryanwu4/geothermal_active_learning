@@ -1981,12 +1981,16 @@ def plot_best_well_config(run_root: Path, well_rows: list[dict], out_dir: Path,
                 permx = gf["Input"]["PermX"]
                 active = gf["Input"]["IsActive"]
                 k = max(0, min(permx.shape[0] - 1, int(z_slice)))
-                slab = permx[k, :, :].astype(float)
+                slab = permx[k, :, :].astype(float)   # (axis1 = Julia j = well x, axis2 = Julia i = well y)
                 mask = active[k, :, :] > 0
             with np.errstate(invalid="ignore"):
                 slab_masked = np.where(mask & (slab > 0), slab, np.nan)
-                background = np.log10(slab_masked)
-            ny, nx = background.shape
+                # Transpose to (y, x) display frame so a well scattered at (x, y) sits on
+                # PermX[k, x, y]. Without .T the background is BOTH transposed and stretched
+                # (the two horizontal axes differ in size, e.g. 70 vs 76). Mirrors the
+                # reference impl in inference/run_ensemble_active_learning.py.
+                background = np.log10(slab_masked).T
+            nx, ny = slab.shape   # nx = axis1 (well x), ny = axis2 (well y)
             z_slice = k
         except Exception as e:
             print(f"  warning: could not load geology background: {e}")

@@ -292,7 +292,13 @@ def _build_static_batch_for_starts(
                 ix, iy = int(round(w["x"])), int(round(w["y"]))
                 ix = int(np.clip(ix, 0, nx - 1))
                 iy = int(np.clip(iy, 0, ny - 1))
-                for z in range(int(w["depth"])):
+                # Perforate Python layers 0..round(depth) to match the IX deck /
+                # Julia stamper (k_idx = round(z)+1, is_well[:k_idx]) and the training
+                # compiled H5. range(int(depth)) was one layer too shallow (0..D-1),
+                # so the surrogate scored a shallower well than IX simulated. Clamp to
+                # the modeled cube depth (z_cutoff) for safety.
+                k_perf = min(int(round(float(w["depth"]))) + 1, z_cutoff)
+                for z in range(k_perf):
                     if temp0_full[z, ix, iy] <= -900:
                         is_well[z, ix, iy] = -999
                         inj_rate[z, ix, iy] = -999
