@@ -38,6 +38,7 @@ import h5py  # noqa: E402
 import numpy as np  # noqa: E402
 
 from orchestrator.ingest import _run_preprocess_h5, _read_real_revenue  # type: ignore  # noqa: E402
+from orchestrator.emv import strict_emv  # noqa: E402
 from orchestrator.paths import resolve_run_paths  # noqa: E402
 from orchestrator.state import IterationRecord, RunState  # noqa: E402
 
@@ -159,10 +160,14 @@ def main() -> int:
                 continue
             per_geo[geo_idx] = float(real)
 
-        if per_geo:
-            ensemble_mean = float(np.mean(list(per_geo.values())))
-        else:
-            ensemble_mean = float("nan")
+        # STRICT EMV: throw out the whole config if ANY geology failed. ``per_geo`` holds only the
+        # geologies that produced a finite revenue; ``snap_tasks`` enumerates every geology this
+        # config was meant to run (15). strict_emv returns the mean iff all of them succeeded
+        # (equivalently n_failed_geos == 0), else None -> NaN here so the existing
+        # ``np.isfinite(ensemble_mean)`` guards below exclude the config from best-in-batch and the
+        # per_candidate_emv map. See orchestrator.emv for the rationale (survivor-mean was biased).
+        emv_strict = strict_emv(per_geo.values(), expected_k=len(snap_tasks))
+        ensemble_mean = float("nan") if emv_strict is None else float(emv_strict)
 
         # Pull coords from snapshot JSON if available so the local driver can
         # confirm what the optimizer actually proposed (and recover state from
@@ -226,10 +231,15 @@ def main() -> int:
     for snap, cand in zip(snapshots, candidates_payload):
         sid = str(snap.get("snapshot_id", ""))
         # Capture EMV (ensemble mean) for the iteration record's
-        # per_candidate_emv map — AL plots key off this for some panels.
+        # per_candidate_emv map — AL plots key off this for some panels. Under the strict rule
+        # ``ensemble_mean_revenue`` is NaN for any config with a failed geology, so this naturally
+        # drops it from per_candidate_emv. ``emv_finite`` is None (NOT NaN) for those configs so the
+        # terminal_* row fields below follow the "None not NaN" convention (a NaN would slip past the
+        # plots' ``is not None`` guards and contaminate KDE grids).
         emv = cand.get("ensemble_mean_revenue")
-        if emv is not None and np.isfinite(emv):
-            per_candidate_emv[sid] = float(emv)
+        emv_finite = float(emv) if (emv is not None and np.isfinite(emv)) else None
+        if emv_finite is not None:
+            per_candidate_emv[sid] = emv_finite
         # Build one row per geology IX run.
         for t in tasks_by_snap.get(sid, []):
             geo_idx = int(t.get("geology_index", -1))
@@ -265,9 +275,9 @@ def main() -> int:
                 # Plots that genuinely compare pred-vs-real (pred_real_kde_shift_ensemble,
                 # scatter_pred_vs_real_ensemble) will collapse to y=x — accurate
                 # for a no-surrogate baseline, not misleading.
-                "terminal_predicted_emv": cand.get("ensemble_mean_revenue"),
+                "terminal_predicted_emv": emv_finite,
                 "seed_real_emv": None,
-                "terminal_real_emv": cand.get("ensemble_mean_revenue"),
+                "terminal_real_emv": emv_finite,
             }
             per_candidate_rows.append(row)
 

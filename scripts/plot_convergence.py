@@ -27,6 +27,12 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
+# Make ``orchestrator`` importable when this script is run directly (sys.path[0] is scripts/).
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+from orchestrator import emv as _emv  # noqa: E402  (strict ensemble-EMV recomputation)
+
 # Manim-flavored palette (mirrors inference/run_ensemble_active_learning.py).
 MANIM_BG = "#000000"
 MANIM_BLUE = "#58C4DD"
@@ -979,6 +985,12 @@ def plot_pred_real_gap(rows: list[dict], out_dir: Path) -> None:
     """
     if not rows:
         return
+    # STRICT gate: on ensemble iterations (K>1), only count a candidate whose ensemble is complete
+    # (all K geologies finite); a config with any failed geology is thrown out rather than averaged
+    # over survivors. Per-geology iterations (K<=1) are ungated. ``strict_emv_map`` lists the
+    # surviving snapshots per iter; ``k_by_iter`` distinguishes ensemble vs per-geology iters.
+    strict_emv_map = _strict_per_candidate_emv_by_iter(rows, "real_revenue")
+    k_by_iter = {it: _emv.expected_k_for_run(irows) for it, irows in _rows_by_iter(rows).items()}
     # Collapse per-geology rows to one (pred_emv, real_emv) per (iter, snapshot).
     by_iter_snap: dict[tuple[int, str], list[tuple[float, float]]] = {}
     for i, r in enumerate(rows):
@@ -986,7 +998,10 @@ def plot_pred_real_gap(rows: list[dict], out_dir: Path) -> None:
         if p is None or q is None or not (np.isfinite(p) and np.isfinite(q)):
             continue
         it = int(r["iteration"])
-        sid = r.get("snapshot_id") or f"_row{i}"  # fall back to per-row if no id
+        raw_sid = r.get("snapshot_id")
+        sid = raw_sid or f"_row{i}"  # fall back to per-row if no id
+        if raw_sid and k_by_iter.get(it, 0) > 1 and str(raw_sid) not in strict_emv_map.get(it, {}):
+            continue  # ensemble candidate thrown out (a geology failed)
         by_iter_snap.setdefault((it, sid), []).append((float(p), float(q)))
     if not by_iter_snap:
         return
@@ -2262,13 +2277,97 @@ def plot_run_failure_diagnostics(run_root: Path, history: list[dict], out_dir: P
 # -----------------------------------------------------------------------------
 
 
-def _per_iter_emv_by_kind(rows: list[dict]) -> dict[int, dict[str, list[float]]]:
-    """Group rows by (iteration, kind) and compute per-candidate EMV.
+# -----------------------------------------------------------------------------
+# Strict ensemble-EMV recomputation (plot time)
+#
+# These recompute EMV from the per-geology ``real_revenue`` rows under the STRICT rule
+# (orchestrator.emv): a config's EMV is defined only if ALL K geologies in its ensemble produced a
+# finite value; any failed/missing geology throws out the whole config. They deliberately do NOT
+# trust the stored ``terminal_real_emv`` or the state-history ``best_emv_*`` (those were written with
+# the older, biased survivor-mean rule), so re-running this script regenerates strict figures from
+# the existing per_candidate_metrics.json WITHOUT mutating any run artifact. In NPV-objective runs
+# ``real_revenue`` has already been rebound to the NPV value by ``_apply_npv_objective``, so the same
+# helpers yield strict NPV EMV with no NPV-specific branching.
+# -----------------------------------------------------------------------------
 
-    Returns a nested dict {iter: {kind: [emv, ...]}}. EMV per candidate is the
-    mean of real_revenue across all rows sharing the same snapshot_id within an
-    iteration. Iterations without any multi-row snapshots are skipped (those
-    are per-geology iterations and don't have an EMV interpretation).
+
+def _rows_by_iter(rows: list[dict]) -> dict[int, list[dict]]:
+    by_iter: dict[int, list[dict]] = {}
+    for r in rows:
+        it = r.get("iteration")
+        if it is None:
+            continue
+        by_iter.setdefault(int(it), []).append(r)
+    return by_iter
+
+
+def _strict_per_candidate_emv_by_iter(
+    rows: list[dict], value_key: str = "real_revenue"
+) -> dict[int, dict[str, float]]:
+    """{iter: {snapshot_id: strict_emv}} computed per iteration.
+
+    K (the ensemble size) is inferred PER ITERATION so per-geology seed iters (K=1) and full-ensemble
+    iters (K=15) are each judged against their own size. Snapshots that fail the strict check
+    (any failed/missing geology) are omitted from the inner dict.
+    """
+    out: dict[int, dict[str, float]] = {}
+    for it, irows in _rows_by_iter(rows).items():
+        k = _emv.expected_k_for_run(irows)
+        if k <= 0:
+            out[it] = {}
+            continue
+        by_snap: dict[str, list[dict]] = {}
+        for r in irows:
+            sid = r.get("snapshot_id")
+            if not sid:
+                continue
+            by_snap.setdefault(str(sid), []).append(r)
+        emv_map: dict[str, float] = {}
+        for sid, srows in by_snap.items():
+            v = _emv.strict_per_snapshot_emv(srows, value_key, expected_k=k)
+            if v is not None:
+                emv_map[sid] = float(v)
+        out[it] = emv_map
+    return out
+
+
+def _strict_best_emv_trajectory(
+    rows: list[dict], value_key: str = "real_revenue"
+) -> tuple[list[int], list[float | None], list[float | None]]:
+    """(iters, best_in_batch, best_so_far) from strict per-candidate EMVs, ensemble iters only.
+
+    ``best_in_batch[i]`` is the max strict EMV among iter i's surviving snapshots, or ``None`` if
+    every config that iteration was thrown out. ``best_so_far`` carries the running max forward
+    across ``None`` gaps (a wiped-out iteration holds the line, it never drops to 0). Only ensemble
+    iterations (K > 1) are emitted, so per-geology seed iters don't masquerade as EMV points.
+    """
+    per_iter = _strict_per_candidate_emv_by_iter(rows, value_key)
+    by_iter = _rows_by_iter(rows)
+    iters_out: list[int] = []
+    in_batch: list[float | None] = []
+    so_far: list[float | None] = []
+    run_max: float | None = None
+    for it in sorted(per_iter.keys()):
+        if _emv.expected_k_for_run(by_iter.get(it, [])) <= 1:
+            continue  # per-geology iteration — no ensemble-EMV interpretation
+        emv_map = per_iter.get(it, {})
+        b = max(emv_map.values()) if emv_map else None
+        if b is not None:
+            run_max = b if run_max is None else max(run_max, b)
+        iters_out.append(it)
+        in_batch.append(b)
+        so_far.append(run_max)
+    return iters_out, in_batch, so_far
+
+
+def _per_iter_emv_by_kind(rows: list[dict]) -> dict[int, dict[str, list[float]]]:
+    """Group rows by (iteration, kind) and compute per-candidate STRICT EMV.
+
+    Returns a nested dict {iter: {kind: [emv, ...]}}. EMV per candidate is the strict ensemble mean
+    of real_revenue across that snapshot's K geology rows (orchestrator.emv): a config with any
+    failed/missing geology is dropped entirely rather than averaged over its survivors. Iterations
+    without any multi-row snapshots are skipped (those are per-geology iterations with no EMV
+    interpretation).
     """
     by_iter_snap: dict[int, dict[str, list[dict]]] = {}
     for r in rows:
@@ -2282,15 +2381,14 @@ def _per_iter_emv_by_kind(rows: list[dict]) -> dict[int, dict[str, list[float]]]
         any_multi = any(len(rs) > 1 for rs in snap_map.values())
         if not any_multi:
             continue
+        k = _emv.expected_k_for_run([r for rs in snap_map.values() for r in rs])
         kind_to_emvs: dict[str, list[float]] = {}
         for sid, rs in snap_map.items():
-            reals = [float(v) if (v := r.get("real_revenue")) is not None else float("nan") for r in rs]
-            reals = [v for v in reals if np.isfinite(v)]
-            if not reals:
-                continue
-            emv = float(np.mean(reals))
+            v = _emv.strict_per_snapshot_emv(rs, "real_revenue", expected_k=k)
+            if v is None:
+                continue  # config thrown out (a geology failed)
             kind = str(rs[0].get("kind", "frontier"))
-            kind_to_emvs.setdefault(kind, []).append(emv)
+            kind_to_emvs.setdefault(kind, []).append(float(v))
         if kind_to_emvs:
             out[it] = kind_to_emvs
     return out
@@ -2349,14 +2447,23 @@ def plot_emv_distribution(history: list[dict], rows: list[dict], out_dir: Path) 
                 parts["cmedians"].set_color(color)
         ax.plot([], [], color=color, marker="o", linestyle="None", label=kind)
 
-    # Best-EMV-so-far overlay.
-    best_emv_iters = [int(r["iteration"]) for r in history if r.get("best_emv_so_far") is not None]
-    best_emv_vals = [float(r["best_emv_so_far"]) for r in history if r.get("best_emv_so_far") is not None]
+    # Best-EMV-so-far overlay (STRICT, recomputed from per-geology rows — not the stored
+    # history, which used the older survivor-mean rule). ``traj_iters`` spans EVERY ensemble
+    # iteration, including any where all configs were thrown out (no violin/scatter is drawn
+    # there, leaving a visible blank slot on the axis).
+    traj_iters, _ib, traj_so_far = _strict_best_emv_trajectory(rows)
+    best_emv_iters = [it for it, v in zip(traj_iters, traj_so_far) if v is not None]
+    best_emv_vals = [float(v) for v in traj_so_far if v is not None]
     if best_emv_iters:
         ax.plot(best_emv_iters, best_emv_vals, color=MANIM_WHITE, linewidth=1.5,
                 label="best EMV so far")
 
-    ax.set_xticks(iters_sorted)
+    # Pin x-ticks to the full ensemble-iteration range so iterations with no surviving config
+    # (every geology failed) keep a blank x-slot rather than collapsing out of the axis.
+    xticks = traj_iters or iters_sorted
+    ax.set_xticks(xticks)
+    if xticks:
+        ax.set_xlim(min(xticks) - 0.5, max(xticks) + 0.5)
     ax.set_xlabel("AL iteration")
     ax.set_ylabel(f"Real EMV (mean {OBJ_LABEL} across ensemble)")
     ax.set_title("Per-snapshot real EMV distribution by kind (mean over K geologies)")
@@ -2461,25 +2568,44 @@ def plot_pes_distribution(history: list[dict], rows: list[dict], out_dir: Path) 
     _save(fig, out_dir / "pes_distribution.png")
 
 
-def plot_best_emv_so_far(history: list[dict], out_dir: Path) -> None:
-    """Single line: running best real EMV across iterations."""
-    iters = [int(r["iteration"]) for r in history if r.get("best_emv_so_far") is not None]
-    vals = [float(r["best_emv_so_far"]) for r in history if r.get("best_emv_so_far") is not None]
+def plot_best_emv_so_far(history: list[dict], rows: list[dict], out_dir: Path) -> None:
+    """Single line: running best real EMV across iterations.
+
+    STRICT: the trajectory is recomputed from the per-geology rows (orchestrator.emv), so iterations
+    whose batch-best was a config with a failed geology no longer count — the curve reflects only
+    configs that completed all K geologies. Does not trust the stored survivor-mean history.
+    """
+    traj_iters, in_batch_all, so_far_all = _strict_best_emv_trajectory(rows)
     fig, ax = plt.subplots(figsize=(8, 4))
     _style_ax(ax)
-    if not iters:
+    if not traj_iters:
         ax.text(0.5, 0.5, "No ensemble-mode iterations yet", ha="center", va="center", color=MANIM_GREY)
         ax.set_axis_off()
         _save(fig, out_dir / "best_emv_so_far.png")
         return
-    ax.plot(iters, vals, color=MANIM_BLUE, marker="o", linewidth=2.0, markersize=6)
-    # In-batch best per iter as a dimmer trace, for context on volatility.
-    in_batch_iters = [int(r["iteration"]) for r in history if r.get("best_emv_in_batch") is not None]
-    in_batch_vals = [float(r["best_emv_in_batch"]) for r in history if r.get("best_emv_in_batch") is not None]
-    if in_batch_iters:
-        ax.plot(in_batch_iters, in_batch_vals, color=MANIM_ORANGE, marker="x",
+    # Keep EVERY ensemble iteration's x-slot, even iterations where every config was thrown out
+    # (best_in_batch is None there because all configs had a failed geology). Plot None as NaN so
+    # the line breaks into a visible GAP at the wiped iteration rather than connecting across it,
+    # and pin the x-ticks/limits to the full iteration range so the blank slot stays on the axis.
+    # best_so_far carries forward across such gaps (a flat hold), so only leading all-wiped iters
+    # leave a gap in the running-best line.
+    so_far_y = [np.nan if v is None else float(v) for v in so_far_all]
+    in_batch_y = [np.nan if v is None else float(v) for v in in_batch_all]
+    if not any(np.isfinite(so_far_y)):
+        ax.text(0.5, 0.5, "No complete-ensemble configs yet (all iterations had a failed geology)",
+                ha="center", va="center", color=MANIM_GREY)
+        ax.set_axis_off()
+        _save(fig, out_dir / "best_emv_so_far.png")
+        return
+    ax.plot(traj_iters, so_far_y, color=MANIM_BLUE, marker="o", linewidth=2.0, markersize=6,
+            label="best EMV so far")
+    # In-batch best per iter as a dimmer trace, for context on volatility (gaps at wiped iters).
+    if any(np.isfinite(in_batch_y)):
+        ax.plot(traj_iters, in_batch_y, color=MANIM_ORANGE, marker="x",
                 linewidth=1.0, alpha=0.7, label="best EMV in batch")
-        ax.legend(loc="lower right")
+    ax.legend(loc="lower right")
+    ax.set_xticks(traj_iters)
+    ax.set_xlim(min(traj_iters) - 0.5, max(traj_iters) + 0.5)
     ax.set_xlabel("AL iteration")
     ax.set_ylabel("Real EMV")
     ax.set_title("Best ensemble EMV (running)")
@@ -2509,6 +2635,7 @@ def _ensemble_snapshot_rows(rows: list[dict]) -> list[dict]:
     Returns dicts with: iteration, kind, snapshot_id, terminal_predicted_emv,
     terminal_real_emv (= mean over K real_revenues for that snapshot).
     """
+    k_by_iter = {it: _emv.expected_k_for_run(irows) for it, irows in _rows_by_iter(rows).items()}
     by_iter_snap: dict[tuple[int, str], list[dict]] = {}
     for r in rows:
         sid = r.get("snapshot_id")
@@ -2526,25 +2653,17 @@ def _ensemble_snapshot_rows(rows: list[dict]) -> list[dict]:
             tp = float("nan")
         if not np.isfinite(tp):
             continue  # not an ensemble snapshot
-        reals = []
-        for r in rs:
-            rv = r.get("real_revenue")
-            if rv is None:
-                continue
-            try:
-                rvf = float(rv)
-            except (TypeError, ValueError):
-                continue
-            if np.isfinite(rvf):
-                reals.append(rvf)
-        term_real = float(np.mean(reals)) if reals else None
+        # STRICT: None unless ALL K geologies are finite — a config with any failed geology is
+        # thrown out of the ensemble pred-vs-real panels (downstream finite-guards drop the None).
+        term_real = _emv.strict_per_snapshot_emv(rs, "real_revenue", expected_k=k_by_iter.get(it, 0))
+        n_geos = sum(1 for r in rs if _emv._is_finite(r.get("real_revenue")))
         out.append({
             "iteration": it,
             "kind": first.get("kind", "?"),
             "snapshot_id": sid,
             "terminal_predicted_emv": tp,
             "terminal_real_emv": term_real,
-            "n_geos": len(reals),
+            "n_geos": n_geos,
         })
     return out
 
@@ -2555,6 +2674,8 @@ def _exploit_seed_rows(rows: list[dict]) -> list[dict]:
     Returns dicts with keys: iteration, snapshot_id, seed_predicted_emv,
     terminal_predicted_emv, seed_real_emv, terminal_real_emv.
     """
+    # Per-iter K from ALL rows (the full ensemble), computed before filtering to exploit-only.
+    k_by_iter = {it: _emv.expected_k_for_run(irows) for it, irows in _rows_by_iter(rows).items()}
     by_iter_snap: dict[tuple[int, str], list[dict]] = {}
     for r in rows:
         if str(r.get("kind", "")) != "exploit":
@@ -2572,9 +2693,8 @@ def _exploit_seed_rows(rows: list[dict]) -> list[dict]:
         seed_pred = first.get("seed_predicted_emv")
         term_pred = first.get("terminal_predicted_emv")
         seed_real = first.get("seed_real_emv")
-        reals = [float(v) if (v := r.get("real_revenue")) is not None else float("nan") for r in rs]
-        reals = [v for v in reals if np.isfinite(v)]
-        term_real = float(np.mean(reals)) if reals else None
+        # STRICT: None unless ALL K geologies are finite (config with any failed geology is dropped).
+        term_real = _emv.strict_per_snapshot_emv(rs, "real_revenue", expected_k=k_by_iter.get(it, 0))
         out.append({
             "iteration": it,
             "snapshot_id": sid,
@@ -2692,14 +2812,20 @@ def plot_exploit_seed_vs_terminal_real(rows: list[dict], out_dir: Path) -> None:
     )
 
 
-def plot_exploit_emv_progression(history: list[dict], out_dir: Path) -> None:
-    """Per-iter exploit_best_emv vs running best_emv_so_far."""
+def plot_exploit_emv_progression(history: list[dict], rows: list[dict], out_dir: Path) -> None:
+    """Per-iter exploit_best_emv vs running best_emv_so_far.
+
+    The "best so far (any kind)" line is recomputed STRICTly from per-geology rows (orchestrator.emv)
+    to stay consistent with best_emv_so_far.png; the exploit cohort line is left from history (it
+    only exists for surrogate runs, which have no failed geologies, so strict == survivor there).
+    """
     fig, ax = plt.subplots(figsize=(8, 4))
     _style_ax(ax)
     iters_ex = [int(r["iteration"]) for r in history if r.get("exploit_best_emv") is not None]
     vals_ex = [float(r["exploit_best_emv"]) for r in history if r.get("exploit_best_emv") is not None]
-    iters_bo = [int(r["iteration"]) for r in history if r.get("best_emv_so_far") is not None]
-    vals_bo = [float(r["best_emv_so_far"]) for r in history if r.get("best_emv_so_far") is not None]
+    traj_iters, _ib, traj_so_far = _strict_best_emv_trajectory(rows)
+    iters_bo = [it for it, v in zip(traj_iters, traj_so_far) if v is not None]
+    vals_bo = [float(v) for v in traj_so_far if v is not None]
     if not iters_ex and not iters_bo:
         ax.text(0.5, 0.5, "No ensemble-mode iterations yet",
                 ha="center", va="center", color=MANIM_GREY)
@@ -2888,10 +3014,10 @@ def main() -> int:
                                                            rows=rows, npv_ctx=npv_ctx)),
         ("emv_distribution", lambda: plot_emv_distribution(history, rows, out_dir)),
         ("pes_distribution", lambda: plot_pes_distribution(history, rows, out_dir)),
-        ("best_emv_so_far", lambda: plot_best_emv_so_far(history, out_dir)),
+        ("best_emv_so_far", lambda: plot_best_emv_so_far(history, rows, out_dir)),
         ("exploit_seed_vs_terminal_predicted", lambda: plot_exploit_seed_vs_terminal_predicted(rows, out_dir)),
         ("exploit_seed_vs_terminal_real", lambda: plot_exploit_seed_vs_terminal_real(rows, out_dir)),
-        ("exploit_emv_progression", lambda: plot_exploit_emv_progression(history, out_dir)),
+        ("exploit_emv_progression", lambda: plot_exploit_emv_progression(history, rows, out_dir)),
         ("exploit_per_geology_progression", lambda: plot_exploit_per_geology_progression(history, out_dir)),
     ]
     n_ok = 0

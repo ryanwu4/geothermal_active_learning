@@ -18,6 +18,8 @@ from typing import Any
 
 import numpy as np
 
+from .emv import expected_k_for_run, strict_per_snapshot_emv
+
 
 def assert_objective_marker(ws: Path, objective: str) -> None:
     """Persist the run's objective in the local workspace and refuse to resume with a flipped one.
@@ -170,7 +172,6 @@ def augment_metrics_with_npv(
     terminal_real_npv, objective tag, and best_real_npv_in_batch. Defensive: rows whose snapshot
     coords are unavailable keep their revenue fields and get null npv (never raises)."""
     rows = payload.get("candidates", [])
-    by_snap: dict[str, list[float]] = {}
     for c in rows:
         sid = str(c.get("snapshot_id", ""))
         coords = coords_by_snapshot.get(sid)
@@ -181,16 +182,21 @@ def augment_metrics_with_npv(
             c["predicted_npv"] = None
             continue
         gi = c.get("geology_index")
-        rn = _row_npv(state, coords, gi, c.get("real_revenue"))
-        pn = _row_npv(state, coords, gi, c.get("predicted_revenue"))
-        c["real_npv"] = rn
-        c["predicted_npv"] = pn
-        if rn is not None:
-            by_snap.setdefault(sid, []).append(rn)
-    term: dict[str, float | None] = {}
-    for sid, vals in by_snap.items():
-        finite = [v for v in vals if v is not None and np.isfinite(v)]
-        term[sid] = float(np.mean(finite)) if finite else None
+        c["real_npv"] = _row_npv(state, coords, gi, c.get("real_revenue"))
+        c["predicted_npv"] = _row_npv(state, coords, gi, c.get("predicted_revenue"))
+    # STRICT EMV (NPV): a config's terminal NPV is defined only if ALL K geologies produced a finite
+    # real_npv. A geology is undefined if its revenue failed OR its NPV couldn't be computed (missing
+    # snapshot coords / well-count guard / dead rock) — any of those throws out the whole config.
+    # K = ensemble size for this payload's rows. See orchestrator.emv (was survivor-mean, which
+    # biased NPV the same way it biased revenue EMV and made configs non-comparable).
+    k = expected_k_for_run(rows)
+    by_snap_rows: dict[str, list[dict]] = {}
+    for c in rows:
+        by_snap_rows.setdefault(str(c.get("snapshot_id", "")), []).append(c)
+    term: dict[str, float | None] = {
+        sid: strict_per_snapshot_emv(srows, "real_npv", expected_k=k)
+        for sid, srows in by_snap_rows.items()
+    }
     for c in rows:
         c["terminal_real_npv"] = term.get(str(c.get("snapshot_id", "")))
     payload["objective"] = "npv"

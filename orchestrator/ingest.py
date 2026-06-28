@@ -25,6 +25,8 @@ from pathlib import Path
 import h5py
 import numpy as np
 
+from .emv import strict_emv
+
 
 class IngestError(RuntimeError):
     pass
@@ -427,11 +429,21 @@ def ingest_iteration(
     for c in candidates:
         if c.snapshot_id:
             grouped_by_snap.setdefault(c.snapshot_id, []).append(c)
+    # STRICT EMV: a config's EMV is defined only if ALL K geologies in its ensemble produced a
+    # finite revenue; any failed/missing geology throws out the whole config (it is omitted from
+    # per_candidate_emv, hence from terminal_real_emv stamping and best/exploit tracking below, and
+    # from every EMV plot). K = the ensemble size = the largest per-snapshot geology count this
+    # iteration. This path OMITS failed-geology rows (vs the baseline writer's null rows), so a
+    # partial config simply has fewer rows than a complete one and falls short of K. Per-geology
+    # iterations have one row per snapshot (K=1), so a single finite value still qualifies. See
+    # orchestrator.emv — survivor-mean was biased and made configs non-comparable.
+    expected_k = max((len(rows) for rows in grouped_by_snap.values()), default=0)
     per_candidate_emv: dict[str, float] = {}
     for sid, rows in grouped_by_snap.items():
-        reals = [r.real_revenue for r in rows if np.isfinite(r.real_revenue)]
-        if reals:
-            per_candidate_emv[sid] = float(np.mean(reals))
+        by_geo = {r.geology_index: r.real_revenue for r in rows if np.isfinite(r.real_revenue)}
+        emv_val = strict_emv(by_geo.values(), expected_k=expected_k)
+        if emv_val is not None:
+            per_candidate_emv[sid] = float(emv_val)
 
     # Stamp terminal_real_emv onto every row whose snapshot has a populated EMV.
     # The terminal EMV is the same value for all K rows of a given snapshot, so
