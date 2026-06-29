@@ -1130,6 +1130,122 @@ def plot_per_geology_mape_heatmap(history: list[dict], out_dir: Path) -> None:
     _save(fig, out_dir / "per_geology_mape_heatmap.png")
 
 
+# ---------------------------------------------------------------------------
+# Panel-gating diagnostics (orchestrator.gating). Rendered every AL iteration via
+# _render_local_plots, so they update in real time. Both no-op for ungated runs
+# (no IterationRecord carries gate_enabled), so they cost nothing when gating is off.
+# ---------------------------------------------------------------------------
+_GATE_BOX = "#39ff14"   # bright lime, reads on the dark heatmap
+
+
+def plot_geology_selection(history: list[dict], out_dir: Path) -> None:
+    """Which geologies were simulated in INTERSECT each iteration (panel gating).
+
+    Per-geology MAPE heatmap with a lime box around every (geology, iteration) cell that was
+    actually queried this iteration — i.e. the live view of the gate self-shrinking onto the
+    hard cluster. A warmup/full iteration (panel == full ensemble) boxes every geology.
+    """
+    from matplotlib.patches import Rectangle  # local import; only this plot needs it
+    if not any(r.get("gate_enabled") for r in history):
+        return  # ungated run — every geology is always queried; nothing to show
+    rows = [r for r in history if r.get("per_geology")]
+    if not rows:
+        return
+    geo_keys = sorted({k for r in rows for k in r["per_geology"].keys()},
+                      key=lambda x: int(x) if x.lstrip("-").isdigit() else 0)
+    iters = [r["iteration"] for r in rows]
+    matrix = np.full((len(geo_keys), len(iters)), np.nan)
+    for j, r in enumerate(rows):
+        for i, g in enumerate(geo_keys):
+            v = r["per_geology"].get(g, {}).get("mape")
+            if v is not None:
+                matrix[i, j] = v * 100
+
+    fig, ax = plt.subplots(figsize=(max(8, len(iters) * 0.6), max(4, len(geo_keys) * 0.4)),
+                           facecolor=MANIM_BG)
+    _style_ax(ax)
+    # Clip the colour scale so the iter-0 geo-8 spike doesn't wash out the structure.
+    finite = matrix[np.isfinite(matrix)]
+    vmax = max(float(np.percentile(finite, 95)), 8.0) if finite.size else 20.0
+    im = ax.imshow(matrix, aspect="auto", cmap="magma", vmin=0, vmax=vmax, interpolation="nearest")
+
+    geo_to_row = {int(g): i for i, g in enumerate(geo_keys) if g.lstrip("-").isdigit()}
+    for j, r in enumerate(rows):
+        panel = r.get("panel_geology_indices")
+        # panel is None on a full/warmup iter of a gated run (the whole ensemble ran).
+        queried = set(geo_to_row.values()) if panel is None else {
+            geo_to_row[g] for g in panel if g in geo_to_row}
+        for i in queried:
+            ax.add_patch(Rectangle((j - 0.5, i - 0.5), 1, 1, fill=False,
+                                   edgecolor=_GATE_BOX, linewidth=1.6, zorder=5))
+
+    ax.set_xticks(range(len(iters))); ax.set_xticklabels(iters)
+    ax.set_yticks(range(len(geo_keys))); ax.set_yticklabels([f"geo {g}" for g in geo_keys])
+    ax.set_xlabel("AL iteration")
+    ax.set_title("Geologies simulated in INTERSECT (lime box = queried)")
+    cbar = fig.colorbar(im, ax=ax, extend="max")
+    cbar.ax.tick_params(colors=MANIM_WHITE)
+    cbar.set_label("surrogate MAPE (%)", color=MANIM_WHITE)
+    _save(fig, out_dir / "geology_selection_over_iters.png")
+
+
+def plot_ix_query_cost(history: list[dict], out_dir: Path) -> None:
+    """INTERSECT query cost per iteration: panel + completion vs the full-budget baseline.
+
+    The real-time 'how much did the gate save' diagnostic. Stacked bars show panel IX (all
+    configs × panel geologies) and completion IX (top-M × fill geologies); the dashed line is
+    the full-budget cost (n_configs × K) the iteration would have spent ungated. Title carries
+    the cumulative savings. No-op for ungated runs.
+    """
+    if not any(r.get("gate_enabled") for r in history):
+        return
+    recs = [r for r in history if r.get("per_geology")]
+    if not recs:
+        return
+    K = max((len(r["per_geology"]) for r in recs), default=0)
+    if K == 0:
+        return
+    # n_configs is constant per run; recover it from a full/warmup iter (submitted / K).
+    n_configs = None
+    for r in history:
+        if r.get("panel_geology_indices") is None and r.get("submitted"):
+            n_configs = round(r["submitted"] / K)
+            break
+
+    iters, panel_ix, compl_ix, full_base = [], [], [], []
+    for r in history:
+        if r.get("submitted") is None:
+            continue
+        iters.append(r["iteration"])
+        p = r.get("ix_runs_panel")
+        if p is None:                       # full/warmup iter: all IX is "panel" (full ensemble)
+            panel_ix.append(int(r["submitted"])); compl_ix.append(0)
+        else:
+            panel_ix.append(int(p)); compl_ix.append(int(r.get("ix_runs_completion") or 0))
+        nc = n_configs or round(r["submitted"] / K)
+        full_base.append(int(nc * K))
+    if not iters:
+        return
+
+    x = list(range(len(iters)))
+    fig, ax = plt.subplots(figsize=(max(8, len(iters) * 0.7), 5), facecolor=MANIM_BG)
+    _style_ax(ax)
+    ax.bar(x, panel_ix, color=MANIM_GREEN, label="panel IX (all configs × panel geos)")
+    ax.bar(x, compl_ix, bottom=panel_ix, color=MANIM_BLUE,
+           label="completion IX (top-M × fill geos)")
+    ax.plot(x, full_base, color=MANIM_GREY, marker="o", ls="--", lw=2,
+            label="full-budget baseline (n_configs × K)")
+    total_actual = sum(panel_ix) + sum(compl_ix)
+    total_full = sum(full_base)
+    saved = 100 * (1 - total_actual / total_full) if total_full else 0.0
+    ax.set_xticks(x); ax.set_xticklabels(iters)
+    ax.set_xlabel("AL iteration"); ax.set_ylabel("INTERSECT runs")
+    ax.set_title(f"INTERSECT query cost per iteration — cumulative {saved:.0f}% fewer "
+                 f"({total_actual:,} vs {total_full:,})")
+    ax.legend(loc="best")
+    _save(fig, out_dir / "ix_query_cost_over_iters.png")
+
+
 def plot_real_revenue_distribution(rows: list[dict], out_dir: Path) -> None:
     """Box+strip plot of real revenue per iteration: track frontier movement."""
     if not rows:
@@ -2999,6 +3115,8 @@ def main() -> int:
         ("calibration_metrics", lambda: plot_calibration_metrics(history, out_dir)),
         ("pred_real_gap", lambda: plot_pred_real_gap(rows, out_dir)),
         ("per_geology_mape_heatmap", lambda: plot_per_geology_mape_heatmap(history, out_dir)),
+        ("geology_selection_over_iters", lambda: plot_geology_selection(history, out_dir)),
+        ("ix_query_cost_over_iters", lambda: plot_ix_query_cost(history, out_dir)),
         ("training_growth", lambda: plot_training_growth(history, out_dir)),
         ("wallclock_breakdown", lambda: plot_wallclock_breakdown(history, out_dir)),
         ("run_failure_diagnostics", lambda: plot_run_failure_diagnostics(args.run_root, history, out_dir)),

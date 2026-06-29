@@ -44,6 +44,13 @@ from orchestrator.acquire import (
     run_acquisition,
     write_selected_manifest,
 )
+from orchestrator.gating import (
+    GeologyGatingConfig,
+    compute_emv_hat,
+    compute_panel,
+    rank_top_m,
+    slice_manifest,
+)
 from orchestrator.log import init_run
 from orchestrator.remote import RemoteSession, SshUnavailable, TERMINAL_JOB_STATES
 from orchestrator.retrain import run_train, should_train_from_scratch
@@ -626,11 +633,20 @@ def _render_and_push_ingest_sbatch(
     array_tasks_json_remote: str,
     ix_output_dir_remote: str,
     ws: Path,
+    gate_phase: str = "full",
+    expected_k: int | None = None,
 ) -> str:
     """Render the ingest sbatch from the canonical template and push to Sherlock.
 
-    Returns the remote path the sbatch was placed at.
+    ``gate_phase`` ("full"/"panel"/"completion") and ``expected_k`` thread the panel-gating
+    two-phase args into phase_ingest. The panel and completion sbatches get distinct
+    filenames so a single iteration's two ingests don't clobber each other. Returns the
+    remote path the sbatch was placed at.
     """
+    gate_args = f"--gate-phase {gate_phase}"
+    if expected_k is not None:
+        gate_args += f" --expected-k {int(expected_k)}"
+    suffix = "" if gate_phase in ("full", "panel") else f".{gate_phase}"
     template = REPO_ROOT / "sbatch" / "ingest.sbatch.template"
     rendered = render_template(template, {
         "RUN_ROOT": remote_run_root,
@@ -638,16 +654,157 @@ def _render_and_push_ingest_sbatch(
         "ITER": str(iteration),
         "ARRAY_TASKS_JSON": array_tasks_json_remote,
         "IX_OUTPUT_DIR": ix_output_dir_remote,
-        "LOG_OUT": f"{remote_run_root}/logs/ingest_iter_{iteration:04d}.out",
-        "LOG_ERR": f"{remote_run_root}/logs/ingest_iter_{iteration:04d}.err",
-        "JOB_NAME": f"AL_INGEST_{run_id}_{iteration:04d}",
+        "LOG_OUT": f"{remote_run_root}/logs/ingest_iter_{iteration:04d}{suffix}.out",
+        "LOG_ERR": f"{remote_run_root}/logs/ingest_iter_{iteration:04d}{suffix}.err",
+        "JOB_NAME": f"AL_INGEST_{run_id}_{iteration:04d}{suffix}",
+        "GATE_ARGS": gate_args,
     })
-    local_sbatch = ws / "rendered_sbatch" / f"ingest_iter_{iteration:04d}.sbatch"
+    local_sbatch = ws / "rendered_sbatch" / f"ingest_iter_{iteration:04d}{suffix}.sbatch"
     local_sbatch.write_text(rendered)
     local_sbatch.chmod(0o755)
-    remote_path = f"{remote_run_root}/sbatch_rendered/ingest_iter_{iteration:04d}.sbatch"
+    remote_path = f"{remote_run_root}/sbatch_rendered/ingest_iter_{iteration:04d}{suffix}.sbatch"
     remote.push(local_sbatch, remote_path)
     return remote_path
+
+
+def _local_geology_indices(cfg: dict) -> list[int]:
+    """The run's geology_index values (the ensemble), read once from the local geology config."""
+    geology_path = Path(cfg["compute"]["local_geologies_config"]).expanduser().resolve()
+    return [int(e["geology_index"]) for e in _load_geology_list(geology_path)]
+
+
+def _stage_submit_ix(
+    *,
+    remote: RemoteSession,
+    ws: Path,
+    iteration: int,
+    run_id: str,
+    cfg: dict,
+    remote_run_root: str,
+    local_manifest: Path,
+    remote_manifest_name: str,
+    stage_subdir: str,
+    output_prefix: str,
+    remappings: list[tuple[str, str]],
+):
+    """Rewrite a (possibly sliced) local manifest to Sherlock paths, push it, stage the IX
+    array, and submit it. Returns (stage, ix_job). The dependent ingest is submitted
+    separately via :func:`_submit_dependent_ingest` so callers can persist per-phase
+    bookkeeping to state.json BEFORE the ingest exists (the completion ingest increments the
+    iteration, so a post-submit state push could otherwise race-clobber it)."""
+    rewritten = _rewrite_manifest_paths(local_manifest, remappings)
+    rewritten_local = ws / "manifests" / f"{Path(remote_manifest_name).stem}.remote.json"
+    rewritten_local.write_text(json.dumps(rewritten, indent=2))
+    remote.run(["mkdir", "-p", f"{remote_run_root}/manifests"])
+    remote_manifest = f"{remote_run_root}/manifests/{remote_manifest_name}"
+    remote.push(rewritten_local, remote_manifest)
+
+    stage_root_remote = f"{remote_run_root}/iter_{iteration:04d}/{stage_subdir}"
+    remote.run(["mkdir", "-p", stage_root_remote])
+    ix_cfg = cfg["intersect"]
+    stage = stage_iteration(
+        julia_repo=Path(cfg["paths"]["julia_repo"]),
+        julia_config=cfg["paths"]["julia_config"],
+        surrogate_repo=Path(cfg["paths"]["surrogate_repo"]),
+        manifest_path=Path(remote_manifest),
+        stage_root=Path(stage_root_remote),
+        output_prefix=output_prefix,
+        cpus=int(ix_cfg.get("cpus_per_task", 2)),
+        mem=str(ix_cfg.get("mem_per_task", "8GB")),
+        time_limit=str(ix_cfg.get("time_per_run", "00:30:00")),
+        np_procs=int(ix_cfg.get("np", 2)),
+        max_concurrent=int(ix_cfg.get("max_concurrent", 70)),
+        job_name=f"AL_IX_{run_id}_{iteration:04d}",
+        runner=_make_sherlock_runner(remote),
+        skip_script_existence_check=True,
+    )
+    ix_job = remote.submit_sbatch(str(stage.sbatch_path))
+    return stage, ix_job
+
+
+def _submit_dependent_ingest(
+    *,
+    remote: RemoteSession,
+    ws: Path,
+    iteration: int,
+    run_id: str,
+    remote_run_root: str,
+    remote_repo_root: str,
+    ix_output_root: str,
+    tasks_json_remote: str,
+    ix_job: str,
+    gate_phase: str,
+    expected_k: int | None,
+) -> str:
+    """Render + push the ingest sbatch and submit it as ``afterany:ix_job``. Returns ingest job id."""
+    ingest_remote = _render_and_push_ingest_sbatch(
+        remote=remote,
+        remote_run_root=remote_run_root,
+        remote_repo_root=remote_repo_root,
+        iteration=iteration,
+        run_id=run_id,
+        array_tasks_json_remote=tasks_json_remote,
+        ix_output_dir_remote=ix_output_root,
+        ws=ws,
+        gate_phase=gate_phase,
+        expected_k=expected_k,
+    )
+    return remote.submit_sbatch(ingest_remote, dependency=f"afterany:{ix_job}")
+
+
+def _emv_hat_top_m_for_iter(
+    *,
+    ws: Path,
+    iteration: int,
+    local_acquire_dir: Path,
+    panel: set[int],
+    all_geology_indices: list[int],
+    top_m: int,
+) -> tuple[list[str], float | None]:
+    """Rank configs by control-variate EMV_hat; return (top-M snapshot ids, best EMV_hat).
+
+    Joins phase-1 panel reals (pulled per_candidate_metrics.json) with the full per-geology
+    surrogate predictions (snapshot JSONs) on a REVENUE basis — matching the gate and the
+    validated replay. Geologies outside the panel are filled from the surrogate prediction.
+    If EMV_hat is empty for every config (a non-finite surrogate prediction somewhere — the
+    NaN-divergence symptom), falls back to ranking by the mean of the available panel reals so
+    the completion phase still advances the loop rather than staging an empty manifest.
+    """
+    real_by_config: dict[str, dict[int, float]] = {}
+    pcm = ws / f"iter_{iteration:04d}" / "per_candidate_metrics.json"
+    if pcm.exists():
+        payload = json.loads(pcm.read_text())
+        for row in payload.get("candidates", []):
+            sid = str(row.get("snapshot_id", ""))
+            rv = row.get("real_revenue")
+            if sid and rv is not None:
+                real_by_config.setdefault(sid, {})[int(row.get("geology_index", -1))] = float(rv)
+
+    pred_by_config: dict[str, dict[int, float]] = {}
+    snap_dir = local_acquire_dir / "snapshots_json"
+    for sid in real_by_config:
+        sp = snap_dir / f"{sid}.json"
+        if not sp.exists():
+            continue
+        sjson = json.loads(sp.read_text())
+        for p in sjson.get("predictions_by_geology", []):
+            v = p.get("discounted_total_revenue")
+            if v is not None:
+                pred_by_config.setdefault(sid, {})[int(p.get("geology_index", -1))] = float(v)
+
+    emv_hat = compute_emv_hat(
+        panel=panel,
+        all_geology_indices=all_geology_indices,
+        real_by_config=real_by_config,
+        pred_by_config=pred_by_config,
+    )
+    if emv_hat:
+        return rank_top_m(emv_hat, top_m), max(emv_hat.values())
+    # Fallback: rank by the mean of the panel reals we DO have (every panel-completed config),
+    # so a surrogate that diverged to NaN on some geology can't wedge the loop on an empty
+    # completion manifest.
+    panel_mean = {sid: sum(g.values()) / len(g) for sid, g in real_by_config.items() if g}
+    return rank_top_m(panel_mean, top_m), (max(panel_mean.values()) if panel_mean else None)
 
 
 # ----------------------------------------------------------------------
@@ -1028,6 +1185,24 @@ def main() -> int:
             print(f"[local-driver] objective=npv: dashboard will show NPV "
                   f"(flowline={npv_state['flowline']:.0f} m, {len(npv_state['rtop_by_geo'])} geologies)")
 
+        # Panel-gating config (opt-in; disabled => identical behavior to today). The geology
+        # ensemble (and its size K) is static across iterations, so resolve it once.
+        gating_cfg = GeologyGatingConfig.from_config(cfg)
+        geology_indices = _local_geology_indices(cfg)
+        ensemble_k = len(geology_indices)
+        if gating_cfg.enabled:
+            # Gating slices the per-config ensemble manifest, which only exists in the
+            # ensemble / cma_surrogate emission path. In per_geology mode each snapshot carries
+            # a single geology, so panel-slicing would drop snapshots — refuse loudly.
+            _acq_mode = str(cfg.get("acquisition", {}).get("mode", "per_geology"))
+            if _acq_mode not in ("ensemble", "cma_surrogate"):
+                raise RuntimeError(
+                    f"geology_gating.enabled requires acquisition.mode in "
+                    f"(ensemble, cma_surrogate); got {_acq_mode!r}."
+                )
+            print(f"[local-driver] geology gating ENABLED: cutoff={gating_cfg.mape_cutoff_pct}% "
+                  f"top_m={gating_cfg.top_m} warmup={gating_cfg.warmup_iters} K={ensemble_k}")
+
         while True:
             if _check_done(remote, remote_run_root):
                 print(f"[local-driver] Sherlock has done.json — run complete.")
@@ -1153,6 +1328,21 @@ def main() -> int:
                     )
             last_step = f"acquired+selected iter {iteration}" + (" (reused)" if reused else "")
 
+            # Panel-gating decision for this iteration (causal: from PRIOR iters' per-geology
+            # MAPE in state.history). Deterministic, so it matches whatever a reused manifest
+            # was emitted with. gated_active is False during warmup / when the panel is full,
+            # in which case the iteration runs the normal single-phase full-ensemble path.
+            decision = compute_panel(
+                per_geology_history=[r.per_geology for r in state.history],
+                all_geology_indices=geology_indices,
+                iteration=iteration,
+                gcfg=gating_cfg,
+            )
+            gated_active = gating_cfg.enabled and not decision.is_full
+            if gated_active:
+                print(f"[local-driver] iter {iteration} panel={sorted(decision.panel)} "
+                      f"({len(decision.panel)}/{ensemble_k} geologies) reason={decision.reason}")
+
             # The manifest references absolute paths to per-snapshot JSONs and
             # well_config .jl files that acquire wrote on bend, plus geology
             # H5 files at bend-local paths. Julia stage runs on Sherlock so we
@@ -1172,55 +1362,35 @@ def main() -> int:
                 # geology h5 files — independent location
                 *_build_geology_remappings(cfg),
             ]
-            rewritten = _rewrite_manifest_paths(manifest_path, remappings)
-            rewritten_local = ws / "manifests" / f"manifest_iter_{iteration:04d}.remote.json"
-            rewritten_local.write_text(json.dumps(rewritten, indent=2))
-            remote_manifest = f"{remote_run_root}/manifests/manifest_iter_{iteration:04d}.json"
-            remote.run(["mkdir", "-p", f"{remote_run_root}/manifests"])
-            remote.push(rewritten_local, remote_manifest)
+            # Phase-1 manifest: the full ensemble when ungated, else the full manifest sliced
+            # to the panel geologies (every selected config, panel geos only).
+            if gated_active:
+                phase1_manifest = ws / "manifests" / f"manifest_iter_{iteration:04d}.panel.json"
+                slice_manifest(json.loads(manifest_path.read_text()),
+                               geos=decision.panel, gate_phase="panel", out_path=phase1_manifest)
+            else:
+                phase1_manifest = manifest_path
             last_step = "pushed acquire dir + manifest"
 
-            # Stage IX on Sherlock via remote runner.
-            stage_root_remote = f"{remote_run_root}/iter_{iteration:04d}/ix_stage"
-            remote.run(["mkdir", "-p", stage_root_remote])
-            ix_cfg = cfg["intersect"]
-            stage = stage_iteration(
-                julia_repo=Path(cfg["paths"]["julia_repo"]),
-                julia_config=cfg["paths"]["julia_config"],
-                surrogate_repo=Path(cfg["paths"]["surrogate_repo"]),
-                manifest_path=Path(remote_manifest),
-                stage_root=Path(stage_root_remote),
+            # Phase-1: stage IX + submit the dependent ingest (panel when gated, else full).
+            stage, ix_job = _stage_submit_ix(
+                remote=remote, ws=ws, iteration=iteration, run_id=run_id, cfg=cfg,
+                remote_run_root=remote_run_root, local_manifest=phase1_manifest,
+                remote_manifest_name=f"manifest_iter_{iteration:04d}.json",
+                stage_subdir="ix_stage",
                 output_prefix=f"al_{run_id}_iter{iteration:04d}",
-                cpus=int(ix_cfg.get("cpus_per_task", 2)),
-                mem=str(ix_cfg.get("mem_per_task", "8GB")),
-                time_limit=str(ix_cfg.get("time_per_run", "00:30:00")),
-                np_procs=int(ix_cfg.get("np", 2)),
-                max_concurrent=int(ix_cfg.get("max_concurrent", 70)),
-                job_name=f"AL_IX_{run_id}_{iteration:04d}",
-                runner=_make_sherlock_runner(remote),
-                skip_script_existence_check=True,
+                remappings=remappings,
             )
-            last_step = f"staged IX (sbatch={stage.sbatch_path})"
-
-            ix_job = remote.submit_sbatch(str(stage.sbatch_path))
-            print(f"[local-driver] submitted IX array as job {ix_job}")
-            last_step = f"submitted IX job {ix_job}"
-
-            ingest_sbatch_remote = _render_and_push_ingest_sbatch(
-                remote=remote,
-                remote_run_root=remote_run_root,
-                remote_repo_root=remote_repo_root,
-                iteration=iteration,
-                run_id=run_id,
-                array_tasks_json_remote=str(stage.tasks_json),
-                ix_output_dir_remote=ix_output_root,
-                ws=ws,
+            ingest_job = _submit_dependent_ingest(
+                remote=remote, ws=ws, iteration=iteration, run_id=run_id,
+                remote_run_root=remote_run_root, remote_repo_root=remote_repo_root,
+                ix_output_root=ix_output_root, tasks_json_remote=str(stage.tasks_json),
+                ix_job=ix_job, gate_phase=("panel" if gated_active else "full"),
+                expected_k=(ensemble_k if gated_active else None),
             )
-            ingest_job = remote.submit_sbatch(
-                ingest_sbatch_remote, dependency=f"afterany:{ix_job}",
-            )
-            print(f"[local-driver] submitted ingest as job {ingest_job} (afterany:{ix_job})")
-            last_step = f"submitted ingest job {ingest_job}"
+            print(f"[local-driver] submitted IX array as job {ix_job}; "
+                  f"ingest {ingest_job} (afterany:{ix_job})")
+            last_step = f"submitted IX {ix_job} + ingest {ingest_job}"
 
             # Update state.json on Sherlock with this iteration's record.
             rec = state.get_iter(iteration) or IterationRecord(iteration=iteration)
@@ -1231,6 +1401,11 @@ def main() -> int:
             rec.ix_array_job_id = ix_job
             rec.ingest_job_id = ingest_job
             rec.timestamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+            rec.gate_enabled = gating_cfg.enabled
+            if gated_active:
+                rec.panel_geology_indices = sorted(decision.panel)
+                rec.n_panel_geologies = len(decision.panel)
+                rec.ix_runs_panel = stage.tasks_count
             state.upsert_iter(rec)
             # Note: state.current_checkpoint stays bound to local paths in
             # hybrid mode. Ingest doesn't read it — it derives compiled H5
@@ -1276,6 +1451,77 @@ def main() -> int:
             except Exception as e:
                 print(f"[local-driver] post-ingest plot refresh failed: {e}",
                       file=sys.stderr)
+
+            # ---- Phase 2 (gated runs): complete the top-M configs in the fill geologies ----
+            # The panel ingest above recorded metrics but did NOT chain/stop (--gate-phase
+            # panel). We rank configs by control-variate EMV_hat, pick the top-M, run them in
+            # the remaining geologies, and let the completion ingest (--gate-phase completion)
+            # merge + advance the loop. Only runs if the panel ingest COMPLETED.
+            if gated_active and final == "COMPLETED":
+                top_m_sids, emv_hat_best = _emv_hat_top_m_for_iter(
+                    ws=ws, iteration=iteration, local_acquire_dir=local_acquire_dir,
+                    panel=decision.panel, all_geology_indices=geology_indices,
+                    top_m=gating_cfg.top_m,
+                )
+                if not top_m_sids:
+                    # Degenerate: no rankable configs even after the panel-real fallback —
+                    # surrogate divergence or no completed panel runs. Fail with a Python-side
+                    # diagnosis instead of staging an empty completion manifest (which would
+                    # fail opaquely in the Julia stager and stall the loop at this iteration).
+                    raise RuntimeError(
+                        f"Gated completion for iter {iteration} found 0 rankable configs "
+                        f"(EMV_hat and the panel-real fallback were both empty). Investigate the "
+                        f"panel ingest for iter {iteration} (surrogate divergence / no completed "
+                        f"panel runs) rather than retrying staging."
+                    )
+                fill = sorted(set(geology_indices) - decision.panel)
+                print(f"[local-driver] iter {iteration} completion: top_m={top_m_sids} "
+                      f"fill={fill}")
+                completion_manifest = ws / "manifests" / f"manifest_iter_{iteration:04d}.completion.json"
+                slice_manifest(json.loads(manifest_path.read_text()),
+                               geos=fill, sids=top_m_sids, gate_phase="completion",
+                               out_path=completion_manifest)
+                c_stage, c_ix_job = _stage_submit_ix(
+                    remote=remote, ws=ws, iteration=iteration, run_id=run_id, cfg=cfg,
+                    remote_run_root=remote_run_root, local_manifest=completion_manifest,
+                    remote_manifest_name=f"manifest_iter_{iteration:04d}.completion.json",
+                    stage_subdir="ix_stage_completion",
+                    output_prefix=f"al_{run_id}_iter{iteration:04d}_cmpl",
+                    remappings=remappings,
+                )
+                # Persist completion bookkeeping onto the FRESH (panel-ingest-updated) state
+                # BEFORE submitting the completion ingest. The completion ingest increments the
+                # iteration; writing after it could race-clobber that increment.
+                state = _pull_state(remote, remote_run_root, ws)
+                rec_c = state.get_iter(iteration) or IterationRecord(iteration=iteration)
+                rec_c.completion_snapshot_ids = list(top_m_sids)
+                rec_c.ix_runs_completion = c_stage.tasks_count
+                rec_c.emv_hat_best_in_batch = emv_hat_best
+                rec_c.submitted = (rec_c.submitted or 0) + c_stage.tasks_count
+                state.upsert_iter(rec_c)
+                _push_state(remote, remote_run_root, state, ws)
+                c_ingest_job = _submit_dependent_ingest(
+                    remote=remote, ws=ws, iteration=iteration, run_id=run_id,
+                    remote_run_root=remote_run_root, remote_repo_root=remote_repo_root,
+                    ix_output_root=ix_output_root, tasks_json_remote=str(c_stage.tasks_json),
+                    ix_job=c_ix_job, gate_phase="completion", expected_k=ensemble_k,
+                )
+                print(f"[local-driver] completion: IX {c_ix_job}; ingest {c_ingest_job} "
+                      f"(afterany:{c_ix_job})")
+                last_step = f"submitted completion IX {c_ix_job} + ingest {c_ingest_job}"
+                final = _poll_until_terminal(remote, c_ingest_job, every=poll_every,
+                                             label="ingest-completion")
+                last_step = f"completion ingest {c_ingest_job} → {final}"
+                try:
+                    fresh_state = _pull_state(remote, remote_run_root, ws)
+                    _pull_per_candidate_metrics(remote, remote_run_root, iteration, ws)
+                    _render_local_plots(fresh_state, ws, npv_state)
+                except SshUnavailable:
+                    raise
+                except Exception as e:
+                    print(f"[local-driver] post-completion plot refresh failed: {e}",
+                          file=sys.stderr)
+
             if final != "COMPLETED":
                 print(
                     f"[local-driver] ingest finished non-COMPLETED ({final}). "

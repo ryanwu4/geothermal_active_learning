@@ -20,4 +20,5 @@ python {{REPO_ROOT}}/scripts/phase_ingest.py \
     --run-root {{RUN_ROOT}} \
     --iteration {{ITER}} \
     --array-tasks-json {{ARRAY_TASKS_JSON}} \
-    --ix-output-dir {{IX_OUTPUT_DIR}}
+    --ix-output-dir {{IX_OUTPUT_DIR}} \
+    {{GATE_ARGS}}

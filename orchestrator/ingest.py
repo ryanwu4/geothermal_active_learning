@@ -49,6 +49,10 @@ class CandidateMetric:
     # Floored APE: abs(pred-real) / max(abs(real), denom_floor). The denom floor
     # prevents geo-8-style "MAPE blows up because true revenue is small" artifacts.
     abs_pct_error_floored: float = float("nan")
+    # Gating provenance: "full" (ungated / warmup full ensemble), "panel" (phase-1 panel
+    # IX), or "completion" (phase-2 top-M completion). Lets the completion phase union rows
+    # by source and lets post-hoc analysis separate panel from completion IX.
+    provenance: str = "full"
     # Ensemble-mode seed/terminal tracking. None on per-geology rows. The
     # acquisition writes the predicted half; ingest populates the real half by
     # looking up the prior iter's per_candidate_emv for the seed snapshot.
@@ -195,6 +199,203 @@ def _count_cases(compiled_h5: Path) -> int:
         return len(list(f.keys()))
 
 
+def _mean_finite(vals: list[float]) -> float | None:
+    finite = [v for v in vals if np.isfinite(v)]
+    return float(np.mean(finite)) if finite else None
+
+
+def rollup_metrics(
+    candidates: list[CandidateMetric],
+    *,
+    n_submitted: int,
+    n_completed: int,
+    n_train_samples: int,
+    prior_best_revenue: float | None = None,
+    prior_best_emv: float | None = None,
+    prior_per_candidate_emv_by_iter: dict[int, dict[str, float]] | None = None,
+    expected_k: int | None = None,
+    n_failed_per_status: int = 0,
+    n_succeeded_but_missing_h5: int = 0,
+    n_missing_silently: int = 0,
+) -> IngestMetrics:
+    """Compute batch / per-geology / ensemble metrics from already-built candidate rows.
+
+    Factored out of :func:`ingest_iteration` so the gated completion phase can recompute
+    over a UNION of panel + completion rows without re-reading any H5. Mutates each
+    candidate's ``abs_pct_error_floored`` (recomputed against the cohort median).
+
+    ``expected_k``: when given, overrides the inferred ensemble size. Gating passes the
+    configured K (e.g. 15) so strict EMV admits ONLY fully-completed configs — panel-only
+    configs (with < K finite-geology rows) are correctly excluded from the incumbent, even
+    on a phase where every config is partial (which would otherwise infer a too-small K).
+    """
+    completion_rate = (n_completed / n_submitted) if n_submitted > 0 else 0.0
+
+    batch_mape = _mean_finite([c.abs_pct_error for c in candidates])
+    batch_signed_pct_bias = _mean_finite([c.signed_pct_error for c in candidates])
+    frontier_mape = _mean_finite([c.abs_pct_error for c in candidates if c.kind == "frontier"])
+    adversarial_mape = _mean_finite([c.abs_pct_error for c in candidates if c.kind == "adversarial"])
+    exploit_mape = _mean_finite([c.abs_pct_error for c in candidates if c.kind == "exploit"])
+    cma_mape = _mean_finite([c.abs_pct_error for c in candidates if c.kind == "cma"])
+
+    # Floored MAPE: divide by max(|real|, 0.1 * cohort_median_real). Lets MAPE remain
+    # interpretable on the geo-8-like cohort with small true values.
+    finite_reals = [abs(c.real_revenue) for c in candidates if np.isfinite(c.real_revenue) and c.real_revenue != 0]
+    cohort_median_real = float(np.median(finite_reals)) if finite_reals else 0.0
+    floor_denom = 0.1 * cohort_median_real
+    for c in candidates:
+        if not np.isfinite(c.real_revenue) or not np.isfinite(c.predicted_revenue):
+            c.abs_pct_error_floored = float("nan")
+            continue
+        denom = max(abs(c.real_revenue), floor_denom) if floor_denom > 0 else abs(c.real_revenue)
+        c.abs_pct_error_floored = float(abs(c.predicted_revenue - c.real_revenue) / denom) if denom > 0 else float("nan")
+    batch_mape_floored = _mean_finite([c.abs_pct_error_floored for c in candidates])
+    batch_mae = _mean_finite([c.abs_error for c in candidates])
+    frontier_mae = _mean_finite([c.abs_error for c in candidates if c.kind == "frontier"])
+    adversarial_mae = _mean_finite([c.abs_error for c in candidates if c.kind == "adversarial"])
+    exploit_mae = _mean_finite([c.abs_error for c in candidates if c.kind == "exploit"])
+    cma_mae = _mean_finite([c.abs_error for c in candidates if c.kind == "cma"])
+
+    # Per-geology rollup — useful for spotting geologies the surrogate
+    # systematically struggles on, and for the convergence plot script.
+    per_geology: dict[str, dict[str, float | int | None]] = {}
+    for c in candidates:
+        bucket = per_geology.setdefault(str(c.geology_index), {
+            "count": 0,
+            "mape": [],
+            "mape_floored": [],
+            "mae": [],
+            "signed_bias": [],
+            "max_real_revenue": None,
+        })
+        bucket["count"] += 1  # type: ignore[operator]
+        if np.isfinite(c.abs_pct_error):
+            bucket["mape"].append(c.abs_pct_error)  # type: ignore[union-attr]
+        if np.isfinite(c.abs_pct_error_floored):
+            bucket["mape_floored"].append(c.abs_pct_error_floored)  # type: ignore[union-attr]
+        if np.isfinite(c.abs_error):
+            bucket["mae"].append(c.abs_error)  # type: ignore[union-attr]
+        if np.isfinite(c.signed_pct_error):
+            bucket["signed_bias"].append(c.signed_pct_error)  # type: ignore[union-attr]
+        if np.isfinite(c.real_revenue):
+            cur = bucket["max_real_revenue"]
+            bucket["max_real_revenue"] = (
+                c.real_revenue if cur is None else max(float(cur), c.real_revenue)  # type: ignore[arg-type]
+            )
+    # Collapse list-valued aggregates to scalars.
+    for g, bucket in per_geology.items():
+        bucket["mape"] = _mean_finite(bucket["mape"])  # type: ignore[arg-type]
+        bucket["mape_floored"] = _mean_finite(bucket["mape_floored"])  # type: ignore[arg-type]
+        bucket["mae"] = _mean_finite(bucket["mae"])  # type: ignore[arg-type]
+        bucket["signed_bias"] = _mean_finite(bucket["signed_bias"])  # type: ignore[arg-type]
+
+    real_values = [c.real_revenue for c in candidates if np.isfinite(c.real_revenue)]
+    best_in_batch = float(max(real_values)) if real_values else None
+    best_so_far: float | None
+    if best_in_batch is None:
+        best_so_far = prior_best_revenue
+    elif prior_best_revenue is None:
+        best_so_far = best_in_batch
+    else:
+        best_so_far = max(prior_best_revenue, best_in_batch)
+
+    # ----- Ensemble-mode aggregates -----
+    grouped_by_snap: dict[str, list[CandidateMetric]] = {}
+    for c in candidates:
+        if c.snapshot_id:
+            grouped_by_snap.setdefault(c.snapshot_id, []).append(c)
+    # STRICT EMV (see orchestrator.emv): a config's EMV is defined only if ALL K geologies
+    # produced finite revenue. K defaults to the largest per-snapshot geology count this
+    # iteration, but a caller may pass ``expected_k`` to pin it (gating: the configured
+    # ensemble size, so partial panel-only configs cannot masquerade as complete).
+    if expected_k is None:
+        expected_k = max((len(rows) for rows in grouped_by_snap.values()), default=0)
+    per_candidate_emv: dict[str, float] = {}
+    for sid, rows in grouped_by_snap.items():
+        by_geo = {r.geology_index: r.real_revenue for r in rows if np.isfinite(r.real_revenue)}
+        emv_val = strict_emv(by_geo.values(), expected_k=expected_k)
+        if emv_val is not None:
+            per_candidate_emv[sid] = float(emv_val)
+
+    # Stamp terminal_real_emv onto every row whose snapshot has a populated EMV.
+    for c in candidates:
+        if c.snapshot_id and c.snapshot_id in per_candidate_emv:
+            c.terminal_real_emv = per_candidate_emv[c.snapshot_id]
+
+    # Look up seed real EMV from prior iters' per_candidate_emv.
+    if prior_per_candidate_emv_by_iter:
+        for c in candidates:
+            if not c.seed_source_snapshot_id or c.seed_source_iteration is None:
+                continue
+            src_emv_map = prior_per_candidate_emv_by_iter.get(int(c.seed_source_iteration))
+            if not src_emv_map:
+                continue
+            v = src_emv_map.get(str(c.seed_source_snapshot_id))
+            if v is not None and np.isfinite(v):
+                c.seed_real_emv = float(v)
+
+    is_ensemble_iter = any(len(rows) > 1 for rows in grouped_by_snap.values())
+    best_emv_in_batch: float | None = None
+    best_emv_so_far_val: float | None = None
+    exploit_best_emv: float | None = None
+    exploit_best_per_geology: dict[str, float] | None = None
+    if is_ensemble_iter:
+        emv_values = list(per_candidate_emv.values())
+        if emv_values:
+            best_emv_in_batch = float(max(emv_values))
+        if best_emv_in_batch is None:
+            best_emv_so_far_val = prior_best_emv
+        elif prior_best_emv is None:
+            best_emv_so_far_val = best_emv_in_batch
+        else:
+            best_emv_so_far_val = max(float(prior_best_emv), best_emv_in_batch)
+
+        # Exploit-cohort restriction.
+        exploit_sids = {c.snapshot_id for c in candidates if c.kind == "exploit" and c.snapshot_id}
+        exploit_emvs = [per_candidate_emv[s] for s in exploit_sids if s in per_candidate_emv]
+        if exploit_emvs:
+            exploit_best_emv = float(max(exploit_emvs))
+        exploit_per_geo: dict[str, float] = {}
+        for c in candidates:
+            if c.kind != "exploit" or not np.isfinite(c.real_revenue):
+                continue
+            key = str(c.geology_index)
+            cur = exploit_per_geo.get(key)
+            exploit_per_geo[key] = c.real_revenue if cur is None else max(cur, c.real_revenue)
+        exploit_best_per_geology = exploit_per_geo or None
+
+    return IngestMetrics(
+        n_submitted=n_submitted,
+        n_completed=n_completed,
+        completion_rate=completion_rate,
+        batch_mape=batch_mape,
+        batch_signed_pct_bias=batch_signed_pct_bias,
+        frontier_mape=frontier_mape,
+        adversarial_mape=adversarial_mape,
+        best_real_revenue_in_batch=best_in_batch,
+        best_real_revenue_so_far=best_so_far,
+        n_train_samples=n_train_samples,
+        batch_mae=batch_mae,
+        batch_mape_floored=batch_mape_floored,
+        frontier_mae=frontier_mae,
+        adversarial_mae=adversarial_mae,
+        exploit_mape=exploit_mape,
+        exploit_mae=exploit_mae,
+        cma_mape=cma_mape,
+        cma_mae=cma_mae,
+        candidates=candidates,
+        per_geology=per_geology,
+        n_failed_per_status=n_failed_per_status,
+        n_succeeded_but_missing_h5=n_succeeded_but_missing_h5,
+        n_missing_silently=n_missing_silently,
+        per_candidate_emv=(per_candidate_emv if is_ensemble_iter else None),
+        best_emv_in_batch=best_emv_in_batch,
+        best_emv_so_far=best_emv_so_far_val,
+        exploit_best_emv=exploit_best_emv,
+        exploit_best_per_geology=exploit_best_per_geology,
+    )
+
+
 def ingest_iteration(
     *,
     iteration: int,
@@ -212,8 +413,15 @@ def ingest_iteration(
     prior_best_emv: float | None = None,
     prior_per_candidate_emv_by_iter: dict[int, dict[str, float]] | None = None,
     workers: int = 4,
+    provenance: str = "full",
+    expected_k: int | None = None,
 ) -> IngestMetrics:
-    """Run the full ingest pipeline for one iteration; return metrics."""
+    """Run the full ingest pipeline for one iteration; return metrics.
+
+    ``provenance`` stamps each candidate row ("full"/"panel"/"completion") for the gated
+    two-phase loop. ``expected_k`` pins the strict-EMV ensemble size (gating passes the
+    configured K so panel-only configs are excluded from the incumbent); ``None`` infers it.
+    """
     if not array_tasks_json.exists():
         raise IngestError(f"Missing tasks JSON: {array_tasks_json}")
 
@@ -339,193 +547,23 @@ def ingest_iteration(
             abs_pct_error=float(abs_pct),
             signed_pct_error=float(signed_pct),
             abs_error=float(abs_err),
+            provenance=provenance,
             seed_source_snapshot_id=seed_source_snapshot_id,
             seed_source_iteration=seed_source_iteration,
             seed_predicted_emv=seed_predicted_emv,
             terminal_predicted_emv=terminal_predicted_emv,
         ))
 
-    completion_rate = (n_completed / n_submitted) if n_submitted > 0 else 0.0
-
-    def _mean_finite(vals: list[float]) -> float | None:
-        finite = [v for v in vals if np.isfinite(v)]
-        return float(np.mean(finite)) if finite else None
-
-    batch_mape = _mean_finite([c.abs_pct_error for c in candidates])
-    batch_signed_pct_bias = _mean_finite([c.signed_pct_error for c in candidates])
-    frontier_mape = _mean_finite([c.abs_pct_error for c in candidates if c.kind == "frontier"])
-    adversarial_mape = _mean_finite([c.abs_pct_error for c in candidates if c.kind == "adversarial"])
-    exploit_mape = _mean_finite([c.abs_pct_error for c in candidates if c.kind == "exploit"])
-    cma_mape = _mean_finite([c.abs_pct_error for c in candidates if c.kind == "cma"])
-
-    # Floored MAPE: divide by max(|real|, 0.1 * cohort_median_real). Lets MAPE remain
-    # interpretable on the geo-8-like cohort with small true values.
-    finite_reals = [abs(c.real_revenue) for c in candidates if np.isfinite(c.real_revenue) and c.real_revenue != 0]
-    cohort_median_real = float(np.median(finite_reals)) if finite_reals else 0.0
-    floor_denom = 0.1 * cohort_median_real
-    for c in candidates:
-        if not np.isfinite(c.real_revenue) or not np.isfinite(c.predicted_revenue):
-            c.abs_pct_error_floored = float("nan")
-            continue
-        denom = max(abs(c.real_revenue), floor_denom) if floor_denom > 0 else abs(c.real_revenue)
-        c.abs_pct_error_floored = float(abs(c.predicted_revenue - c.real_revenue) / denom) if denom > 0 else float("nan")
-    batch_mape_floored = _mean_finite([c.abs_pct_error_floored for c in candidates])
-    batch_mae = _mean_finite([c.abs_error for c in candidates])
-    frontier_mae = _mean_finite([c.abs_error for c in candidates if c.kind == "frontier"])
-    adversarial_mae = _mean_finite([c.abs_error for c in candidates if c.kind == "adversarial"])
-    exploit_mae = _mean_finite([c.abs_error for c in candidates if c.kind == "exploit"])
-    cma_mae = _mean_finite([c.abs_error for c in candidates if c.kind == "cma"])
-
-    # Per-geology rollup — useful for spotting geologies the surrogate
-    # systematically struggles on, and for the convergence plot script.
-    per_geology: dict[str, dict[str, float | int | None]] = {}
-    for c in candidates:
-        bucket = per_geology.setdefault(str(c.geology_index), {
-            "count": 0,
-            "mape": [],
-            "mape_floored": [],
-            "mae": [],
-            "signed_bias": [],
-            "max_real_revenue": None,
-        })
-        bucket["count"] += 1  # type: ignore[operator]
-        if np.isfinite(c.abs_pct_error):
-            bucket["mape"].append(c.abs_pct_error)  # type: ignore[union-attr]
-        if np.isfinite(c.abs_pct_error_floored):
-            bucket["mape_floored"].append(c.abs_pct_error_floored)  # type: ignore[union-attr]
-        if np.isfinite(c.abs_error):
-            bucket["mae"].append(c.abs_error)  # type: ignore[union-attr]
-        if np.isfinite(c.signed_pct_error):
-            bucket["signed_bias"].append(c.signed_pct_error)  # type: ignore[union-attr]
-        if np.isfinite(c.real_revenue):
-            cur = bucket["max_real_revenue"]
-            bucket["max_real_revenue"] = (
-                c.real_revenue if cur is None else max(float(cur), c.real_revenue)  # type: ignore[arg-type]
-            )
-    # Collapse list-valued aggregates to scalars.
-    for g, bucket in per_geology.items():
-        bucket["mape"] = _mean_finite(bucket["mape"])  # type: ignore[arg-type]
-        bucket["mape_floored"] = _mean_finite(bucket["mape_floored"])  # type: ignore[arg-type]
-        bucket["mae"] = _mean_finite(bucket["mae"])  # type: ignore[arg-type]
-        bucket["signed_bias"] = _mean_finite(bucket["signed_bias"])  # type: ignore[arg-type]
-
-    real_values = [c.real_revenue for c in candidates if np.isfinite(c.real_revenue)]
-    best_in_batch = float(max(real_values)) if real_values else None
-    best_so_far: float | None
-    if best_in_batch is None:
-        best_so_far = prior_best_revenue
-    elif prior_best_revenue is None:
-        best_so_far = best_in_batch
-    else:
-        best_so_far = max(prior_best_revenue, best_in_batch)
-
-    # ----- Ensemble-mode aggregates -----
-    # Group candidate rows by snapshot_id; if a snapshot appears in >1 row (one
-    # per geology), this is an ensemble-mode iteration and we compute its real
-    # EMV as the mean across rows. Per-geology iterations have exactly one row
-    # per snapshot, so this path harmlessly produces a 1-element mean — but we
-    # still want the structure populated for downstream plots.
-    grouped_by_snap: dict[str, list[CandidateMetric]] = {}
-    for c in candidates:
-        if c.snapshot_id:
-            grouped_by_snap.setdefault(c.snapshot_id, []).append(c)
-    # STRICT EMV: a config's EMV is defined only if ALL K geologies in its ensemble produced a
-    # finite revenue; any failed/missing geology throws out the whole config (it is omitted from
-    # per_candidate_emv, hence from terminal_real_emv stamping and best/exploit tracking below, and
-    # from every EMV plot). K = the ensemble size = the largest per-snapshot geology count this
-    # iteration. This path OMITS failed-geology rows (vs the baseline writer's null rows), so a
-    # partial config simply has fewer rows than a complete one and falls short of K. Per-geology
-    # iterations have one row per snapshot (K=1), so a single finite value still qualifies. See
-    # orchestrator.emv — survivor-mean was biased and made configs non-comparable.
-    expected_k = max((len(rows) for rows in grouped_by_snap.values()), default=0)
-    per_candidate_emv: dict[str, float] = {}
-    for sid, rows in grouped_by_snap.items():
-        by_geo = {r.geology_index: r.real_revenue for r in rows if np.isfinite(r.real_revenue)}
-        emv_val = strict_emv(by_geo.values(), expected_k=expected_k)
-        if emv_val is not None:
-            per_candidate_emv[sid] = float(emv_val)
-
-    # Stamp terminal_real_emv onto every row whose snapshot has a populated EMV.
-    # The terminal EMV is the same value for all K rows of a given snapshot, so
-    # this is a join, not a per-row aggregation.
-    for c in candidates:
-        if c.snapshot_id and c.snapshot_id in per_candidate_emv:
-            c.terminal_real_emv = per_candidate_emv[c.snapshot_id]
-
-    # Look up seed real EMV from prior iters' per_candidate_emv. Only ensemble
-    # candidates carry a seed_source_snapshot_id; per-geology rows have None.
-    if prior_per_candidate_emv_by_iter:
-        for c in candidates:
-            if not c.seed_source_snapshot_id or c.seed_source_iteration is None:
-                continue
-            src_emv_map = prior_per_candidate_emv_by_iter.get(int(c.seed_source_iteration))
-            if not src_emv_map:
-                continue
-            v = src_emv_map.get(str(c.seed_source_snapshot_id))
-            if v is not None and np.isfinite(v):
-                c.seed_real_emv = float(v)
-
-    # Best-EMV-this-batch and running best. Only meaningful when at least one
-    # candidate has a real EMV; on per-geology iterations the same numbers as
-    # best_real_revenue_in_batch fall out, but plot helpers can distinguish via
-    # the absence of `per_candidate_emv` length > 1.
-    is_ensemble_iter = any(len(rows) > 1 for rows in grouped_by_snap.values())
-    best_emv_in_batch: float | None = None
-    best_emv_so_far_val: float | None = None
-    exploit_best_emv: float | None = None
-    exploit_best_per_geology: dict[str, float] | None = None
-    if is_ensemble_iter:
-        emv_values = list(per_candidate_emv.values())
-        if emv_values:
-            best_emv_in_batch = float(max(emv_values))
-        if best_emv_in_batch is None:
-            best_emv_so_far_val = prior_best_emv
-        elif prior_best_emv is None:
-            best_emv_so_far_val = best_emv_in_batch
-        else:
-            best_emv_so_far_val = max(float(prior_best_emv), best_emv_in_batch)
-
-        # Exploit-cohort restriction.
-        exploit_sids = {c.snapshot_id for c in candidates if c.kind == "exploit" and c.snapshot_id}
-        exploit_emvs = [per_candidate_emv[s] for s in exploit_sids if s in per_candidate_emv]
-        if exploit_emvs:
-            exploit_best_emv = float(max(exploit_emvs))
-        exploit_per_geo: dict[str, float] = {}
-        for c in candidates:
-            if c.kind != "exploit" or not np.isfinite(c.real_revenue):
-                continue
-            key = str(c.geology_index)
-            cur = exploit_per_geo.get(key)
-            exploit_per_geo[key] = c.real_revenue if cur is None else max(cur, c.real_revenue)
-        exploit_best_per_geology = exploit_per_geo or None
-
-    return IngestMetrics(
+    return rollup_metrics(
+        candidates,
         n_submitted=n_submitted,
         n_completed=n_completed,
-        completion_rate=completion_rate,
-        batch_mape=batch_mape,
-        batch_signed_pct_bias=batch_signed_pct_bias,
-        frontier_mape=frontier_mape,
-        adversarial_mape=adversarial_mape,
-        best_real_revenue_in_batch=best_in_batch,
-        best_real_revenue_so_far=best_so_far,
         n_train_samples=n_train_samples,
-        batch_mae=batch_mae,
-        batch_mape_floored=batch_mape_floored,
-        frontier_mae=frontier_mae,
-        adversarial_mae=adversarial_mae,
-        exploit_mape=exploit_mape,
-        exploit_mae=exploit_mae,
-        cma_mape=cma_mape,
-        cma_mae=cma_mae,
-        candidates=candidates,
-        per_geology=per_geology,
+        prior_best_revenue=prior_best_revenue,
+        prior_best_emv=prior_best_emv,
+        prior_per_candidate_emv_by_iter=prior_per_candidate_emv_by_iter,
+        expected_k=expected_k,
         n_failed_per_status=n_failed_per_status,
         n_succeeded_but_missing_h5=n_succeeded_but_missing_h5,
         n_missing_silently=n_missing_silently,
-        per_candidate_emv=(per_candidate_emv if is_ensemble_iter else None),
-        best_emv_in_batch=best_emv_in_batch,
-        best_emv_so_far=best_emv_so_far_val,
-        exploit_best_emv=exploit_best_emv,
-        exploit_best_per_geology=exploit_best_per_geology,
     )

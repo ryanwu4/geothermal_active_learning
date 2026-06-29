@@ -1,0 +1,171 @@
+{
+  "run_id_prefix": "al_cma_npv_multistart",
+  "target": "graph_discounted_net_revenue",
+  "_note": "MULTISTART + PICK-ELITES acquisition (validated in analysis/multistart_elite_vs_random_ix, FINDINGS.md). Derived from al_cma_surrogate_npv_long20.json. Per AL iteration: run n_cma_starts=10 INDEPENDENT COLD CMA-ES restarts (distinct seeds -> distinct LHS cold means -> distinct basins) over the surrogate, each for cma_generations=40, and emit the top n_elite_per_start=2 CONVERGED elites (final-gen, by predicted EMV) of each start -> 20 exploit picks (= n_exploit), xy-deduped. Depth PINNED [50,55] (the validated convergence regime where per-start CMA converges in xy; the NPV optimum lives in the productive band). Reuses the SAME clean 256-IX seed + norm as the long20 run, so it is a head-to-head test of multistart-vs-single-start acquisition at equal IX budget. Distinct local_workspace + run_id_prefix so it never touches the live long20 run. Acquisition compute ~ 10x40x24 surrogate evals/iter (local GPU) vs long20's 1x20x24; IX budget per iter unchanged (20 configs x 15 geos = 300).",
+  "wandb": {
+    "project": "geothermal_active_learning",
+    "entity": "ryanwu4",
+    "tags": [
+      "cma_surrogate",
+      "npv_objective",
+      "sample_efficiency",
+      "multistart",
+      "pick_elites",
+      "depth_pinned",
+      "clean_start",
+      "lhs_seed"
+    ]
+  },
+  "paths": {
+    "scratch_root": "/scratch/users/rwu4/al_runs",
+    "surrogate_repo": "/home/users/rwu4/Geothermal_Graph_Surrogate",
+    "julia_repo": "/home/users/rwu4/GeologicalSimulationWrapper.jl",
+    "julia_config": "configs/sherlock_ryan.json",
+    "bootstrap_compiled_h5": "/scratch/users/rwu4/al_runs/seed_clean/seed_compiled.h5",
+    "geologies_config": "configs/geologies_full.json",
+    "norm_config_path": "/scratch/users/rwu4/al_runs/seed_clean/seed_norm_config.json"
+  },
+  "compute": {
+    "train_acquire_location": "local",
+    "ssh_host": "sherlock",
+    "ssh_control_path": "~/.ssh/cm-rwu4@login.sherlock.stanford.edu:22",
+    "remote_repo_root": "/home/users/rwu4/geothermal_active_learning",
+    "local_workspace": "/home/rwu4/omv_geothermal/geothermal_active_learning/local_workspace_cma_npv_multistart_depth5055_gated_seed42",
+    "local_surrogate_repo": "/home/rwu4/omv_geothermal/Geothermal_Graph_Surrogate",
+    "local_geologies_config": "/home/rwu4/omv_geothermal/geothermal_active_learning/configs/geologies_full_local.json",
+    "poll_interval_sec": 600,
+    "notify_email": "ryanwu2002@gmail.com",
+    "notify_msmtp_account": "gmail"
+  },
+  "seed": {
+    "seed_id": "clean",
+    "n_seed_samples": 256,
+    "depth_min": 11,
+    "depth_max": 70,
+    "edge_buffer": 10,
+    "seed": 42
+  },
+  "training": {
+    "clean_start": true,
+    "from_scratch_every_k": 5,
+    "max_epochs_full": 180,
+    "max_epochs_finetune": 60,
+    "early_stop_patience": 30,
+    "lr": 0.0003,
+    "batch_size": 16,
+    "edge_encoder": "cnn",
+    "seed": 42
+  },
+  "acquisition": {
+    "mode": "cma_surrogate",
+    "objective": "npv",
+    "economics_config_path": "/home/rwu4/omv_geothermal/Geothermal_Graph_Surrogate/configs/economics.json",
+    "geo_cube_path": "/home/rwu4/omv_geothermal/geothermal_active_learning/analysis/angled_well_length/geo_coords.h5",
+    "facilities": [
+      [
+        20,
+        30
+      ],
+      [
+        40,
+        40
+      ]
+    ],
+    "vertical_lead_m": 1000.0,
+    "ksurf": 2,
+    "poro_thresh": 0.01,
+    "cma_popsize": 24,
+    "cma_generations": 40,
+    "cma_sigma_init": 12.0,
+    "cma_warm_start": false,
+    "align_recombination": true,
+    "n_cma_starts": 10,
+    "n_elite_per_start": 2,
+    "assert_distinct_k": false,
+    "depth_min": 50,
+    "depth_max": 55,
+    "n_exploit": 20,
+    "n_frontier": 0,
+    "elite_top_k": 16,
+    "elite_seed_noise": 2.0,
+    "k_safe": 45,
+    "edge_buffer": 10,
+    "seed": 42,
+    "devices": [
+      "cuda:0"
+    ]
+  },
+  "selection": {
+    "batch_size": 20
+  },
+  "intersect": {
+    "max_concurrent": 80,
+    "time_per_run": "00:40:00",
+    "cpus_per_task": 2,
+    "mem_per_task": "8GB",
+    "np": 2
+  },
+  "stopping": {
+    "max_iterations": 20,
+    "plateau_window": 20,
+    "plateau_threshold_relative": 0.005,
+    "target_mape": null
+  },
+  "wells": [
+    {
+      "depth": 50,
+      "type": "injector"
+    },
+    {
+      "depth": 50,
+      "type": "producer"
+    },
+    {
+      "depth": 50,
+      "type": "injector"
+    },
+    {
+      "depth": 50,
+      "type": "producer"
+    },
+    {
+      "depth": 50,
+      "type": "injector"
+    },
+    {
+      "depth": 50,
+      "type": "producer"
+    },
+    {
+      "depth": 50,
+      "type": "injector"
+    },
+    {
+      "depth": 50,
+      "type": "producer"
+    },
+    {
+      "depth": 50,
+      "type": "injector"
+    },
+    {
+      "depth": 50,
+      "type": "producer"
+    },
+    {
+      "depth": 50,
+      "type": "injector"
+    },
+    {
+      "depth": 50,
+      "type": "producer"
+    }
+  ],
+  "geology_gating": {
+    "enabled": true,
+    "mape_cutoff_pct": 5.0,
+    "top_m": 3,
+    "warmup_iters": 1,
+    "audit_configs": 0
+  }
+}

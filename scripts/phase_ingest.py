@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -18,14 +19,85 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from dataclasses import asdict
+from dataclasses import asdict, fields
 
-from orchestrator.ingest import ingest_iteration
+from orchestrator.ingest import CandidateMetric, ingest_iteration, rollup_metrics
 from orchestrator.log import init_run
 from orchestrator.paths import resolve_run_paths
 from orchestrator.slurm import submit_sbatch, write_rendered
 from orchestrator.state import IterationRecord, RunState
 from orchestrator.stop import StoppingConfig, evaluate_stopping
+
+
+_CAND_FIELDS = {f.name for f in fields(CandidateMetric)}
+
+
+def _reconstruct_candidates(per_cand_json: Path) -> list[CandidateMetric]:
+    """Rebuild CandidateMetric rows from a written per_candidate_metrics.json."""
+    if not per_cand_json.exists():
+        return []
+    with open(per_cand_json, "r") as f:
+        payload = json.load(f)
+    out: list[CandidateMetric] = []
+    for row in payload.get("candidates", []):
+        out.append(CandidateMetric(**{k: v for k, v in row.items() if k in _CAND_FIELDS}))
+    return out
+
+
+def _union_candidates(
+    panel_rows: list[CandidateMetric], completion_rows: list[CandidateMetric]
+) -> list[CandidateMetric]:
+    """Union by (snapshot_id, geology_index); completion rows win on collision.
+
+    Panel and completion geologies are disjoint per config, so collisions are not
+    expected — but completion-wins makes a re-run idempotent and safe regardless.
+    """
+    by_key: dict[tuple[str, int], CandidateMetric] = {}
+    for c in panel_rows:
+        by_key[(c.snapshot_id, int(c.geology_index))] = c
+    for c in completion_rows:
+        by_key[(c.snapshot_id, int(c.geology_index))] = c
+    return list(by_key.values())
+
+
+def _write_per_candidate(per_cand_path: Path, iteration: int, metrics) -> None:
+    payload = {
+        "iteration": iteration,
+        "n_submitted": metrics.n_submitted,
+        "n_completed": metrics.n_completed,
+        "candidates": [asdict(c) for c in (metrics.candidates or [])],
+        "per_candidate_emv": metrics.per_candidate_emv,
+        "best_emv_in_batch": metrics.best_emv_in_batch,
+        "exploit_best_emv": metrics.exploit_best_emv,
+        "exploit_best_per_geology": metrics.exploit_best_per_geology,
+    }
+    with open(per_cand_path, "w") as f:
+        json.dump(payload, f, indent=2)
+
+
+def _record_metrics(rec: IterationRecord, metrics, ingest_elapsed_min: float) -> None:
+    rec.completed = metrics.n_completed
+    rec.batch_mape = metrics.batch_mape
+    rec.batch_signed_pct_bias = metrics.batch_signed_pct_bias
+    rec.frontier_mape = metrics.frontier_mape
+    rec.adversarial_mape = metrics.adversarial_mape
+    rec.exploit_mape = metrics.exploit_mape
+    rec.cma_mape = metrics.cma_mape
+    rec.batch_mape_floored = metrics.batch_mape_floored
+    rec.batch_mae = metrics.batch_mae
+    rec.frontier_mae = metrics.frontier_mae
+    rec.adversarial_mae = metrics.adversarial_mae
+    rec.exploit_mae = metrics.exploit_mae
+    rec.cma_mae = metrics.cma_mae
+    rec.best_real_revenue = metrics.best_real_revenue_so_far
+    rec.n_train_samples = metrics.n_train_samples
+    rec.wallclock_ingest_min = ingest_elapsed_min
+    rec.per_geology = metrics.per_geology
+    rec.best_emv_in_batch = metrics.best_emv_in_batch
+    rec.best_emv_so_far = metrics.best_emv_so_far
+    rec.per_candidate_emv = metrics.per_candidate_emv
+    rec.exploit_best_emv = metrics.exploit_best_emv
+    rec.exploit_best_per_geology = metrics.exploit_best_per_geology
 
 
 def _load_config(path: Path) -> dict:
@@ -86,7 +158,16 @@ def main() -> int:
     parser.add_argument("--iteration", type=int, required=True)
     parser.add_argument("--array-tasks-json", type=Path, required=True)
     parser.add_argument("--ix-output-dir", type=Path, required=True)
+    # Panel-gating two-phase support (orchestrator.gating). "full" = ungated legacy
+    # behavior. "panel" = phase-1 partial ingest that records metrics but does NOT run the
+    # stopping check or chain the next iteration. "completion" = phase-2 ingest of the top-M
+    # completions, merged+unioned with the panel rows, which DOES advance the loop.
+    parser.add_argument("--gate-phase", choices=["full", "panel", "completion"], default="full")
+    parser.add_argument("--expected-k", type=int, default=None,
+                        help="ensemble size K to pin strict EMV (gated phases); None infers it")
     args = parser.parse_args()
+    gate_phase = args.gate_phase
+    expected_k = args.expected_k
 
     state = RunState.load(args.run_root / "state.json")
     config = _load_config(Path(state.config_path))
@@ -104,22 +185,6 @@ def main() -> int:
     objective = str(config.get("acquisition", {}).get("objective", "revenue"))
     bootstrap_h5 = Path(config["paths"]["bootstrap_compiled_h5"]).resolve()
 
-    prior_iter = state.iteration - 1
-    prior_compiled_h5 = (
-        paths.iter_compiled_h5(prior_iter) if prior_iter >= 0 else bootstrap_h5
-    )
-    if not prior_compiled_h5.exists() and state.iteration == 0:
-        prior_compiled_h5 = bootstrap_h5
-    next_compiled_h5 = paths.iter_compiled_h5(state.iteration)
-
-    # `args.ix_output_dir` is the shared h5s_dir_out from the Julia config.
-    # Scope to just this iter's outputs by symlinking the ones the array tasks
-    # promised, so preprocess_h5 doesn't sweep up unrelated runs.
-    ix_output_dir = _stage_iteration_outputs(
-        ix_output_root=args.ix_output_dir,
-        array_tasks_json=args.array_tasks_json,
-        iter_scratch_dir=paths.iter_ix_output_dir(state.iteration),
-    )
     # Build prior_per_candidate_emv_by_iter so the ingest can look up real EMV
     # for each ensemble-mode candidate's seed source. Only iterations whose
     # IterationRecord populated per_candidate_emv contribute; per-geology
@@ -129,28 +194,109 @@ def main() -> int:
         if rec_hist.per_candidate_emv:
             prior_per_candidate_emv_by_iter[int(rec_hist.iteration)] = dict(rec_hist.per_candidate_emv)
 
+    per_cand_path = paths.iter_dir(state.iteration) / "per_candidate_metrics.json"
     ingest_started = time.time()
-    metrics = ingest_iteration(
-        iteration=state.iteration,
-        surrogate_repo=surrogate_repo,
-        norm_config_path=norm_config_path,
-        economics_config=economics_config,
-        array_tasks_json=args.array_tasks_json,
-        ix_output_dir=ix_output_dir,
-        raw_ix_archive=paths.raw_ix_archive,
-        delta_h5=paths.iter_preprocessed_h5(state.iteration),
-        prior_compiled_h5=prior_compiled_h5,
-        next_compiled_h5=next_compiled_h5,
-        log_path=paths.logs_dir / f"ingest_iter_{state.iteration:04d}.preprocess.log",
-        prior_best_revenue=state.best_real_revenue_so_far(),
-        prior_best_emv=state.best_emv_so_far_value(),
-        prior_per_candidate_emv_by_iter=prior_per_candidate_emv_by_iter or None,
-        workers=4,
-    )
+
+    if gate_phase == "completion":
+        # Phase 2: ingest the top-M completions, MERGE into this iteration's PARTIAL compiled
+        # H5 (written by the panel phase), then recompute the iteration's metrics over the
+        # UNION of panel + completion rows. Now the top-M configs have all K geologies, so
+        # strict EMV (expected_k=K) admits them and the incumbent becomes ground-truth.
+        partial_compiled = paths.iter_compiled_h5(state.iteration)
+        tmp_compiled = partial_compiled.with_name(partial_compiled.stem + "_tmp" + partial_compiled.suffix)
+        delta = paths.iter_preprocessed_h5(state.iteration)
+        completion_delta = delta.with_name(delta.stem + "_completion" + delta.suffix)
+        scratch = paths.iter_ix_output_dir(state.iteration)
+        completion_scratch = scratch.with_name(scratch.name + "_completion")
+        ix_output_dir = _stage_iteration_outputs(
+            ix_output_root=args.ix_output_dir,
+            array_tasks_json=args.array_tasks_json,
+            iter_scratch_dir=completion_scratch,
+        )
+        completion_metrics = ingest_iteration(
+            iteration=state.iteration,
+            surrogate_repo=surrogate_repo,
+            norm_config_path=norm_config_path,
+            economics_config=economics_config,
+            array_tasks_json=args.array_tasks_json,
+            ix_output_dir=ix_output_dir,
+            raw_ix_archive=paths.raw_ix_archive,
+            delta_h5=completion_delta,
+            prior_compiled_h5=partial_compiled,
+            next_compiled_h5=tmp_compiled,
+            log_path=paths.logs_dir / f"ingest_iter_{state.iteration:04d}.completion.preprocess.log",
+            prior_best_revenue=state.best_real_revenue_so_far(),
+            prior_best_emv=state.best_emv_so_far_value(),
+            prior_per_candidate_emv_by_iter=prior_per_candidate_emv_by_iter or None,
+            workers=4,
+            provenance="completion",
+            expected_k=expected_k,
+        )
+        # Atomically promote the merged H5 over the partial one (separate paths so the
+        # _merge_compiled_h5s read-prior/write-next never aliases the same file).
+        os.replace(tmp_compiled, partial_compiled)
+        next_compiled_h5 = partial_compiled
+
+        # Union with the panel rows from phase 1 and recompute the iteration's metrics.
+        panel_payload: dict = {}
+        if per_cand_path.exists():
+            with open(per_cand_path, "r") as f:
+                panel_payload = json.load(f)
+        union = _union_candidates(_reconstruct_candidates(per_cand_path),
+                                  completion_metrics.candidates or [])
+        metrics = rollup_metrics(
+            union,
+            n_submitted=int(panel_payload.get("n_submitted", 0)) + completion_metrics.n_submitted,
+            n_completed=int(panel_payload.get("n_completed", 0)) + completion_metrics.n_completed,
+            n_train_samples=completion_metrics.n_train_samples,
+            prior_best_revenue=state.best_real_revenue_so_far(),
+            prior_best_emv=state.best_emv_so_far_value(),
+            prior_per_candidate_emv_by_iter=prior_per_candidate_emv_by_iter or None,
+            expected_k=expected_k,
+            n_failed_per_status=completion_metrics.n_failed_per_status,
+            n_succeeded_but_missing_h5=completion_metrics.n_succeeded_but_missing_h5,
+            n_missing_silently=completion_metrics.n_missing_silently,
+        )
+    else:
+        # full (legacy ungated) or panel (gated phase 1): standard single-batch ingest.
+        prior_iter = state.iteration - 1
+        prior_compiled_h5 = (
+            paths.iter_compiled_h5(prior_iter) if prior_iter >= 0 else bootstrap_h5
+        )
+        if not prior_compiled_h5.exists() and state.iteration == 0:
+            prior_compiled_h5 = bootstrap_h5
+        next_compiled_h5 = paths.iter_compiled_h5(state.iteration)
+        # `args.ix_output_dir` is the shared h5s_dir_out from the Julia config; scope to
+        # just this iter's outputs so preprocess_h5 doesn't sweep up unrelated runs.
+        ix_output_dir = _stage_iteration_outputs(
+            ix_output_root=args.ix_output_dir,
+            array_tasks_json=args.array_tasks_json,
+            iter_scratch_dir=paths.iter_ix_output_dir(state.iteration),
+        )
+        metrics = ingest_iteration(
+            iteration=state.iteration,
+            surrogate_repo=surrogate_repo,
+            norm_config_path=norm_config_path,
+            economics_config=economics_config,
+            array_tasks_json=args.array_tasks_json,
+            ix_output_dir=ix_output_dir,
+            raw_ix_archive=paths.raw_ix_archive,
+            delta_h5=paths.iter_preprocessed_h5(state.iteration),
+            prior_compiled_h5=prior_compiled_h5,
+            next_compiled_h5=next_compiled_h5,
+            log_path=paths.logs_dir / f"ingest_iter_{state.iteration:04d}.preprocess.log",
+            prior_best_revenue=state.best_real_revenue_so_far(),
+            prior_best_emv=state.best_emv_so_far_value(),
+            prior_per_candidate_emv_by_iter=prior_per_candidate_emv_by_iter or None,
+            workers=4,
+            provenance=("panel" if gate_phase == "panel" else "full"),
+            expected_k=expected_k,
+        )
+
     ingest_elapsed_min = (time.time() - ingest_started) / 60.0
 
     print(
-        f"[ingest] iter={state.iteration} submitted={metrics.n_submitted} "
+        f"[ingest] phase={gate_phase} iter={state.iteration} submitted={metrics.n_submitted} "
         f"completed={metrics.n_completed} mape={metrics.batch_mape} "
         f"signed_bias={metrics.batch_signed_pct_bias} "
         f"best_real={metrics.best_real_revenue_so_far} "
@@ -158,49 +304,18 @@ def main() -> int:
     )
 
     rec = state.get_iter(state.iteration) or IterationRecord(iteration=state.iteration)
-    rec.completed = metrics.n_completed
-    rec.batch_mape = metrics.batch_mape
-    rec.batch_signed_pct_bias = metrics.batch_signed_pct_bias
-    rec.frontier_mape = metrics.frontier_mape
-    rec.adversarial_mape = metrics.adversarial_mape
-    rec.exploit_mape = metrics.exploit_mape
-    rec.cma_mape = metrics.cma_mape
-    rec.batch_mape_floored = metrics.batch_mape_floored
-    rec.batch_mae = metrics.batch_mae
-    rec.frontier_mae = metrics.frontier_mae
-    rec.adversarial_mae = metrics.adversarial_mae
-    rec.exploit_mae = metrics.exploit_mae
-    rec.cma_mae = metrics.cma_mae
-    rec.best_real_revenue = metrics.best_real_revenue_so_far
-    rec.n_train_samples = metrics.n_train_samples
-    rec.wallclock_ingest_min = ingest_elapsed_min
-    rec.per_geology = metrics.per_geology
-    rec.best_emv_in_batch = metrics.best_emv_in_batch
-    rec.best_emv_so_far = metrics.best_emv_so_far
-    rec.per_candidate_emv = metrics.per_candidate_emv
-    rec.exploit_best_emv = metrics.exploit_best_emv
-    rec.exploit_best_per_geology = metrics.exploit_best_per_geology
+    _record_metrics(rec, metrics, ingest_elapsed_min)
     state.upsert_iter(rec)
-
-    # Write per-candidate calibration rows alongside the iteration's artifacts.
-    # state.json stays compact; the convergence plot script reads these files
-    # to build scatter / per-geology heatmap / distribution plots.
-    per_cand_path = paths.iter_dir(state.iteration) / "per_candidate_metrics.json"
-    per_cand_payload = {
-        "iteration": state.iteration,
-        "n_submitted": metrics.n_submitted,
-        "n_completed": metrics.n_completed,
-        "candidates": [asdict(c) for c in (metrics.candidates or [])],
-        "per_candidate_emv": metrics.per_candidate_emv,
-        "best_emv_in_batch": metrics.best_emv_in_batch,
-        "exploit_best_emv": metrics.exploit_best_emv,
-        "exploit_best_per_geology": metrics.exploit_best_per_geology,
-    }
-    with open(per_cand_path, "w") as f:
-        json.dump(per_cand_payload, f, indent=2)
-    # Make the new compiled H5 the active training set for the next iteration.
+    _write_per_candidate(per_cand_path, state.iteration, metrics)
     state.current_compiled_h5 = str(next_compiled_h5)
     state.save(paths.state_file)
+
+    # Phase-1 (panel) stops here: it must NOT run the stopping check or chain the next
+    # iteration. The local driver computes EMV_hat, picks the top-M, and submits the
+    # completion phase (which re-enters this script with --gate-phase completion).
+    if gate_phase == "panel":
+        print(f"[ingest] panel phase complete for iter={state.iteration}; awaiting completion.")
+        return 0
 
     wandb_handle = init_run(
         run_id=state.wandb_run_id,

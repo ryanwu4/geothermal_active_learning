@@ -69,6 +69,19 @@ class IterationRecord:
     # Used to compare elite-seeded Adam against its starting pool.
     exploit_best_emv: float | None = None
     exploit_best_per_geology: dict[str, float] | None = None
+    # Panel-gating bookkeeping (orchestrator.gating). All None on ungated runs.
+    # `panel_geology_indices` is the set RUN in IX this iteration (phase-1 panel);
+    # `completion_snapshot_ids` are the top-M configs completed to the full ensemble.
+    # `ix_runs_panel`/`ix_runs_completion` let the savings KPI be reproduced from
+    # state alone. `emv_hat_best_in_batch` is the control-variate ranking estimate
+    # (distinct from the ground-truth `best_emv_in_batch`).
+    gate_enabled: bool | None = None
+    panel_geology_indices: list[int] | None = None
+    n_panel_geologies: int | None = None
+    completion_snapshot_ids: list[str] | None = None
+    ix_runs_panel: int | None = None
+    ix_runs_completion: int | None = None
+    emv_hat_best_in_batch: float | None = None
 
 
 @dataclass
