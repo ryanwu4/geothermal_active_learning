@@ -57,6 +57,7 @@ from orchestrator.remote import RemoteSession, SshUnavailable, TERMINAL_JOB_STAT
 from orchestrator.slurm import render_template  # noqa: E402
 from orchestrator.stage import stage_iteration  # noqa: E402
 from orchestrator.state import IterationRecord, RunState, new_run_id, new_wandb_run_id  # noqa: E402
+from orchestrator.emv import strict_emv  # noqa: E402  (strict ensemble-EMV: single source of truth)
 
 # Reuse the SSH plumbing & helpers from the AL driver verbatim — keeping a
 # single source of truth for ControlMaster handling, manifest path-rewriting,
@@ -443,6 +444,7 @@ def _emit_baseline_snapshot(
     geology_entries: list[dict],
     well_configs_dir: Path,
     snapshots_json_dir: Path,
+    run_id_prefix: str = "",
 ) -> dict:
     """Write a .jl well config + snapshot JSON for one baseline candidate.
 
@@ -450,7 +452,12 @@ def _emit_baseline_snapshot(
     ``well_config_paths_by_geology`` array so the Julia stager fans this single
     candidate out into K IX tasks).
     """
-    snapshot_id = f"run{run_token:06d}_step{generation:04d}_baseline_p{pop_idx:03d}"
+    # Namespace snapshot_id by the unique run_id so different baseline seeds/runs never
+    # share an IX execution dir (sim_dir/BC_EN_<C>/<config_id>, where config_id embeds
+    # snapshot_id) — verify_pre_sim_dirs wipes that dir on presim, so a shared config_id
+    # across concurrent runs would clobber. Mirrors AL's acquire._emit_snapshot_ensemble.
+    _idp = f"{run_id_prefix}_" if run_id_prefix else ""
+    snapshot_id = f"{_idp}run{run_token:06d}_step{generation:04d}_baseline_p{pop_idx:03d}"
     jl_path = well_configs_dir / f"{snapshot_id}.jl"
     json_path = snapshots_json_dir / f"{snapshot_id}.json"
 
@@ -944,6 +951,7 @@ def main() -> int:
                     geology_entries=geology_entries,
                     well_configs_dir=well_configs_dir,
                     snapshots_json_dir=snapshots_json_dir,
+                    run_id_prefix=run_id,
                 )
                 snapshot_records.append(rec)
 
@@ -1098,8 +1106,16 @@ def main() -> int:
                             float(gr), wl, npv_state["is_injector_list"],
                             flowline_between_m=npv_state["flowline"], npv_terms=npv_state["terms"],
                         )["npv"])
-                    v = float(np.mean(npvs)) if npvs else float("nan")
-                    c["ensemble_mean_npv"] = v  # recorded in the re-saved local fitness copy
+                    # STRICT ensemble-EMV (orchestrator.emv, single source of truth): NPV is
+                    # defined ONLY if all K geologies produced a finite value; any crashed/missing
+                    # geology throws the config out -> NaN, which optimizer.tell() maps to
+                    # WORST_SENTINEL and best_npv_in_batch's nanmax (below) excludes. This aligns
+                    # the baseline's SEARCH and REPORTED best with AL's strict-EMV metric; the old
+                    # survivor-mean (np.mean over finite geos) inflated configs that failed on their
+                    # hardest geology and made the head-to-head unfair.
+                    strict = strict_emv(npvs, expected_k=len(geology_entries))
+                    v = float(strict) if strict is not None else float("nan")
+                    c["ensemble_mean_npv"] = v  # strict EMV; NaN if any geology failed (thrown out)
                 else:
                     v = c.get("ensemble_mean_revenue", float("nan"))
                 cands_by_pop[p_idx] = float(v) if v is not None else float("nan")
@@ -1137,9 +1153,10 @@ def main() -> int:
                     }, step=iteration)
                     wandb_handle.finish()
                 raise RuntimeError(
-                    f"All {popsize} candidates returned non-finite ensemble revenue "
-                    f"for iter {iteration} — refusing to call optimizer.tell() with "
-                    f"all-WORST_SENTINEL fitness (that would corrupt CMA-ES sigma).\n"
+                    f"All {popsize} candidates have non-finite ensemble fitness for iter "
+                    f"{iteration} (revenue mode: all IX failed; NPV mode: no config completed "
+                    f"all {len(geology_entries)} geologies under the strict-EMV rule) — refusing "
+                    f"to call optimizer.tell() with all-WORST_SENTINEL fitness (corrupts CMA-ES sigma).\n"
                     f"  Inspect: {remote_run_root}/iter_{iteration:04d}/fitness.json on Sherlock\n"
                     f"  SLURM logs: {remote_run_root}/logs/ingest_baseline_iter_{iteration:04d}.err\n"
                     f"  IX array logs under the per-iter stage dir.\n"

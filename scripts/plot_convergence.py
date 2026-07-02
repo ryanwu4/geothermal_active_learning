@@ -2054,22 +2054,31 @@ def plot_best_well_config(run_root: Path, well_rows: list[dict], out_dir: Path,
         by_snap[key]["wells"].append(r)
     if not by_snap:
         return
-    # Best selection: ensemble-mean NPV when available (npv mode), else IX revenue.
-    npv_by_snap: dict[tuple[int, str], list[float]] = {}
-    for r in (rows or []):
-        v = r.get("real_npv")
-        if v is None or not np.isfinite(float(v)):
-            continue
-        npv_by_snap.setdefault((int(r["iteration"]), str(r["snapshot_id"])), []).append(float(v))
+    # Best selection: STRICT ensemble EMV (orchestrator.emv via _strict_per_candidate_emv_by_iter)
+    # — a config's ensemble metric is defined ONLY if every one of its K geologies produced a
+    # finite value; any failed/missing geology throws the whole config out. Prevents a config that
+    # crashed on its worst geology from being drawn as "best" with an inflated survivor-mean label
+    # (the old float(np.mean(v)) averaged over survivors). Prefer NPV (npv mode), fall back to IX
+    # discounted revenue; K is inferred per iteration inside the helper.
     best = None
     score_label = None
-    if npv_by_snap:
-        cands = [(k, float(np.mean(v))) for k, v in npv_by_snap.items() if k in by_snap]
+    for value_key, label_fmt in (("real_npv", "ensemble-mean NPV = {:.1f} M$"),
+                                 ("real_revenue", "ensemble-mean INTERSECT discounted revenue = {:.1f} M$")):
+        strict_by_iter = _strict_per_candidate_emv_by_iter(rows or [], value_key)
+        cands = []
+        for it, emv_map in strict_by_iter.items():
+            for sid, emv in emv_map.items():
+                bkey = (int(it), str(sid))
+                if bkey in by_snap:
+                    cands.append((bkey, float(emv)))
         if cands:
-            best_key, best_npv = max(cands, key=lambda kv: kv[1])
+            best_key, best_val = max(cands, key=lambda kv: kv[1])
             best = by_snap[best_key]
-            score_label = f"ensemble-mean NPV = {best_npv / 1e6:.1f} M$"
+            score_label = label_fmt.format(best_val / 1e6)
+            break
     if best is None:
+        # No per-candidate metric row survived the strict rule (or none supplied) — fall back to the
+        # single stored IX revenue just so there is a config to draw.
         _, best = max(by_snap.items(), key=lambda kv: kv[1]["real_revenue"])
         score_label = f"INTERSECT discounted revenue = {best['real_revenue'] / 1e6:.1f} M$"
     best_sid = best["snapshot_id"]
@@ -2284,10 +2293,30 @@ def _failure_stats_per_iter(run_root: Path, history: list[dict]) -> list[dict]:
 
         # Configs present in the file plus any that vanished entirely (no rows).
         configs_present = len(by_snap)
-        expected_configs = round(submitted / K) if (submitted and K) else configs_present
+        # Gating-aware expected geology count per config: a panel-gated iteration intentionally
+        # runs only the panel geologies for most configs (the rest are surrogate-filled, NOT
+        # failed) and the full ensemble only for the top-M completions. Without this, every
+        # panel-only config (finite-geo-count = |panel| < K) is mislabeled "≥1 failing geology",
+        # producing a spurious ~(N-M)/N spike from the first partial iteration on.
+        gated = bool(rec.get("gate_enabled")) and rec.get("panel_geology_indices") is not None
+        n_panel = rec.get("n_panel_geologies")
+        completion_sids = set(rec.get("completion_snapshot_ids") or [])
+
+        def _expected_geos(sid: str) -> int:
+            if gated and n_panel:
+                return K if sid in completion_sids else int(n_panel)
+            return K
+
+        if gated and n_panel:
+            # Every config ran at least the panel, so none vanished entirely (a config that lost
+            # its whole panel shows up as no_output in the left panel instead).
+            expected_configs = configs_present
+        else:
+            expected_configs = round(submitted / K) if (submitted and K) else configs_present
         missing_configs = max(0, expected_configs - configs_present)
         configs_total = max(configs_present, expected_configs)
-        configs_with_failure = sum(1 for n in by_snap.values() if n < K) + missing_configs
+        configs_with_failure = sum(1 for sid, n in by_snap.items()
+                                   if n < _expected_geos(sid)) + missing_configs
 
         sub = int(submitted) if submitted else n_ok
         comp = int(completed) if completed is not None else n_ok
@@ -2610,12 +2639,21 @@ def _per_iter_pes_by_kind(rows: list[dict]) -> dict[int, dict[str, list[float]]]
     for it, snap_map in by_iter_snap.items():
         if not any(len(rs) > 1 for rs in snap_map.values()):
             continue
+        # STRICT: PES is defined for a config only if ALL K geologies produced a finite real_npv
+        # (orchestrator.emv throw-out rule). A config that crashed on any geology is dropped
+        # entirely rather than scored over its survivors — same rule as ensemble EMV. K is inferred
+        # per iteration; dedupe finite NPVs by geology before the completeness check.
+        k = _emv.expected_k_for_run([r for rs in snap_map.values() for r in rs])
         kind_to_pes: dict[str, list[float]] = {}
         for sid, rs in snap_map.items():
-            npvs = [float(v) for r in rs
-                    if (v := r.get("real_npv")) is not None and np.isfinite(float(v))]
-            if not npvs:
-                continue
+            by_geo: dict = {}
+            for r in rs:
+                v = r.get("real_npv")
+                if v is not None and np.isfinite(float(v)):
+                    by_geo[r.get("geology_index")] = float(v)
+            if k <= 0 or len(by_geo) != k:
+                continue  # config thrown out (a geology failed/missing)
+            npvs = list(by_geo.values())
             pes = 100.0 * float(np.mean([1.0 if v > 0 else 0.0 for v in npvs]))
             kind = str(rs[0].get("kind", "frontier"))
             kind_to_pes.setdefault(kind, []).append(pes)
