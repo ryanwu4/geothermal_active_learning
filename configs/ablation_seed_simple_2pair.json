@@ -1,0 +1,137 @@
+{
+  "run_id_prefix": "ablation_simple_2pair",
+  "target": "graph_discounted_net_revenue",
+  "_note": "ABLATION DATASET (SIMPLE): seed-only LHS batch, NO AL loop (run via scripts/run_seed_lhs.py). 2 well pairs (4 wells inj/prod/inj/prod), depth pinned [50,55], LHS xy AND LHS depth (seed.lhs_depth=true), 2048 configs even-split across the 15-geology ensemble (137x8 + 136x7). Compiled H5 is one of three benchmark datasets for the surrogate-architecture ablation study (SIMPLE / HARD / HIGH-PERF). training/acquisition/selection/stopping/geology_gating blocks are inert (AL never runs) and kept only so _load_config validates. intersect.max_concurrent held at 20 due to the global 100-run INTERSECT license cap (other campaigns active) - tune before launch.",
+  "wandb": {
+    "project": "geothermal_active_learning",
+    "entity": "ryanwu4",
+    "tags": [
+      "ablation_dataset",
+      "seed_only",
+      "lhs_seed",
+      "simple_2pair",
+      "depth_pinned"
+    ]
+  },
+  "paths": {
+    "scratch_root": "/scratch/users/rwu4/al_runs",
+    "surrogate_repo": "/home/users/rwu4/Geothermal_Graph_Surrogate",
+    "julia_repo": "/home/users/rwu4/GeologicalSimulationWrapper.jl",
+    "julia_config": "configs/sherlock_ryan.json",
+    "bootstrap_compiled_h5": "/scratch/users/rwu4/al_runs/seed_ablation_simple_2pair/seed_compiled.h5",
+    "geologies_config": "configs/geologies_full.json",
+    "norm_config_path": "/scratch/users/rwu4/al_runs/seed_ablation_simple_2pair/seed_norm_config.json"
+  },
+  "compute": {
+    "train_acquire_location": "local",
+    "ssh_host": "sherlock",
+    "ssh_control_path": "~/.ssh/cm-rwu4@login.sherlock.stanford.edu:22",
+    "remote_repo_root": "/home/users/rwu4/geothermal_active_learning",
+    "local_workspace": "/home/rwu4/omv_geothermal/geothermal_active_learning/local_workspace_ablation_simple_2pair",
+    "local_surrogate_repo": "/home/rwu4/omv_geothermal/Geothermal_Graph_Surrogate",
+    "local_geologies_config": "/home/rwu4/omv_geothermal/geothermal_active_learning/configs/geologies_full_local.json",
+    "poll_interval_sec": 600,
+    "notify_email": "ryanwu2002@gmail.com",
+    "notify_msmtp_account": "gmail"
+  },
+  "seed": {
+    "seed_id": "ablation_simple_2pair_42",
+    "n_seed_samples": 2048,
+    "depth_min": 50,
+    "depth_max": 55,
+    "lhs_depth": true,
+    "edge_buffer": 10,
+    "seed": 42
+  },
+  "training": {
+    "clean_start": true,
+    "from_scratch_every_k": 5,
+    "max_epochs_full": 180,
+    "max_epochs_finetune": 60,
+    "early_stop_patience": 30,
+    "lr": 0.0003,
+    "batch_size": 16,
+    "edge_encoder": "cnn",
+    "seed": 42
+  },
+  "acquisition": {
+    "mode": "cma_surrogate",
+    "objective": "npv",
+    "economics_config_path": "/home/rwu4/omv_geothermal/Geothermal_Graph_Surrogate/configs/economics.json",
+    "geo_cube_path": "/home/rwu4/omv_geothermal/geothermal_active_learning/analysis/angled_well_length/geo_coords.h5",
+    "facilities": [
+      [
+        20,
+        30
+      ],
+      [
+        40,
+        40
+      ]
+    ],
+    "vertical_lead_m": 1000.0,
+    "ksurf": 2,
+    "poro_thresh": 0.01,
+    "cma_popsize": 24,
+    "cma_generations": 40,
+    "cma_sigma_init": 12.0,
+    "cma_warm_start": false,
+    "align_recombination": true,
+    "n_cma_starts": 10,
+    "n_elite_per_start": 2,
+    "assert_distinct_k": false,
+    "depth_min": 50,
+    "depth_max": 55,
+    "n_exploit": 20,
+    "n_frontier": 0,
+    "elite_top_k": 16,
+    "elite_seed_noise": 2.0,
+    "k_safe": 45,
+    "edge_buffer": 10,
+    "seed": 42,
+    "devices": [
+      "cuda:0"
+    ]
+  },
+  "selection": {
+    "batch_size": 20
+  },
+  "intersect": {
+    "max_concurrent": 20,
+    "time_per_run": "00:40:00",
+    "cpus_per_task": 2,
+    "mem_per_task": "8GB",
+    "np": 2
+  },
+  "stopping": {
+    "max_iterations": 20,
+    "plateau_window": 20,
+    "plateau_threshold_relative": 0.005,
+    "target_mape": null
+  },
+  "wells": [
+    {
+      "depth": 50,
+      "type": "injector"
+    },
+    {
+      "depth": 50,
+      "type": "producer"
+    },
+    {
+      "depth": 50,
+      "type": "injector"
+    },
+    {
+      "depth": 50,
+      "type": "producer"
+    }
+  ],
+  "geology_gating": {
+    "enabled": true,
+    "mape_cutoff_pct": 5.0,
+    "top_m": 3,
+    "warmup_iters": 1,
+    "audit_configs": 0
+  }
+}

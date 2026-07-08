@@ -51,6 +51,88 @@ from run_al_local import (  # type: ignore  # noqa: E402
 )
 
 
+# Sherlock's job-submit plugin rejects arrays with indices past 1000
+# ("Invalid job array specification") even though scontrol reports
+# MaxArraySize=1000000. Empirically bisected 2026-07-08: --array=1-1000 OK,
+# --array=1-1001 rejected. Batches larger than this are split into chunked
+# array jobs whose worker task-ids are offset to cover the full tasks_json.
+_SLURM_ARRAY_CAP = 1000
+
+_TASK_ID_TOKEN = '--task-id "$SLURM_ARRAY_TASK_ID"'
+
+
+def _chunk_sbatch_text(sbatch_text: str, n_tasks: int, max_concurrent: int) -> list[str]:
+    """Split a staged array sbatch into <=_SLURM_ARRAY_CAP-index chunks.
+
+    Each chunk keeps --array=1-<size> and offsets the worker's --task-id by
+    the chunk start, so together the chunks cover tasks 1..n_tasks exactly.
+    max_concurrent is divided across chunks so total in-flight tasks never
+    exceed the configured cap (IX license budget).
+    """
+    import re
+
+    if _TASK_ID_TOKEN not in sbatch_text:
+        raise RuntimeError(
+            f"staged sbatch missing expected token {_TASK_ID_TOKEN!r}; "
+            "cannot chunk — check cli_surrogate_array_prepare.jl output."
+        )
+    array_re = re.compile(r"^#SBATCH --array=\S+$", flags=re.MULTILINE)
+    if not array_re.search(sbatch_text):
+        raise RuntimeError("staged sbatch missing '#SBATCH --array=' directive")
+    name_re = re.compile(r"^(#SBATCH --job-name=\S+)$", flags=re.MULTILINE)
+
+    n_chunks = (n_tasks + _SLURM_ARRAY_CAP - 1) // _SLURM_ARRAY_CAP
+    base, extra = divmod(max_concurrent, n_chunks)
+    chunks: list[str] = []
+    offset = 0
+    for k in range(n_chunks):
+        size = min(_SLURM_ARRAY_CAP, n_tasks - offset)
+        throttle = max(1, base + (1 if k < extra else 0))
+        text = array_re.sub(f"#SBATCH --array=1-{size}%{throttle}", sbatch_text)
+        text = name_re.sub(rf"\1_c{k + 1}", text)
+        text = text.replace(
+            _TASK_ID_TOKEN,
+            f'--task-id "$((SLURM_ARRAY_TASK_ID + {offset}))"',
+        )
+        chunks.append(text)
+        offset += size
+    return chunks
+
+
+def _submit_ix_array(
+    remote: RemoteSession,
+    stage,
+    *,
+    max_concurrent: int,
+    local_seed_dir: Path,
+    remote_seed_root: str,
+) -> list[str]:
+    """Submit the staged IX array, chunking when it exceeds the SLURM cap.
+
+    Returns the list of submitted job ids (length 1 in the unchunked case).
+    """
+    n_tasks = int(stage.tasks_count)
+    if n_tasks <= _SLURM_ARRAY_CAP:
+        return [remote.submit_sbatch(str(stage.sbatch_path))]
+
+    sbatch_text = remote.run(["cat", str(stage.sbatch_path)]).stdout
+    chunks = _chunk_sbatch_text(sbatch_text, n_tasks, max_concurrent)
+    print(f"[seed-driver] {n_tasks} tasks > SLURM array cap {_SLURM_ARRAY_CAP}; "
+          f"submitting {len(chunks)} chunked arrays (throttles sum to "
+          f"<= {max_concurrent})")
+    job_ids: list[str] = []
+    for k, text in enumerate(chunks, start=1):
+        local_chunk = local_seed_dir / "rendered_sbatch" / f"submit_surrogate_array_c{k}.sbatch"
+        local_chunk.write_text(text)
+        local_chunk.chmod(0o755)
+        remote_chunk = f"{remote_seed_root}/ix_stage/manifests/submit_surrogate_array_c{k}.sbatch"
+        remote.push(local_chunk, remote_chunk)
+        job_id = remote.submit_sbatch(remote_chunk)
+        job_ids.append(job_id)
+        print(f"[seed-driver]   chunk {k}/{len(chunks)} → job {job_id}")
+    return job_ids
+
+
 def _resolve_seed_id(cfg: dict, cli_seed_id: str | None) -> str:
     """Stable id used in the IX output prefix. Order: --seed-id, seed.seed_id,
     else the parent-dir name of the configured seed compiled H5.
@@ -90,6 +172,7 @@ def main() -> int:
     depth_max = int(seed_cfg.get("depth_max", acq_cfg.get("depth_max", 70)))
     edge_buffer = int(seed_cfg.get("edge_buffer", acq_cfg.get("edge_buffer", 10)))
     seed_val = int(seed_cfg.get("seed", acq_cfg.get("seed", 42)))
+    lhs_depth = bool(seed_cfg.get("lhs_depth", False))
 
     # ----- Local sampling on bend (uses LOCAL geology paths + LOCAL surrogate) --
     local_surrogate_repo = Path(compute["local_surrogate_repo"]).resolve()
@@ -117,7 +200,8 @@ def main() -> int:
     (local_seed_dir / "rendered_sbatch").mkdir(parents=True, exist_ok=True)
 
     print(f"[seed-driver] sampling {n_seed_samples} configs across {len(geologies)} geologies "
-          f"(depth {depth_min}-{depth_max}, seed {seed_val}) → {local_manifest}")
+          f"(depth {depth_min}-{depth_max}, lhs_depth={lhs_depth}, seed {seed_val}) "
+          f"→ {local_manifest}")
     manifest_path, n_emitted = build_seed_manifest(
         surrogate_repo=local_surrogate_repo,
         geologies=geologies,
@@ -130,6 +214,7 @@ def main() -> int:
         edge_buffer=edge_buffer,
         seed=seed_val,
         iteration=0,
+        lhs_depth=lhs_depth,
     )
     print(f"[seed-driver] emitted {n_emitted} seed candidates")
 
@@ -196,8 +281,13 @@ def main() -> int:
                   f"candidates ({n_emitted}) — expected 1:1 in per-geology mode.",
                   file=sys.stderr)
 
-        ix_job = remote.submit_sbatch(str(stage.sbatch_path))
-        print(f"[seed-driver] submitted IX array as job {ix_job}")
+        ix_jobs = _submit_ix_array(
+            remote, stage,
+            max_concurrent=int(ix_cfg.get("max_concurrent", 70)),
+            local_seed_dir=local_seed_dir,
+            remote_seed_root=remote_seed_root,
+        )
+        print(f"[seed-driver] submitted IX array as job(s) {','.join(ix_jobs)}")
 
         # Render + push the seed-ingest sbatch; submit afterany.
         template = REPO_ROOT / "sbatch" / "seed_ingest.sbatch.template"
@@ -219,8 +309,9 @@ def main() -> int:
         local_ingest_sbatch.chmod(0o755)
         remote_ingest_sbatch = f"{remote_seed_root}/sbatch_rendered/seed_ingest.sbatch"
         remote.push(local_ingest_sbatch, remote_ingest_sbatch)
-        ingest_job = remote.submit_sbatch(remote_ingest_sbatch, dependency=f"afterany:{ix_job}")
-        print(f"[seed-driver] submitted seed-ingest as job {ingest_job} (afterany:{ix_job})")
+        ix_dependency = "afterany:" + ":".join(ix_jobs)
+        ingest_job = remote.submit_sbatch(remote_ingest_sbatch, dependency=ix_dependency)
+        print(f"[seed-driver] submitted seed-ingest as job {ingest_job} ({ix_dependency})")
 
         final = _poll_until_terminal(remote, ingest_job, every=poll_every, label="seed-ingest")
         if final != "COMPLETED":

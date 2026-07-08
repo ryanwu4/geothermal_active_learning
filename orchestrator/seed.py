@@ -90,6 +90,7 @@ def build_seed_manifest(
     edge_buffer: int = 10,
     seed: int = 42,
     iteration: int = 0,
+    lhs_depth: bool = False,
 ) -> tuple[Path, int]:
     """Sample per-geology LHS well configs and write a stage-ready manifest.
 
@@ -183,18 +184,26 @@ def build_seed_manifest(
         # Per-geology RNG so results don't depend on geology ordering.
         seed_geo = _per_geology_seed(seed, geo.geology_index)
         rng = np.random.default_rng(seed_geo)
-        sampler = qmc.LatinHypercube(d=2 * num_wells, seed=seed_geo)
+        sampler = qmc.LatinHypercube(d=(3 if lhs_depth else 2) * num_wells, seed=seed_geo)
         unit = sampler.random(n_geo)
 
         coords = np.zeros((n_geo, num_wells, 3), dtype=np.float32)
         for w in range(num_wells):
             coords[:, w, 0] = x_lo + unit[:, 2 * w] * (x_hi - x_lo)
             coords[:, w, 1] = y_lo + unit[:, 2 * w + 1] * (y_hi - y_lo)
-        # Independent per-well, per-config integer depth (matches the cma
-        # frontier sampler at acquire.py:2396) → depth randomization.
-        coords[:, :, 2] = np.round(
-            rng.uniform(z_lo_eff, z_hi_eff, size=(n_geo, num_wells))
-        )
+        if lhs_depth:
+            # Depth is part of the LHS design: columns 2N..3N-1 map per-well
+            # to the effective depth range.
+            coords[:, :, 2] = np.round(
+                z_lo_eff
+                + unit[:, 2 * num_wells : 3 * num_wells] * (z_hi_eff - z_lo_eff)
+            )
+        else:
+            # Independent per-well, per-config integer depth (matches the cma
+            # frontier sampler at acquire.py:2396) → depth randomization.
+            coords[:, :, 2] = np.round(
+                rng.uniform(z_lo_eff, z_hi_eff, size=(n_geo, num_wells))
+            )
         coords[:, :, :2] = project_to_valid_cells(
             coords[:, :, :2], valid_xy_indices, num_wells, rng, nx=nx, ny=ny,
         )
@@ -236,6 +245,7 @@ def build_seed_manifest(
                 "depth_max": int(depth_max),
                 "edge_buffer": int(edge_buffer),
                 "seed": int(seed),
+                "lhs_depth": bool(lhs_depth),
                 "per_geology_counts": counts_by_geo,
             }
         },
