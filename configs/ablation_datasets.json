@@ -1,32 +1,32 @@
 {
-  "_note": "Manifest of the three benchmark datasets for the surrogate-architecture ablation study. SIMPLE and HARD are seed-only LHS batches (see the matching ablation_seed_*.json configs; compiled H5s land in each local_workspace after the Sherlock run + rsync). HIGH-PERF reuses the gated_seed42 AL workspace as-is (3031 CMA-optimized + 256 LHS seed cases; composition sidecar allows analysis-time subsetting). Objectives for ablation training runs: graph_energy_total, graph_discounted_net_revenue, node_wept_final (train.py --target).",
+  "_note": "Manifest of the three benchmark datasets for the surrogate-architecture ablation study. CANONICAL LOCATION: Geothermal_Graph_Surrogate/ablation_datasets/ (see its README.md for stats, known properties, and figures). All three share byte-identical physics normalization. Objectives: graph_energy_total, graph_discounted_net_revenue, node_wept_final.",
   "datasets": {
     "simple_2pair": {
-      "status": "pending_ix",
+      "status": "ready",
       "config": "configs/ablation_seed_simple_2pair.json",
       "pilot_config": "configs/ablation_seed_simple_2pair_pilot.json",
       "description": "2 well pairs (4 wells), depth [50,55], LHS xy+depth, 2048 configs even-split over 15 geologies",
-      "compiled_h5": "local_workspace_ablation_simple_2pair/seed_compiled.h5",
+      "compiled_h5": "Geothermal_Graph_Surrogate/ablation_datasets/simple_2pair/seed_compiled.h5",
       "remote_root": "/scratch/users/rwu4/al_runs/seed_ablation_simple_2pair",
-      "norm_config": "local_workspace_ablation_simple_2pair/seed_norm_config.json",
-      "case_geology_map": "local_workspace_ablation_simple_2pair/case_geology_map.json"
+      "norm_config": "Geothermal_Graph_Surrogate/ablation_datasets/simple_2pair/seed_norm_config.json",
+      "case_geology_map": "Geothermal_Graph_Surrogate/ablation_datasets/simple_2pair/case_geology_map.json"
     },
     "hard_fulldepth": {
-      "status": "pending_ix",
+      "status": "ready",
       "config": "configs/ablation_seed_hard_fulldepth.json",
       "description": "6 well pairs (12 wells), depth [11,70] (capped per-geology at z_cutoff-1), LHS xy+depth, 2048 configs even-split over 15 geologies",
-      "compiled_h5": "local_workspace_ablation_hard_fulldepth/seed_compiled.h5",
+      "compiled_h5": "Geothermal_Graph_Surrogate/ablation_datasets/hard_fulldepth/seed_compiled.h5",
       "remote_root": "/scratch/users/rwu4/al_runs/seed_ablation_hard_fulldepth",
-      "norm_config": "local_workspace_ablation_hard_fulldepth/seed_norm_config.json",
-      "case_geology_map": "local_workspace_ablation_hard_fulldepth/case_geology_map.json"
+      "norm_config": "Geothermal_Graph_Surrogate/ablation_datasets/hard_fulldepth/seed_norm_config.json",
+      "case_geology_map": "Geothermal_Graph_Surrogate/ablation_datasets/hard_fulldepth/case_geology_map.json"
     },
     "highperf_cma": {
       "status": "ready",
       "description": "gated_seed42 AL workspace as-is: 3287 cases = 3031 CMA-multistart-elite/gated-panel + 256 LHS seed (7.8%), 12 wells, depth [50,55], 15 geologies. Optimizer-biased distribution - flag in writeups.",
-      "compiled_h5": "local_workspace_cma_npv_multistart_depth5055_gated_seed42/current_compiled.h5",
-      "norm_config": "local_workspace_cma_npv_multistart_depth5055_gated_seed42/norm_config.json",
-      "case_geology_map": "local_workspace_cma_npv_multistart_depth5055_gated_seed42/case_geology_map.json",
-      "composition": "local_workspace_cma_npv_multistart_depth5055_gated_seed42/ablation_highperf_case_composition.json"
+      "compiled_h5": "Geothermal_Graph_Surrogate/ablation_datasets/highperf_cma/compiled.h5",
+      "norm_config": "Geothermal_Graph_Surrogate/ablation_datasets/highperf_cma/norm_config.json",
+      "case_geology_map": "Geothermal_Graph_Surrogate/ablation_datasets/highperf_cma/case_geology_map.json",
+      "composition": "Geothermal_Graph_Surrogate/ablation_datasets/highperf_cma/ablation_highperf_case_composition.json"
     }
   }
 }

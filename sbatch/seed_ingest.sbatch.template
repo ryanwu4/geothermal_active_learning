@@ -2,9 +2,9 @@
 #SBATCH --job-name={{JOB_NAME}}
 #SBATCH --output={{LOG_OUT}}
 #SBATCH --error={{LOG_ERR}}
-#SBATCH --mem=16GB
-#SBATCH -c 4
-#SBATCH -t 1:00:00
+#SBATCH --mem=32GB
+#SBATCH -c 8
+#SBATCH -t 4:00:00
 
 set -euo pipefail
 
@@ -19,4 +19,5 @@ python {{REPO_ROOT}}/scripts/phase_seed_ingest.py \
     --surrogate-repo {{SURROGATE_REPO}} \
     --seed-compiled-h5 {{SEED_COMPILED_H5}} \
     --seed-norm-config {{SEED_NORM_CONFIG}} \
-    --economics-config {{ECONOMICS_CONFIG}}
+    --economics-config {{ECONOMICS_CONFIG}} \
+    --workers "$SLURM_CPUS_PER_TASK"

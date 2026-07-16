@@ -51,52 +51,88 @@ from run_al_local import (  # type: ignore  # noqa: E402
 )
 
 
-# Sherlock's job-submit plugin rejects arrays with indices past 1000
-# ("Invalid job array specification") even though scontrol reports
-# MaxArraySize=1000000. Empirically bisected 2026-07-08: --array=1-1000 OK,
-# --array=1-1001 rejected. Batches larger than this are split into chunked
-# array jobs whose worker task-ids are offset to cover the full tasks_json.
+# Sherlock array/QOS limits (both bisected/observed 2026-07-08):
+#   1. The job-submit plugin rejects arrays with indices past 1000 ("Invalid
+#      job array specification") even though scontrol reports MaxArraySize=1e6.
+#   2. QOS 'normal' MaxSubmitJobsPerUser=2000, and EVERY array element counts —
+#      so even chunked 1000-element arrays collide with concurrently-queued
+#      campaigns.
+# Batches larger than intersect.submit_budget are therefore PACKED: each array
+# slot runs several IX tasks sequentially (strided task-ids), shrinking the
+# queue footprint while --array's %throttle still bounds concurrent IX runs
+# exactly (each slot runs one IX at a time → license budget unchanged).
 _SLURM_ARRAY_CAP = 1000
+_DEFAULT_SUBMIT_BUDGET = 700  # queue-footprint target; leaves QOS headroom
 
 _TASK_ID_TOKEN = '--task-id "$SLURM_ARRAY_TASK_ID"'
 
 
-def _chunk_sbatch_text(sbatch_text: str, n_tasks: int, max_concurrent: int) -> list[str]:
-    """Split a staged array sbatch into <=_SLURM_ARRAY_CAP-index chunks.
+def _scale_walltime(time_limit: str, factor: int) -> str:
+    """Multiply a SLURM [D-]HH:MM:SS walltime by an integer factor."""
+    days = 0
+    rest = time_limit
+    if "-" in rest:
+        d, rest = rest.split("-", 1)
+        days = int(d)
+    parts = [int(p) for p in rest.split(":")]
+    while len(parts) < 3:
+        parts.insert(0, 0)
+    total = (((days * 24 + parts[0]) * 60 + parts[1]) * 60 + parts[2]) * factor
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
-    Each chunk keeps --array=1-<size> and offsets the worker's --task-id by
-    the chunk start, so together the chunks cover tasks 1..n_tasks exactly.
-    max_concurrent is divided across chunks so total in-flight tasks never
-    exceed the configured cap (IX license budget).
+
+def _pack_sbatch_text(
+    sbatch_text: str, n_tasks: int, max_concurrent: int, submit_budget: int
+) -> tuple[str, int, int]:
+    """Pack an oversized staged array sbatch into <=submit_budget slots.
+
+    Slot s (1-based) runs task-ids s, s+n_slots, s+2*n_slots, ... <= n_tasks
+    sequentially, so the slots cover 1..n_tasks exactly once. The walltime is
+    scaled by the pack factor; a per-run `|| echo` guard keeps one failed IX
+    run from aborting the rest of the slot (set -euo pipefail is active).
+
+    Returns (packed_text, n_slots, per_slot).
     """
     import re
 
     if _TASK_ID_TOKEN not in sbatch_text:
         raise RuntimeError(
             f"staged sbatch missing expected token {_TASK_ID_TOKEN!r}; "
-            "cannot chunk — check cli_surrogate_array_prepare.jl output."
+            "cannot pack — check cli_surrogate_array_prepare.jl output."
         )
     array_re = re.compile(r"^#SBATCH --array=\S+$", flags=re.MULTILINE)
-    if not array_re.search(sbatch_text):
-        raise RuntimeError("staged sbatch missing '#SBATCH --array=' directive")
+    time_re = re.compile(r"^#SBATCH -t (\S+)$", flags=re.MULTILINE)
     name_re = re.compile(r"^(#SBATCH --job-name=\S+)$", flags=re.MULTILINE)
+    worker_re = re.compile(r"^(julia .*--task-id \"\$SLURM_ARRAY_TASK_ID\".*)$",
+                           flags=re.MULTILINE)
+    for rx, what in ((array_re, "--array directive"), (time_re, "-t directive"),
+                     (worker_re, "julia worker line")):
+        if not rx.search(sbatch_text):
+            raise RuntimeError(f"staged sbatch missing expected {what}")
 
-    n_chunks = (n_tasks + _SLURM_ARRAY_CAP - 1) // _SLURM_ARRAY_CAP
-    base, extra = divmod(max_concurrent, n_chunks)
-    chunks: list[str] = []
-    offset = 0
-    for k in range(n_chunks):
-        size = min(_SLURM_ARRAY_CAP, n_tasks - offset)
-        throttle = max(1, base + (1 if k < extra else 0))
-        text = array_re.sub(f"#SBATCH --array=1-{size}%{throttle}", sbatch_text)
-        text = name_re.sub(rf"\1_c{k + 1}", text)
-        text = text.replace(
-            _TASK_ID_TOKEN,
-            f'--task-id "$((SLURM_ARRAY_TASK_ID + {offset}))"',
-        )
-        chunks.append(text)
-        offset += size
-    return chunks
+    budget = max(1, min(submit_budget, _SLURM_ARRAY_CAP))
+    per_slot = (n_tasks + budget - 1) // budget
+    n_slots = (n_tasks + per_slot - 1) // per_slot
+
+    text = array_re.sub(f"#SBATCH --array=1-{n_slots}%{max_concurrent}", sbatch_text)
+    old_time = time_re.search(text).group(1)
+    text = time_re.sub(f"#SBATCH -t {_scale_walltime(old_time, per_slot)}", text)
+    text = name_re.sub(rf"\1_p{per_slot}", text)
+
+    worker_line = worker_re.search(text).group(1)
+    packed_worker = worker_line.replace(_TASK_ID_TOKEN, '--task-id "$_IX_TASK_ID"')
+    loop = "\n".join([
+        f"for _PACK_I in $(seq 0 {per_slot - 1}); do",
+        f"  _IX_TASK_ID=$((SLURM_ARRAY_TASK_ID + _PACK_I * {n_slots}))",
+        f'  if [ "$_IX_TASK_ID" -le {n_tasks} ]; then',
+        f'    {packed_worker} || echo "[pack] task $_IX_TASK_ID failed rc=$? (continuing)"',
+        "  fi",
+        "done",
+    ])
+    text = text.replace(worker_line, loop)
+    return text, n_slots, per_slot
 
 
 def _submit_ix_array(
@@ -104,33 +140,31 @@ def _submit_ix_array(
     stage,
     *,
     max_concurrent: int,
+    submit_budget: int,
     local_seed_dir: Path,
     remote_seed_root: str,
 ) -> list[str]:
-    """Submit the staged IX array, chunking when it exceeds the SLURM cap.
+    """Submit the staged IX array, packing when it exceeds the submit budget.
 
-    Returns the list of submitted job ids (length 1 in the unchunked case).
+    Returns the list of submitted job ids (always length 1 currently; kept as
+    a list so the ingest dependency composes if this ever splits jobs again).
     """
     n_tasks = int(stage.tasks_count)
-    if n_tasks <= _SLURM_ARRAY_CAP:
+    if n_tasks <= min(submit_budget, _SLURM_ARRAY_CAP):
         return [remote.submit_sbatch(str(stage.sbatch_path))]
 
     sbatch_text = remote.run(["cat", str(stage.sbatch_path)]).stdout
-    chunks = _chunk_sbatch_text(sbatch_text, n_tasks, max_concurrent)
-    print(f"[seed-driver] {n_tasks} tasks > SLURM array cap {_SLURM_ARRAY_CAP}; "
-          f"submitting {len(chunks)} chunked arrays (throttles sum to "
-          f"<= {max_concurrent})")
-    job_ids: list[str] = []
-    for k, text in enumerate(chunks, start=1):
-        local_chunk = local_seed_dir / "rendered_sbatch" / f"submit_surrogate_array_c{k}.sbatch"
-        local_chunk.write_text(text)
-        local_chunk.chmod(0o755)
-        remote_chunk = f"{remote_seed_root}/ix_stage/manifests/submit_surrogate_array_c{k}.sbatch"
-        remote.push(local_chunk, remote_chunk)
-        job_id = remote.submit_sbatch(remote_chunk)
-        job_ids.append(job_id)
-        print(f"[seed-driver]   chunk {k}/{len(chunks)} → job {job_id}")
-    return job_ids
+    packed, n_slots, per_slot = _pack_sbatch_text(
+        sbatch_text, n_tasks, max_concurrent, submit_budget)
+    print(f"[seed-driver] {n_tasks} tasks > submit budget "
+          f"{min(submit_budget, _SLURM_ARRAY_CAP)}; packing {per_slot} IX runs/slot "
+          f"→ one {n_slots}-element array (%{max_concurrent} concurrent IX)")
+    local_packed = local_seed_dir / "rendered_sbatch" / "submit_surrogate_array_packed.sbatch"
+    local_packed.write_text(packed)
+    local_packed.chmod(0o755)
+    remote_packed = f"{remote_seed_root}/ix_stage/manifests/submit_surrogate_array_packed.sbatch"
+    remote.push(local_packed, remote_packed)
+    return [remote.submit_sbatch(remote_packed)]
 
 
 def _resolve_seed_id(cfg: dict, cli_seed_id: str | None) -> str:
@@ -284,6 +318,7 @@ def main() -> int:
         ix_jobs = _submit_ix_array(
             remote, stage,
             max_concurrent=int(ix_cfg.get("max_concurrent", 70)),
+            submit_budget=int(ix_cfg.get("submit_budget", _DEFAULT_SUBMIT_BUDGET)),
             local_seed_dir=local_seed_dir,
             remote_seed_root=remote_seed_root,
         )

@@ -96,7 +96,7 @@
     "batch_size": 20
   },
   "intersect": {
-    "max_concurrent": 20,
+    "max_concurrent": 45,
     "time_per_run": "00:40:00",
     "cpus_per_task": 2,
     "mem_per_task": "8GB",

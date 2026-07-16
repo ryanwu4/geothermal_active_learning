@@ -4,7 +4,7 @@
 #SBATCH --error={{LOG_ERR}}
 #SBATCH --mem=16GB
 #SBATCH -c 4
-#SBATCH -t 1:00:00
+#SBATCH -t 2:00:00
 
 set -euo pipefail
 
